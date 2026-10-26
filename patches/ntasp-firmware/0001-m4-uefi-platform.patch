@@ -3042,10 +3042,10 @@ index 0000000..3b6e2cb
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
 new file mode 100644
-index 0000000..83ccb17
+index 0000000..c4c61d0
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,134 @@
 +# T8132 SoC family DSC include file
 +#  Copyright (c) 2011-2015, ARM Limited. All rights reserved.
 +#  Copyright (c) 2014, Linaro Limited. All rights reserved.
@@ -3149,15 +3149,19 @@ index 0000000..83ccb17
 +  gArmTokenSpaceGuid.PcdPciIoBase|0x0
 +  gArmTokenSpaceGuid.PcdPciIoSize|0x00010000
 +  #
-+  # The 32 bit PCIe MMIO is not prefetchable.  Translation is 0 because the
-+  # BARs this machine reports are already CPU addresses.
++  # The 32 bit PCIe MMIO is not prefetchable.  The DT ranges entry on this
++  # machine maps bus 0x80000000 to CPU 0xb8000000, so the aperture base is the
++  # bus address and the translation is the host offset (PciHostBridgeLib
++  # computes Translation = -PcdPciMmio32Translation, so the PCD carries
++  # bus - host = -0x38000000).  Getting this backwards silently hands devices
++  # BARs that nothing decodes.
 +  #
-+  gArmTokenSpaceGuid.PcdPciMmio32Base|0xB8000000
++  gArmTokenSpaceGuid.PcdPciMmio32Base|0x80000000
 +  gArmTokenSpaceGuid.PcdPciMmio32Size|0x40000000
-+  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0x0
++  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0xFFFFFFFFC8000000
 +  gEfiMdePkgTokenSpaceGuid.PcdPciMmio64Translation|0x0
 +  #
-+  # 64 bit PCIe MMIO *is* prefetchable.
++  # 64 bit PCIe MMIO *is* prefetchable; this window is not translated.
 +  #
 +  gArmTokenSpaceGuid.PcdPciMmio64Base|0xBC0000000
 +  gArmTokenSpaceGuid.PcdPciMmio64Size|0x20000000

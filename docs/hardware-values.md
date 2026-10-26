@@ -95,15 +95,20 @@ node's ECAM as:
 |---|---|
 | APCIE ECAM | `0x1cb0000000`, 256 MB |
 | `apcie` bus range | 0–8 |
+| PCIe 32-bit window | bus `0x80000000` → CPU `0xb8000000`, 1 GB |
+| PCIe prefetch window | `0xbc0000000` → `0xbc0000000`, 512 MB |
+| PCIe MSI doorbell | `0xfffff000`, vector offset 1506 |
+| ANS mailbox | `0x81600000` |
+| `dart-apcie0` | `0x90000000` |
 | WLAN | Broadcom `14e4:4434`, BARs around `0xb8200000`/`0xb8300000` |
 | Bluetooth | Broadcom `14e4:5f72`, BARs around `0xb8100000`/`0xb8301000` |
 | Ethernet | Broadcom `14e4:1682` (`lan0`) |
 | USB4/Thunderbolt root complexes | `apciec0`–`apciec3` |
 
-The UEFI host bridge still uses the T602X PCDs (`PcdPciExpressBaseAddress` =
-`0x580000000`), so PCIe devices will not enumerate correctly yet. PCIe is
-deliberately omitted from the DSDT and no PCIe `_CRS` is exposed to Windows until
-the ECAM/MMIO windows and the Apple host bridge path are validated.
+The UEFI host bridge and memory map now use these captured values instead of the
+T602X ones (`PcdPciExpressBaseAddress` was `0x580000000`). PCIe is still omitted
+from the DSDT: no `_CRS` is exposed to Windows until the DARTs and MSI path are
+validated. See `docs/pcie.md` for the property-by-property decode.
 
 The internal SSD is an **Apple ANS2** controller, not a standard PCIe NVMe device.
 There is no `AppleANS2Dxe` in the tree yet; USB storage is the intended installer
