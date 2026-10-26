@@ -22,7 +22,9 @@ m1n1 runs at EL2. It owns the physical AIC and the physical timer, and it runs t
 The UEFI firmware is a Project Mu payload. It provides:
 
 - UEFI boot services and runtime services;
-- ACPI tables (MADT, GTDT, IORT, SPCR, DSDT, PPTT, etc.);
+- the ACPI tables its platform implements — this M4 package provides MADT,
+  GTDT, FADT, DSDT, PPTT and DBG2; IORT/SPCR only exist once a platform adds
+  them, and this one does not yet;
 - AIC or vGIC interrupt support;
 - block I/O for the Windows installer and boot media;
 - a simple framebuffer for the Windows boot UI.

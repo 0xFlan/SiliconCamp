@@ -1,6 +1,6 @@
 # Building the NTASP UEFI firmware
 
-**Status (2026-10-25):** both the M2 reference package and the new M4 `Mac16_3` package build successfully. The M4 image is `Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EFI.fd` (30 MB). Its MADT, PPTT, FADT, DBG2, and GTDT are now checked automatically by `scripts/check-acpi.py`, which the build script runs (10 cores, 2 clusters, vGIC bases, PSCI/SMC, UART, FD header).
+**Status (2026-10-26):** both the M2 reference package and the new M4 `Mac16_3` package build successfully. The M4 image is `Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EFI.fd` (30 MB). Its MADT, PPTT, FADT, DSDT, DBG2, and GTDT are checked automatically by `scripts/check-acpi.py`, which the build script runs (10 cores, 2 clusters, vGIC bases, PSCI/SMC, UART, DSDT `_UID` tree and `COM0` `_CRS`, FD header).
 
 The NTASP firmware uses Project Mu's `stuart` build system. The project's own documentation says it is tested on Linux, not macOS, so this repo uses a Lima Ubuntu 24.04 VM on the M4 host.
 
@@ -115,6 +115,10 @@ an invariant breaks. It parses the tables the build emits and checks:
   efficiency classes 0/1, GICD `0x5000000000`, GICR range
   `0x5100000000`+`0x140000`;
 - PPTT: one package, two clusters, ten cores, core IDs 0–9 in MADT order;
+- DSDT: every CPU/CLU/DIE device present and nested in the right container,
+  each `_UID` matching the MADT order, every CPU `ACPI0007`, and `COM0` an
+  `APPL8900` whose `_CRS` is the platform UART base, length and IRQ (parsed from
+  the AML, not found by string search);
 - FADT: hardware-reduced, PSCI over SMC;
 - DBG2: debug UART at `0x3ad200000`;
 - GTDT: EL1 timer 17, virtual timer 18, no memory-mapped frames;
@@ -173,10 +177,11 @@ The ARM64 Image header in `Mac16_3.fdf` carried upstream's `image_size`
 The following remain provisional and must be checked on hardware or before PCIe is
 exposed to Windows:
 
-- PCIe window bounds and MSI base for each `apcie`/`apciec` root complex. The
-  host bridge now uses the J624 ECAM (`0x1cb0000000`) and maps the device
-  windows, but the bounds are inferred and PCIe is still omitted from the DSDT;
-  `docs/pcie.md` lists the `ioreg` capture that settles it.
+- PCIe beyond the first root complex. The `apcie@B0000000` ECAM, bus window,
+  host offset and prefetch window are captured (`docs/pcie.md`), but `PCI0` is
+  still omitted from the DSDT, the APCIE DARTs are not enabled, and the four
+  `apciec` complexes have their own apertures that a single host-bridge
+  descriptor cannot represent.
 - ANS2/SART storage for the internal SSD; USB storage is the current install path.
 - DCP/display handoff beyond the iBoot framebuffer.
 

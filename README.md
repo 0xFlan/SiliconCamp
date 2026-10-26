@@ -3,14 +3,14 @@
 native Windows on Apple Silicon using existing open-source bring-up where it is sound and original code for the gaps.
 
 
-This is a research and bring-up repository, not a working product. As of **2026-10-25**:
+This is a research and bring-up repository, not a working product. As of **2026-10-26**:
 
 - `m1n1` upstream builds on this M4 host.
 - NTASP's `m1n1-windows` fork builds with the vGIC enabled, and its tree already contains T8132 NVMe, PCIe, and SMP support.
 - An original M4 vGIC topology fix is applied in `patches/m1n1-windows/0001-vgic-m4-topology.patch`.
 - The NTASP Project Mu UEFI firmware now has an original M4 platform package and **builds successfully** in the Linux build VM. The generated image (`MAC16_3_EFI.fd`, 30 MB) is attached to the GitHub release with its SHA-256, not committed to git.
-- The M4 values are derived from this exact `Mac16,3`/`J624` machine and Asahi's T8132 device tree: 6 E-cores + 4 P-cores, 24 GB DRAM at the 1 TB alias, UART `0x3ad200000` IRQ 1046, and four USB DWC3 controllers.
-- The generated M4 ACPI tables were checked: 10 GICC entries with the correct MPIDRs, GICD at `0x5000000000`, GICR at `0x5100000000` with a `0x140000` range, a 2-cluster/6E+4P PPTT, and a matching 10-device DSDT. `scripts/check-acpi.py` enforces this on every build, so the values cannot drift silently.
+- The M4 values are derived from this exact `Mac16,3`/`J624` machine and Asahi's T8132 device tree: 6 E-cores + 4 P-cores, 24 GB DRAM at the 1 TB alias, UART `0x3ad200000` IRQ 1046, four USB DWC3 controllers, and the APCIE host windows decoded from `ioreg` (ECAM `0x1cb0000000`, bus `0x80000000` → host `0xb80000000`).
+- The generated M4 ACPI tables were checked: 10 GICC entries with the correct MPIDRs, GICD at `0x5000000000`, GICR at `0x5100000000` with a `0x140000` range, a 2-cluster/6E+4P PPTT, and a matching 10-device DSDT. `scripts/check-acpi.py` enforces this — including each CPU's `_UID`, its cluster, and `COM0`'s `_CRS` — on every build, so the values cannot drift silently.
 - The NTASP Windows driver repository is still a README-only skeleton.
 - No Windows kernel has been booted on this M4. The existing project still hangs at the Windows loader-to-kernel handoff even on M1/M2.
 - There is no Windows GPU driver for Apple AGX, and no path to kernel anti-cheat yet.
@@ -87,7 +87,7 @@ third_party/ntasp-drivers/   Windows drivers/HAL extensions (currently empty)
 ## What is still missing
 
 1. Hardware validation: the firmware builds and its CPU/RAM/UART/ACPI topology matches the machine, but m1n1 and the UEFI image have not run on the M4 yet.
-2. PCIe and storage: the host bridge and memory map now use the J624 APCIE ECAM (`0x1cb0000000`) and device windows instead of the T602X addresses; the exact window bounds and MSI base still need an `ioreg` capture, the root bridge is not yet in the DSDT, and the internal ANS2 SSD has no driver. USB storage is the current install path. See `docs/pcie.md`.
+2. PCIe and storage: the host bridge and page tables now use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus `0x80000000` → host `0xb80000000`) and prefetch window (`0xbc0000000`). The root bridge is not yet in the DSDT, the APCIE DARTs are not enabled, the four `apciec` complexes are not described, and the internal ANS2 SSD has no driver. USB storage is the current install path. See `docs/pcie.md`.
 3. A working Windows loader-to-kernel handoff (the central unsolved bug, even on M1/M2).
 4. Windows drivers: ANS NVMe, DART, PCIe, DCP display, SPI input, SMC, USB, Wi-Fi/Bluetooth.
 5. A Windows AGX GPU driver.

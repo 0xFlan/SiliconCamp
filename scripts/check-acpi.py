@@ -181,6 +181,162 @@ def read_pptt(data: bytes, ck: Checker | None = None) -> list[dict]:
     return nodes
 
 
+# --------------------------------------------------------------------------
+# Minimal AML parsing for the DSDT checks.
+#
+# The DSDT is the one table whose contents matter to Windows in a way that a
+# string search cannot prove: a CPU attached to the wrong cluster, or a UART
+# _CRS with the wrong address, still contains the right device names.  These
+# helpers read exactly the AML objects the platform contract uses.
+# --------------------------------------------------------------------------
+
+def aml_pkg_length(data: bytes, off: int) -> tuple[int, int]:
+    """Decode an AML PkgLength at *off*; return (length, bytes consumed).
+
+    The length counts the PkgLength bytes themselves, so a package starting at
+    ``off`` ends at ``off + length``.
+    """
+    first = data[off]
+    extra = first >> 6
+    if extra == 0:
+        return first & 0x3F, 1
+    value = first & 0x0F
+    for index in range(extra):
+        value |= data[off + 1 + index] << (4 + 8 * index)
+    return value, 1 + extra
+
+
+def aml_name(data: bytes, off: int) -> tuple[str, int]:
+    """Decode a four-character AML NameString; return (name, bytes used)."""
+    prefix = 0
+    if data[off] == 0x5C:                       # root prefix
+        prefix = 1
+    elif data[off] == 0x5E:                     # parent prefix, unused here
+        raise ValueError("parent-prefixed name")
+    raw = data[off + prefix:off + prefix + 4]
+    # AML name segments are a lead character (A-Z or _) plus three name
+    # characters, which may also be digits: CPU0, CLU1, DIE0.
+    if len(raw) != 4 or not (0x41 <= raw[0] <= 0x5A or raw[0] == 0x5F):
+        raise ValueError("not a four-character AML name")
+    if not all(0x41 <= b <= 0x5A or 0x30 <= b <= 0x39 or b == 0x5F
+               for b in raw[1:]):
+        raise ValueError("not a four-character AML name")
+    return raw.decode("ascii"), prefix + 4
+
+
+def aml_devices(data: bytes) -> list[dict]:
+    """Find every DeviceOp in an AML table, nested ones included.
+
+    Each entry carries its byte span, so a caller can prove that CPU nodes sit
+    inside the intended cluster without implementing the whole AML object model.
+    """
+    devices: list[dict] = []
+    pos = 36
+    while True:
+        pos = data.find(b"\x5B\x82", pos)
+        if pos < 0:
+            return devices
+        try:
+            length, length_bytes = aml_pkg_length(data, pos + 2)
+            end = pos + 2 + length
+            name, name_bytes = aml_name(data, pos + 2 + length_bytes)
+        except (IndexError, ValueError):
+            pos += 2
+            continue
+        if end <= pos or end > len(data):
+            pos += 2
+            continue
+        devices.append({
+            "name": name,
+            "start": pos,
+            "end": end,
+            "name_end": pos + 2 + length_bytes + name_bytes,
+        })
+        pos += 2
+
+
+def aml_integer(data: bytes, off: int) -> tuple[int, int]:
+    """Decode an AML integer/data object; return (value, bytes consumed)."""
+    op = data[off]
+    if op == 0x00:
+        return 0, 1
+    if op == 0x01:
+        return 1, 1
+    if op == 0xFF:
+        return 0xFFFFFFFFFFFFFFFF, 1
+    if op == 0x0A:
+        return data[off + 1], 2
+    if op == 0x0B:
+        return struct.unpack_from("<H", data, off + 1)[0], 3
+    if op == 0x0C:
+        return struct.unpack_from("<I", data, off + 1)[0], 5
+    if op == 0x0E:
+        return struct.unpack_from("<Q", data, off + 1)[0], 9
+    raise ValueError(f"not an AML integer: 0x{op:02x}")
+
+
+def aml_property(data: bytes, device: dict, name: str) -> int | None:
+    """Return the value of ``Name(name, <integer>)`` inside a device."""
+    marker = b"\x08" + name.encode("ascii")
+    off = data.find(marker, device["name_end"], device["end"])
+    if off < 0:
+        return None
+    try:
+        return aml_integer(data, off + len(marker))[0]
+    except (IndexError, ValueError):
+        return None
+
+
+def aml_string(data: bytes, device: dict, name: str) -> str | None:
+    """Return the value of ``Name(name, "string")`` inside a device."""
+    marker = b"\x08" + name.encode("ascii")
+    off = data.find(marker, device["name_end"], device["end"])
+    if off < 0 or data[off + len(marker):off + len(marker) + 1] != b"\x0D":
+        return None
+    start = off + len(marker) + 1
+    end = data.find(b"\x00", start, device["end"])
+    if end < 0:
+        return None
+    return data[start:end].decode("ascii", "replace")
+
+
+def aml_resources(data: bytes, device: dict, name: str):
+    """Parse ``Name(name, ResourceTemplate)`` into (QWordMemory, GSIVs)."""
+    marker = b"\x08" + name.encode("ascii")
+    off = data.find(marker, device["name_end"], device["end"])
+    if off < 0:
+        return [], []
+    off += len(marker)
+    if data[off:off + 1] != b"\x11":            # BufferOp
+        return [], []
+    try:
+        length, length_bytes = aml_pkg_length(data, off + 1)
+        end = off + 1 + length
+        size, size_bytes = aml_integer(data, off + 1 + length_bytes)
+    except (IndexError, ValueError):
+        return [], []
+    start = off + 1 + length_bytes + size_bytes
+    buf = data[start:min(end, start + size)]
+
+    memories: list[tuple[int, int, int]] = []
+    gsivs: list[int] = []
+    pos = 0
+    while pos + 3 <= len(buf):
+        tag = buf[pos]
+        if tag == 0x79:                          # EndTag
+            break
+        count = buf[pos + 1] | (buf[pos + 2] << 8)
+        body = buf[pos + 3:pos + 3 + count]
+        if tag == 0x8A and len(body) >= 43:      # QWordMemory
+            _, minimum, maximum, _, length64 = struct.unpack_from("<QQQQQ", body, 3)
+            memories.append((minimum, maximum, length64))
+        elif tag == 0x89 and len(body) >= 2:     # extended interrupt
+            for index in range(body[1]):
+                gsivs.append(struct.unpack_from("<I", body, 2 + 4 * index)[0])
+        pos += 3 + count
+    return memories, gsivs
+
+
 def acpi_header(data: bytes, name: str, ck: Checker) -> bool:
     """Validate an ACPI table header and return True if it is usable."""
     if len(data) < 36:
@@ -391,10 +547,52 @@ def check_dbg2(data: bytes, ck: Checker, plat: Platform) -> None:
 def check_dsdt(data: bytes, ck: Checker, plat: Platform) -> None:
     count = len(plat.cores)
     runs = cluster_runs(plat.cores)
+    body = data[:struct.unpack_from("<I", data, 4)[0]]
+    found = {
+        node["name"]: node for node in aml_devices(body)
+    }
+
     names = [f"CPU{i}" for i in range(count)]
-    names += ["COM0", "DIE0"] + [f"CLU{i}" for i in range(len(runs))]
-    for name in names:
-        ck.check(name.encode() in data, f"DSDT: {name} device present")
+    names += [f"CLU{i}" for i in range(len(runs))]
+    names += ["DIE0", "COM0"]
+    present = [ck.check(name in found, f"DSDT: {name} device present")
+               for name in names]
+    if not all(present):
+        return
+
+    def within(child: str, parent: str) -> bool:
+        inner, outer = found[child], found[parent]
+        return outer["start"] < inner["start"] and inner["end"] <= outer["end"]
+
+    for run_index, run in enumerate(runs):
+        cluster = f"CLU{run_index}"
+        ck.check(within(cluster, "DIE0"), f"DSDT: {cluster} sits inside DIE0")
+        for index in run:
+            ck.check(within(f"CPU{index}", cluster),
+                     f"DSDT: CPU{index} sits inside {cluster}")
+
+    # The _UID values are what Windows matches against the MADT GICC UIDs; a
+    # device in the right place with the wrong _UID is still a broken topology.
+    expected_uids = {f"CPU{i}": i for i in range(count)}
+    expected_uids.update({f"CLU{i}": i + 1 for i in range(len(runs))})
+    expected_uids["DIE0"] = 0
+    for name, want in expected_uids.items():
+        got = aml_property(body, found[name], "_UID")
+        ck.check(got == want, f"DSDT: {name} _UID {got} == {want}")
+
+    hids = [aml_string(body, found[f"CPU{i}"], "_HID") for i in range(count)]
+    ck.check(all(hid == "ACPI0007" for hid in hids),
+             "DSDT: every CPU device is ACPI0007")
+
+    hid = aml_string(body, found["COM0"], "_HID")
+    ck.check(hid == "APPL8900", f"DSDT: COM0 _HID {hid!r} == 'APPL8900'")
+    memories, gsivs = aml_resources(body, found["COM0"], "_CRS")
+    want_memory = (plat.uart_base, plat.uart_base + 0xFFF, 0x1000)
+    ck.check(memories == [want_memory],
+             f"DSDT: COM0 _CRS is 0x{plat.uart_base:x}+0x1000 "
+             f"(got {[(hex(a), hex(b), hex(c)) for a, b, c in memories]})")
+    ck.check(gsivs == [plat.uart_irq],
+             f"DSDT: COM0 _CRS interrupt {gsivs} == [{plat.uart_irq}]")
 
 
 def check_image(build_dir: str, ck: Checker, plat: Platform) -> None:

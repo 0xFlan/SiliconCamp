@@ -1,8 +1,8 @@
 # M4 hardware values used by the firmware
 
 This file records every M4-specific value that the build depends on, where it came
-from, and how to re-check it. The PCIe and ANS2 items at the end are known but are
-not yet wired into the firmware.
+from, and how to re-check it. PCIe is wired into the host bridge and page tables
+(`docs/pcie.md`); ANS2 storage has no driver yet.
 
 Sources:
 
@@ -86,7 +86,7 @@ not present in the T602X map.
 `T8132FamilyVirtualMemoryMapDefines.h` covers both the DWC3 register blocks and
 the USB DARTs. The USB stack has not been run on hardware yet.
 
-## PCIe (known, not yet wired into UEFI)
+## PCIe (host bridge wired; DSDT still off)
 
 The J624 has several APCIE root complexes. `ioreg` reports the first `apcie`
 node's ECAM as:
@@ -95,24 +95,30 @@ node's ECAM as:
 |---|---|
 | APCIE ECAM | `0x1cb0000000`, 256 MB |
 | `apcie` bus range | 0–8 |
-| PCIe 32-bit window | bus `0x80000000` → CPU `0xb8000000`, 1 GB |
+| PCIe 32-bit window | bus `0x80000000` → host `0xb80000000`, 1 GB |
+| PCIe host offset | `0xb00000000` (`PcdPciMmio32Translation` = `-0xb00000000`) |
 | PCIe prefetch window | `0xbc0000000` → `0xbc0000000`, 512 MB |
 | PCIe MSI doorbell | `0xfffff000`, vector offset 1506 |
 | ANS mailbox | `0x81600000` |
-| `dart-apcie0` | `0x90000000` |
-| WLAN | Broadcom `14e4:4434`, BARs around `0xb8200000`/`0xb8300000` |
-| Bluetooth | Broadcom `14e4:5f72`, BARs around `0xb8100000`/`0xb8301000` |
-| Ethernet | Broadcom `14e4:1682` (`lan0`) |
-| USB4/Thunderbolt root complexes | `apciec0`–`apciec3` |
+| `dart-apcie0` / `dart-apcie2` | `0x90000000` / `0x92000000` |
+| Ethernet | Broadcom `14e4:1682` (`lan0`), BARs `0xb80000000`/`0xb80010000` |
+| WLAN | Broadcom `14e4:4434`, BARs `0xb82000000`/`0xb83000000` |
+| Bluetooth | Broadcom `14e4:5f72`, BARs `0xb81000000`/`0xb83010000` |
+| USB4/Thunderbolt root complexes | `apciec0`–`apciec3`; ECAMs from `0x1c50000000` (`apciec0`/`apciec1` decoded) |
 
 The UEFI host bridge and memory map now use these captured values instead of the
-T602X ones (`PcdPciExpressBaseAddress` was `0x580000000`). PCIe is still omitted
-from the DSDT: no `_CRS` is exposed to Windows until the DARTs and MSI path are
-validated. See `docs/pcie.md` for the property-by-property decode.
+T602X ones (`PcdPciExpressBaseAddress` was `0x580000000`). The 32-bit aperture is
+the bus window; the host offset is carried in `PcdPciMmio32Translation`, and the
+page tables map the host addresses (`0xb80000000`+1 GB). PCIe is still omitted
+from the DSDT: no `_CRS` is exposed to Windows until the APCIE DARTs are enabled
+and the ECAM/windows have been exercised on hardware. The four `apciec` root
+complexes are a separate matter: the single host-bridge descriptor does not
+describe them.
 
 The internal SSD is an **Apple ANS2** controller, not a standard PCIe NVMe device.
-There is no `AppleANS2Dxe` in the tree yet; USB storage is the intended installer
-path for the first Windows attempt.
+`AppleNANDStorageDxe` is a 22-line stub and no DSC includes it, so there is no
+ANS2 driver yet; USB storage is the intended installer path for the first
+Windows attempt.
 
 ## Re-checking on this machine
 
@@ -124,6 +130,10 @@ ioreg -p IODeviceTree -r -n chosen -l -w0 | grep -E 'dram-base|dram-size|chip-id
 
 # USB and PCIe topology (large output; filter it)
 ioreg -p IODeviceTree -l -w0 | grep -E '\+-o (usb-drd|dart-usb|apcie|pci-bridge|pcic)'
+
+# PCIe root complex properties. -d 0 is required: without it the same property
+# names come back from child nodes and the last one wins.
+ioreg -p IODeviceTree -r -n "apcie@B0000000" -d 0 -l -w0
 ```
 
 The public DTS can be fetched without cloning the whole kernel:

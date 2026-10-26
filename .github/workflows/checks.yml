@@ -25,7 +25,13 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Python syntax
-        run: python3 -m py_compile scripts/check-acpi.py tests/test_check_acpi.py
+        run: |
+          python3 -m py_compile \
+            scripts/check-acpi.py \
+            scripts/soc-coverage.py \
+            tests/test_check_acpi.py \
+            tests/test_soc_coverage.py \
+            tests/test_pcie_windows.py
 
       - name: Shell syntax
         run: |

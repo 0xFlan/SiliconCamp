@@ -44,6 +44,9 @@ Done:
   containers and PPTT core IDs in the same order.
 - Corrected the UART to `0x3ad200000`, AIC IRQ 1046.
 - Added the low 1 GB MMIO window used by the M4 USB DWC3 controllers and DARTs.
+- Set the APCIE host bridge and page tables from the captured J624 windows
+  (ECAM `0x1cb0000000`, bus `0x80000000` → host `0xb80000000`, prefetch
+  `0xbc0000000`); see `docs/pcie.md`.
 
 Next:
 
@@ -51,6 +54,8 @@ Next:
 - Capture the UEFI serial log and check the memory map, CPU count, and ACPI
   table addresses at runtime.
 - Bring up the USB DWC3/XHCI path so a USB keyboard and USB installer are usable.
+- Add `PCI0`/`_CRS` and enable the APCIE DARTs once the USB path proves the
+  memory map on hardware.
 
 **Exit criteria:** the UEFI boot menu appears on the M4's display or over serial, and the firmware reports the correct CPU count and memory map.
 

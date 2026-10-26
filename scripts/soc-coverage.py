@@ -62,7 +62,7 @@ DEVICES = [
     ("MacBook Pro (16-inch, M3 Max, 2023)", "Mac15,11", "J516mAP", "T6034"),
     ("MacBook Air (13-inch, M3, 2024)", "Mac15,12", "J613AP", "T8122"),
     ("MacBook Air (15-inch, M3, 2024)", "Mac15,13", "J615AP", "T8122"),
-    ("Mac Studio (M3 Ultra, 2025)", "Mac15,4", "J575dAP", "T6032"),
+    ("Mac Studio (M3 Ultra, 2025)", "Mac15,14", "J575dAP", "T6032"),
     ("iMac (24-inch 2-port, M4, 2024)", "Mac16,2", "J623AP", "T8132"),
     ("iMac (24-inch 4-port, M4, 2024)", "Mac16,3", "J624AP", "T8132"),
     ("Mac mini (M4, 2024)", "Mac16,10", "J773gAP", "T8132"),
@@ -157,9 +157,14 @@ def build_report(tree: str) -> dict:
 def print_text(report: dict) -> None:
     machines = report["machines"]
     covered = [m for m in machines if m["silicon"]]
+    platforms = [m for m in machines if m["platform"]]
     print(f"firmware tree: {report['tree']}")
-    print(f"machines: {len(machines)}, silicon package present: "
-          f"{len(covered)}, missing: {len(machines) - len(covered)}\n")
+    print(f"machines: {len(machines)}")
+    # A silicon family package is not a machine port: it is the SoC half of the
+    # firmware.  Keep the two numbers separate or the report flatters itself.
+    print(f"  SoC family has a silicon package: {len(covered)}")
+    print(f"  machine has a platform package: {len(platforms)}")
+    print(f"  no silicon package at all: {len(machines) - len(covered)}\n")
 
     print("silicon families")
     families: dict[str, list[dict]] = {}
@@ -178,7 +183,6 @@ def print_text(report: dict) -> None:
             print(f"  {machine['model']:<14} {machine['product']:<8} "
                   f"{machine['soc']:<6} {machine['name']}")
 
-    platforms = [m for m in machines if m["platform"]]
     if platforms:
         print("\nmachines with a platform package (by model identifier)")
         for machine in platforms:
