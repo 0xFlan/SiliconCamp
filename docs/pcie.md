@@ -98,7 +98,9 @@ leaves every BAR access decoding nowhere.
 `T8132FamilyVirtualMemoryMapDefines.h` maps three regions for this root complex:
 ECAM `0x1cb0000000`+256 MB, the 32-bit window `0xb80000000`+1 GB, and the
 prefetchable window `0xbc0000000`+512 MB. `MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS`
-is 48 and the table currently uses 45 entries including the terminator.
+is 48 and the table currently uses 45 entries including the terminator. Most of
+those entries are inherited from the T602X package and cover no J624 device;
+they are left in place until a pruned map can be validated on hardware.
 
 Only the first root complex (`apcie@B0000000`) is described by the host bridge.
 The iMac has four more: `apciec0`–`apciec3` at `0x50000000`, `0x60000000`,

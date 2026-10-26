@@ -504,8 +504,17 @@ def check_pptt(data: bytes, ck: Checker, plat: Platform) -> None:
 
 
 def check_fadt(data: bytes, ck: Checker) -> None:
+    # Preferred_PM_Profile is byte 45 and the ARM boot flags arrive in ACPI 5.1
+    # at 129.  A table shorter than that cannot be checked -- and reading past
+    # its end would crash the checker instead of failing the build.
+    if not ck.check(len(data) >= 131,
+                    f"FADT: {len(data)} bytes cover the ACPI 5.1 fields"):
+        return
+    profile = data[45]
     flags = struct.unpack_from("<I", data, 112)[0]
     arm_flags = struct.unpack_from("<H", data, 129)[0]
+    ck.check(profile == 1,
+             f"FADT: preferred PM profile is desktop (got {profile})")
     ck.check(bool(flags & (1 << 20)), "FADT: hardware-reduced ACPI set")
     ck.check(bool(arm_flags & 0x1), "FADT: PSCI compliant")
     # Bit 1 selects HVC for PSCI calls; Apple has no EL3, so m1n1 traps SMC.
@@ -513,6 +522,9 @@ def check_fadt(data: bytes, ck: Checker) -> None:
 
 
 def check_gtdt(data: bytes, ck: Checker) -> None:
+    if not ck.check(len(data) >= 92,
+                    f"GTDT: {len(data)} bytes cover the platform timer fields"):
+        return
     non_secure_pl1 = struct.unpack_from("<I", data, 56)[0]
     virt = struct.unpack_from("<I", data, 64)[0]
     platform_timers = struct.unpack_from("<I", data, 88)[0]
@@ -600,7 +612,9 @@ def check_image(build_dir: str, ck: Checker, plat: Platform) -> None:
     candidates = glob.glob(os.path.join(os.path.dirname(build_dir.rstrip("/")),
                                         "FV", "*_EFI.fd"))
     if not candidates:
-        ck.note("no FV/*_EFI.fd yet; skipping image checks")
+        # A completed build always leaves an FD; if it is missing, the image
+        # contract was not checked and the build should not be certified.
+        ck.check(False, "image: FV/*_EFI.fd present")
         return
     path = candidates[0]
     size = os.path.getsize(path)

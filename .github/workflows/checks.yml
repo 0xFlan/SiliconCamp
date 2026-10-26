@@ -25,13 +25,7 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Python syntax
-        run: |
-          python3 -m py_compile \
-            scripts/check-acpi.py \
-            scripts/soc-coverage.py \
-            tests/test_check_acpi.py \
-            tests/test_soc_coverage.py \
-            tests/test_pcie_windows.py
+        run: python3 -m py_compile scripts/*.py tests/*.py
 
       - name: Shell syntax
         run: |
@@ -39,3 +33,17 @@ jobs:
             bash -n "$f" || exit 1
           done
           echo "all scripts parse"
+
+  patch-applicability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Top-level submodules only.  MU_BASECORE is 337 MB, and its patch
+          # (0002) is checked by the same script locally; this job still fails
+          # if 0001 stops applying to the pinned ntasp-firmware commit or the
+          # m1n1-windows patch goes stale.
+          submodules: true
+
+      - name: Patches still apply to the pinned submodules
+        run: ./scripts/verify-patches.sh

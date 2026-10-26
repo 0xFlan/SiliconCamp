@@ -62,6 +62,9 @@ DEVICES = [
     ("MacBook Pro (16-inch, M3 Max, 2023)", "Mac15,11", "J516mAP", "T6034"),
     ("MacBook Air (13-inch, M3, 2024)", "Mac15,12", "J613AP", "T8122"),
     ("MacBook Air (15-inch, M3, 2024)", "Mac15,13", "J615AP", "T8122"),
+    # Asahi's list gives this row as Mac15,4, which is already the iMac M3
+    # 2-port.  The Mac Studio M3 Ultra is Mac15,14; a duplicated identifier
+    # would silently mis-attribute coverage.
     ("Mac Studio (M3 Ultra, 2025)", "Mac15,14", "J575dAP", "T6032"),
     ("iMac (24-inch 2-port, M4, 2024)", "Mac16,2", "J623AP", "T8132"),
     ("iMac (24-inch 4-port, M4, 2024)", "Mac16,3", "J624AP", "T8132"),

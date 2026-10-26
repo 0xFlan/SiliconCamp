@@ -26,6 +26,21 @@ ROOT = os.path.dirname(TESTS_DIR)
 CHECKER = os.path.join(ROOT, "scripts", "check-acpi.py")
 FIXTURES = os.path.join(TESTS_DIR, "fixtures", "mac16_3")
 
+# First 64 bytes of the MAC16_3_EFI.fd produced by the 2026-10-26 M4 build.
+# Only the header is a fixture: the 30 MB image is a release asset, so the
+# tests pad this header to a few pages instead of committing the payload.
+ARM64_HEADER = bytes.fromhex(
+    "01000010ff1f0014"        # code0/code1
+    "0000080000000000"        # text_offset = 0x80000
+    "0000e00100000000"        # image_size = 0x1e00000
+    "0000000000000000"        # flags
+    "0000000000000000"        # reserved[3]
+    "0000000000000000"
+    "0000000000000000"
+    "41524d64"                # "ARM\x64"
+    "00000000"                # reserved
+)
+
 
 def run_checker(build_dir: str) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -55,6 +70,12 @@ class FixtureCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="acpi-test-")
         self.build_dir = os.path.join(self.tmp, "AARCH64")
         shutil.copytree(os.path.join(FIXTURES, "AARCH64"), self.build_dir)
+        # check_image() reads the FD from the FV/ directory next to AARCH64/,
+        # exactly as a real build tree lays it out.
+        self.image = os.path.join(self.tmp, "FV", "MAC16_3_EFI.fd")
+        os.makedirs(os.path.dirname(self.image))
+        with open(self.image, "wb") as f:
+            f.write(ARM64_HEADER + b"\0" * (0x8000 - len(ARM64_HEADER)))
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -80,6 +101,13 @@ class TestCheckerPasses(FixtureCase):
         result = run_checker(self.build_dir)
         for label in ("MADT", "PPTT", "FADT", "DSDT", "DBG2", "GTDT"):
             self.assertIn(label, result.stdout)
+
+    def test_image_checks_run(self) -> None:
+        # The FD header is part of the platform contract; the checker must not
+        # silently skip it when the build tree has no image.
+        result = run_checker(self.build_dir)
+        self.assertNotIn("skipping image checks", result.stdout)
+        self.assertIn("image: ARM64 Image magic present", result.stdout)
 
 
 class TestTopologyDump(FixtureCase):
@@ -189,6 +217,92 @@ class TestCheckerRejects(FixtureCase):
         result = run_checker(self.build_dir)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("COM0 _CRS interrupt", result.stdout)
+
+    def test_fadt_profile_is_not_desktop(self) -> None:
+        self.patch_bytes(self.table("FADT*"), 45, b"\x02")
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("preferred PM profile", result.stdout)
+
+    def test_fadt_not_hardware_reduced(self) -> None:
+        fadt = self.table("FADT*")
+        with open(fadt, "rb") as f:
+            flags = struct.unpack_from("<I", f.read(116), 112)[0]
+        self.patch_bytes(fadt, 112, struct.pack("<I", flags & ~(1 << 20)))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("hardware-reduced", result.stdout)
+
+    def test_fadt_psci_over_hvc(self) -> None:
+        self.patch_bytes(self.table("FADT*"), 129, struct.pack("<H", 0x3))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("PSCI calls use SMC", result.stdout)
+
+    def test_short_fadt_fails_without_crashing(self) -> None:
+        fadt = self.table("FADT*")
+        with open(fadt, "r+b") as f:
+            f.truncate(112)
+            f.seek(4)
+            f.write(struct.pack("<I", 112))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FADT: 112 bytes cover", result.stdout)
+
+    def test_wrong_gtdt_el1_timer(self) -> None:
+        self.patch_bytes(self.table("GTDT*"), 56, struct.pack("<I", 16))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("non-secure EL1 timer GSIV", result.stdout)
+
+    def test_wrong_gtdt_virtual_timer(self) -> None:
+        self.patch_bytes(self.table("GTDT*"), 64, struct.pack("<I", 19))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("virtual timer GSIV", result.stdout)
+
+    def test_short_gtdt_fails_without_crashing(self) -> None:
+        gtdt = self.table("GTDT*")
+        with open(gtdt, "r+b") as f:
+            f.truncate(60)
+            f.seek(4)
+            f.write(struct.pack("<I", 60))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("GTDT: 60 bytes cover", result.stdout)
+
+    def test_wrong_dbg2_uart(self) -> None:
+        # DBG2's generic address register starts 22 bytes into the descriptor.
+        self.patch_bytes(self.table("DBG2*"), 70, struct.pack("<Q", 0x3AD201000))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("debug UART", result.stdout)
+
+    def test_missing_image(self) -> None:
+        os.remove(self.image)
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("image: FV/*_EFI.fd present", result.stdout)
+
+    def test_image_bad_magic(self) -> None:
+        self.patch_bytes(self.image, 56, b"ARM\x65")
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("ARM64 Image magic", result.stdout)
+
+    def test_image_bad_text_offset(self) -> None:
+        self.patch_bytes(self.image, 8, struct.pack("<Q", 0x40000))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("text_offset", result.stdout)
+
+    def test_image_size_too_small(self) -> None:
+        # 0x7000 does not cover the 0x8000-byte file, so the header lies about
+        # the payload and a loader that trusts it would cut the image short.
+        self.patch_bytes(self.image, 16, struct.pack("<Q", 0x7000))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("header image_size", result.stdout)
 
 
 if __name__ == "__main__":

@@ -106,8 +106,11 @@ node's ECAM as:
 | Bluetooth | Broadcom `14e4:5f72`, BARs `0xb81000000`/`0xb83010000` |
 | USB4/Thunderbolt root complexes | `apciec0`–`apciec3`; ECAMs from `0x1c50000000` (`apciec0`/`apciec1` decoded) |
 
-The UEFI host bridge and memory map now use these captured values instead of the
-T602X ones (`PcdPciExpressBaseAddress` was `0x580000000`). The 32-bit aperture is
+The UEFI host bridge PCDs now use these captured values instead of the T602X
+ones (`PcdPciExpressBaseAddress` was `0x580000000`), and the three J624 windows
+are appended to the virtual memory map. That map still carries the descriptors
+inherited from the T602X package; they cover no J624 device, and pruning them is
+a follow-up that needs the machine to validate. The 32-bit aperture is
 the bus window; the host offset is carried in `PcdPciMmio32Translation`, and the
 page tables map the host addresses (`0xb80000000`+1 GB). PCIe is still omitted
 from the DSDT: no `_CRS` is exposed to Windows until the APCIE DARTs are enabled

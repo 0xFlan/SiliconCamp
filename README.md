@@ -1,7 +1,6 @@
 # SiliconCamp
 
-native Windows on Apple Silicon using existing open-source bring-up where it is sound and original code for the gaps.
-
+Native Windows on Apple Silicon using existing open-source bring-up where it is sound and original code for the gaps.
 
 This is a research and bring-up repository, not a working product. As of **2026-10-26**:
 
@@ -60,7 +59,7 @@ third_party/ntasp-firmware/Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EFI.f
 
 ```
 docs/                   architecture, status, bring-up plan, safety, M4 platform, hardware values,
-                        Apple Silicon coverage matrix, T604X (M4 Pro/Max) values
+                        Apple Silicon coverage matrix, T604X (M4 Pro/Max) values, probe-log conventions
 patches/m1n1-windows/   original patches against the NTASP m1n1 fork
 patches/ntasp-firmware/ M4 UEFI platform and build patches
 scripts/                host check, build, patch application, ACPI checker, SoC coverage
