@@ -1,6 +1,9 @@
-# M4Windows
+# SiliconCamp
 
-**Goal:** native Windows on Apple M4 (`Mac16,3`, `T8132`), using the existing open-source Apple Silicon bring-up where it is sound, and original code for the M4-specific gaps.
+**Goal:** native Windows on Apple Silicon — every Mac, not one machine — using the
+existing open-source bring-up where it is sound and original code for the gaps.
+The name is a play on Boot Camp; the target is the whole Apple Silicon line,
+though the only machine with a validated package here is still `Mac16,3` (`T8132`, M4).
 
 This is a research and bring-up repository, not a working product. As of **2026-10-25**:
 
