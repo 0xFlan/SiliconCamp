@@ -1,53 +1,49 @@
 # PCIe and storage on J624
 
-The M4 platform package used to inherit the T602X PCIe PCDs, which point the
-host bridge at `0x580000000` — an address that does not exist on this SoC. That
-is now replaced with the J624 values that are actually known, and the memory
-map covers them.
+The M4 package inherited the T602X PCIe PCDs, which point the host bridge at
+`0x580000000` — an address that does not exist on this SoC — and the memory map
+had no entry for the real ECAM or device windows. Both are now set from this
+machine's device tree.
 
-## What is wired now
+## Captured from this machine (2026-10-26)
 
-| Item | Value | Source |
+`ioreg -p IODeviceTree -r -n apcie@B0000000 -l -w0`. Cell values are 32-bit
+little-endian, and 64-bit quantities are stored as (low, high) cell pairs.
+
+| Item | Value | Where |
 |---|---|---|
-| APCIE ECAM | `0x1cb0000000`, 256 MB | this machine's `ioreg` |
-| Bus range | 0–8 | `ioreg` (`apcie` `bus-range`) |
-| 32-bit MMIO window | `0xb8000000`, 1 GB, translation 0 | contains the WLAN BAR at `0xb8200000` and the Bluetooth BAR at `0xb8301000` |
-| Prefetchable window | `0xbc0000000`, 512 MB | Apple's M4-class layout; **unconfirmed on J624** |
-| MMIO32/64 translation | 0 | the BARs `ioreg` reports are already CPU addresses |
+| APCIE ECAM | `0x1cb0000000`, 256 MB | `reg[0]` |
+| Bus range | 0–8 | `bus-range` |
+| 32-bit non-prefetchable | bus `0x80000000` → CPU `0xb8000000`, 1 GB | `ranges[1]` |
+| Prefetchable | `0xbc0000000` → `0xbc0000000`, 512 MB | `ranges[0]` |
+| MSI doorbell | `msi-address` `0xfffff000`, `msi-vector-offset` 1506 | `msi-*` |
+| Root-complex IRQs | 1231, 1240, 1249 | `interrupts` |
+| ANS mailbox | `0x81600000`, IRQs 1003–1006/1018 | `ans@81600000` |
+| DART (`apcie0`) | `0x90000000` | `dart-apcie0@90000000` |
 
-`T8132FamilyVirtualMemoryMapDefines.h` maps the ECAM and both windows as device
-memory, and `MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS` was raised to fit them. Without
-that mapping, the first PCIe config access takes a translation fault, so a wrong
-ECAM is not a "PCIe does not work" bug — it is a firmware hang.
+The important correction: the 32-bit aperture base is the **bus** address
+`0x80000000`, and the host window is `0xb8000000`. `AppleSiliconPciHostBridgeLib`
+computes `Translation = -PcdPciMmio32Translation`, so the PCD carries
+`bus - host = -0x38000000` (`0xFFFFFFFFC8000000`). An earlier version of this
+change used `0xb8000000` with zero translation, which would have handed devices
+BARs that nothing decodes.
 
-`PcdPciExpressBarSize`/`PcdPciExpressBarLimit` (used by the DSDT `_CRS`) still
-come from `AppleSiliconPkg.dsc.inc`; they need the same J624 capture before the
-root bridge is described to Windows.
+The ECAM and both CPU windows are mapped in
+`T8132FamilyVirtualMemoryMapDefines.h`, and `MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS`
+was raised to fit them. A wrong ECAM is not a "PCIe does not work" bug — it is a
+translation fault on the first config access.
 
-## What is still unknown
+## What is still missing
 
-1. **Exact window bounds.** The 32-bit base is inferred from where the Wi-Fi and
-   Bluetooth BARs landed, not from a captured `ranges` property. Capture them:
-
-   ```bash
-   ioreg -p IODeviceTree -r -n apcie -l -w0 | grep -E '"ranges"|"assigned-addresses"|"bus-range"'
-   ioreg -p IODeviceTree -l -w0 | grep -E '\+-o (apcie|apciec|pci-bridge)'
-   ```
-
-   Record the result in `docs/hardware-values.md` and, if the bounds differ,
-   update the two defines and the PCDs together — the checker cannot catch a
-   mismatch between them yet.
-
-2. **MSI.** The DT-shaped description of Apple PCIe uses an MSI range on the AIC
-   (`AIC_IRQ 2071`, 32 vectors on M4 Max). J624's MSI base and count are not
-   captured, and `AppleSiliconPciPlatformDxe` needs them for wired interrupts.
-
-3. **DARTs.** Each `apcie` port has its own DART. They must be enabled and
-   bypassed (or programmed) before devices can DMA; the UEFI tree has
-   `AppleDartIoMmuDxe`, but nothing here validates it on J624.
-
-4. **`PCI0` in the DSDT.** Deliberately still absent. Windows will not see a
-   root bridge until the `_CRS` describes windows that are known to be correct.
+1. **`PCI0` in the DSDT.** Still absent on purpose: `PcdPciExpressBarSize` and
+   `PcdPciExpressBarLimit` (used by the `_CRS`) still come from
+   `AppleSiliconPkg.dsc.inc` and need the same capture before Windows is told a
+   root bridge exists.
+2. **DART enablement.** The `apcie` DARTs have to be mapped and either bypassed
+   or programmed before devices can DMA. `AppleDartIoMmuDxe` exists in the tree
+   but has not run on this machine.
+3. **MSI wiring.** `AppleSiliconPciPlatformDxe` needs the doorbell and vector
+   base wired to the AIC before wired interrupts work for non-MSI devices.
 
 ## Storage
 
@@ -56,11 +52,11 @@ Two different problems, often conflated:
 - **UEFI storage.** The in-box NVMe driver cannot talk to the internal SSD: it
   is an Apple ANS controller, not a PCIe NVMe device. `AppleNANDStorageDxe`
   exists in the tree but is a **22-line stub** — a readme and an empty file —
-  and is not included in any DSC. So the firmware has no driver for the internal
-  disk, and the first install must target USB storage.
+  and is not included in any DSC. The firmware therefore has no driver for the
+  internal disk, and the first install must target USB storage.
 - **Windows storage.** A Windows driver for ANS2 has to implement the ANS
-  mailbox, SART, and Apple's NVMe quirks (see m1n1's `nvme.c`, which does this
-  for the bootloader). That is a kernel-mode driver project, not a firmware
-  change, and it needs the machine.
+  mailbox, SART, and Apple's NVMe quirks (m1n1's `nvme.c` does this for the
+  bootloader). That is a kernel-mode driver project, not a firmware change, and
+  it needs the machine.
 
 Until both exist, USB is the install path, and `docs/status.md` keeps saying so.
