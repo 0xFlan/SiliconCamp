@@ -35,6 +35,7 @@ Windows bootmgr -> winload -> Windows kernel  (EL1 guest)
 
 ```bash
 ./scripts/check-host.sh
+./scripts/verify-patches.sh   # patches still apply to the pinned submodules
 ./scripts/build-m1n1.sh
 ./scripts/build-uefi-linux.sh Mac16_3   # requires the Lima VM; see docs/build-uefi.md
 ```
