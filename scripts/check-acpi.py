@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Verify the ACPI tables and image contract of the M4 UEFI firmware.
+"""Verify the ACPI tables and image contract of a Mac firmware build.
 
-The M4 platform package hardcodes things that must match the J624 hardware:
-the 10-core MADT, the 6E+4P PPTT, the vGIC window, the UART address and IRQ,
-and the firmware device size.  Compiling does not check any of that, so this
-script parses the tables the build emits and asserts the invariants.
+A platform package hardcodes things that must match real hardware: the core
+count and MPIDRs, the efficiency classes, the vGIC window, the UART address and
+IRQ, and the firmware device size.  Compiling does not check any of that, so this
+script parses the tables the build emits and asserts the platform's contract.
 
-It has no third-party dependencies: the tables are parsed from the binary data
-the EDK2 build leaves in the build tree.
+Expectations live in the PLATFORMS table below, one entry per platform package
+that has been validated.  There is deliberately no "close enough" path: an
+unvalidated platform is an error, not a pass, because a checker that guesses is
+worse than no checker.  `--print-topology` turns a known-good build into a
+ready-to-paste entry when a new SoC is brought up.
+
+It has no third-party dependencies: the tables are parsed straight from the
+binary data the EDK2 build leaves in the build tree.
 
 Usage:
     ./scripts/check-acpi.py                     # Mac16_3, newest build
-    ./scripts/check-acpi.py --platform MacBookProEarly2023
+    ./scripts/check-acpi.py --platform Mac16_3
     ./scripts/check-acpi.py --build-dir <dir>   # any .../DEBUG_CLANGPDB dir
+    ./scripts/check-acpi.py --print-topology    # dump a Platform entry
 
 Exit status is 0 only if every check passes.
 """
@@ -24,26 +31,48 @@ import glob
 import os
 import struct
 import sys
+from dataclasses import dataclass
 
-# Expected J624 (Mac16,3) values.  Sources are recorded in docs/hardware-values.md.
-E_CORE_MPIDRS = [0x0, 0x1, 0x2, 0x3, 0x4, 0x5]
-P_CORE_MPIDRS = [0x10100, 0x10101, 0x10102, 0x10103]
-EXPECTED_MPIDRS = E_CORE_MPIDRS + P_CORE_MPIDRS
-GICD_BASE = 0x5000000000
-GICR_BASE = 0x5100000000
-GICR_STRIDE = 0x20000
-UART_BASE = 0x3AD200000
-UART_IRQ = 1046
 
-# FDT / FDF ARD64 Image header fields.
-FD_BASE = 0x10030000000
-FD_SIZE = 0x1E00000
+@dataclass(frozen=True)
+class Platform:
+    """Everything the checker expects of one platform's firmware output."""
+
+    name: str
+    #: MPIDR of every core in ACPI UID order, as the MADT lists them.
+    cores: tuple[int, ...]
+    #: Efficiency class per core, in the same order.
+    efficiency: tuple[int, ...]
+    gicd_base: int
+    gicr_base: int
+    gicr_stride: int
+    uart_base: int
+    uart_irq: int
+    fd_size: int
+
+
+# Sources for every value are recorded in docs/hardware-values.md.
+PLATFORMS: dict[str, Platform] = {
+    "Mac16_3": Platform(
+        name="Mac16,3 J624 (T8132, M4 iMac)",
+        cores=(
+            0x0, 0x1, 0x2, 0x3, 0x4, 0x5,
+            0x10100, 0x10101, 0x10102, 0x10103,
+        ),
+        efficiency=(0, 0, 0, 0, 0, 0, 1, 1, 1, 1),
+        gicd_base=0x5000000000,
+        gicr_base=0x5100000000,
+        gicr_stride=0x20000,
+        uart_base=0x3AD200000,
+        uart_irq=1046,
+        fd_size=0x1E00000,
+    ),
+}
 
 
 class Checker:
     def __init__(self) -> None:
         self.failures: list[str] = []
-        self.notes: list[str] = []
 
     def check(self, ok: bool, message: str) -> bool:
         if ok:
@@ -53,9 +82,103 @@ class Checker:
             self.failures.append(message)
         return ok
 
-    def note(self, message: str) -> None:
-        self.notes.append(message)
+    @staticmethod
+    def note(message: str) -> None:
         print(f"  info {message}")
+
+
+# --------------------------------------------------------------------------
+# Helpers shared by the assertion pass and the topology dump.
+# --------------------------------------------------------------------------
+
+def cluster_id(mpidr: int) -> int:
+    """Aff1:Aff0-style cluster identity of an MPIDR, ignoring the core bits."""
+    return (mpidr >> 8) & 0xFFFF
+
+
+def cluster_runs(cores: tuple[int, ...] | list[int]) -> list[list[int]]:
+    """Split the core list into contiguous runs that share a cluster.
+
+    Apple numbers E-core MPIDRs 0..5 (cluster 0) and P-core MPIDRs 0x10100..
+    (cluster 0x101), and the MADT lists E cores first, so a cluster is always a
+    contiguous run in ACPI UID order.
+    """
+    runs: list[list[int]] = []
+    for index, mpidr in enumerate(cores):
+        cid = cluster_id(mpidr)
+        if runs and cluster_id(cores[runs[-1][0]]) == cid:
+            runs[-1].append(index)
+        else:
+            runs.append([index])
+    return runs
+
+
+def madt_entries(data: bytes, ck: Checker | None = None):
+    """Yield (entry_type, offset, length) for every MADT entry."""
+    entries = []
+    off = 44
+    while off + 2 <= len(data):
+        etype, elen = data[off], data[off + 1]
+        if elen < 2 or off + elen > len(data):
+            if ck is not None:
+                ck.check(False, f"MADT: entry at 0x{off:x} has bad length {elen}")
+            return entries
+        entries.append((etype, off, elen))
+        off += elen
+    return entries
+
+
+def read_madt(data: bytes, ck: Checker | None = None) -> dict:
+    """Extract the fields the checks need from a MADT, without asserting."""
+    entries = madt_entries(data, ck)
+    info: dict = {
+        "gicds": [off for (t, off, _) in entries if t == 0x0C],
+        "gicrs": [(off, length) for (t, off, length) in entries if t == 0x0E],
+        "uids": [],
+        "mpidrs": [],
+        "efficiency": [],
+        "per_cpu_gicr": [],
+        "gicc_lengths": [],
+    }
+    for etype, off, length in entries:
+        if etype != 0x0B:
+            continue
+        info["gicc_lengths"].append(length)
+        if length < 80:
+            continue
+        info["uids"].append(struct.unpack_from("<I", data, off + 8)[0])
+        info["per_cpu_gicr"].append(struct.unpack_from("<Q", data, off + 60)[0])
+        info["mpidrs"].append(struct.unpack_from("<Q", data, off + 68)[0])
+        info["efficiency"].append(data[off + 76])
+    if info["gicds"]:
+        info["gicd_base"] = struct.unpack_from("<Q", data, info["gicds"][0] + 8)[0]
+    if info["gicrs"]:
+        off = info["gicrs"][0][0]
+        info["gicr_base"] = struct.unpack_from("<Q", data, off + 4)[0]
+        info["gicr_size"] = struct.unpack_from("<I", data, off + 12)[0]
+    return info
+
+
+def read_pptt(data: bytes, ck: Checker | None = None) -> list[dict]:
+    """Extract processor-hierarchy nodes from a PPTT."""
+    nodes: list[dict] = []
+    off = 36
+    while off + 4 <= len(data):
+        ntype, nlen = data[off], data[off + 1]
+        if nlen < 4 or off + nlen > len(data):
+            if ck is not None:
+                ck.check(False, f"PPTT: node at 0x{off:x} has bad length {nlen}")
+            return nodes
+        node = {"type": ntype, "offset": off, "length": nlen}
+        if ntype == 0 and nlen >= 20:
+            # edk2 uses UINT16 Reserved + UINT32 Flags, so Parent is at 8.
+            node["flags"] = struct.unpack_from("<I", data, off + 4)[0]
+            node["parent"] = struct.unpack_from("<I", data, off + 8)[0]
+            node["acpi_id"] = struct.unpack_from("<I", data, off + 12)[0]
+            node["resources"] = struct.unpack_from("<I", data, off + 16)[0]
+        nodes.append(node)
+        off += nlen
+    return nodes
 
 
 def acpi_header(data: bytes, name: str, ck: Checker) -> bool:
@@ -68,8 +191,8 @@ def acpi_header(data: bytes, name: str, ck: Checker) -> bool:
     length = struct.unpack_from("<I", data, 4)[0]
     revision = data[8]
     checksum = data[9]
-    oem_id = data[10:16].decode("ascii", "replace").rstrip()
-    oem_table = data[16:24].decode("ascii", "replace").rstrip()
+    oem_id = data[10:16].decode("ascii", "replace").rstrip("\0")
+    oem_table = data[16:24].decode("ascii", "replace").rstrip("\0")
     oem_rev = struct.unpack_from("<I", data, 24)[0]
 
     if not ck.check(sig == name, f"{name}: signature is {sig!r}"):
@@ -86,7 +209,8 @@ def acpi_header(data: bytes, name: str, ck: Checker) -> bool:
     else:
         ck.check(total == 0, f"{name}: checksum over {length} bytes is valid")
 
-    ck.note(f"{name}: rev {revision}, OEM {oem_id}/{oem_table}, oem rev 0x{oem_rev:x}")
+    ck.note(f"{name}: rev {revision}, OEM {oem_id}/{oem_table}, "
+            f"oem rev 0x{oem_rev:x}")
     return True
 
 
@@ -109,101 +233,75 @@ def find_tables(build_dir: str) -> dict[str, str]:
     return tables
 
 
-def parse_madt(data: bytes, ck: Checker) -> None:
-    header_len = 44
-    entries: list[tuple[int, int, int]] = []  # (type, offset, length)
-    off = header_len
-    while off + 2 <= len(data):
-        etype = data[off]
-        elen = data[off + 1]
-        if elen < 2 or off + elen > len(data):
-            ck.check(False, f"MADT: entry at 0x{off:x} has bad length {elen}")
-            return
-        entries.append((etype, off, elen))
-        off += elen
+# --------------------------------------------------------------------------
+# Per-table checks.
+# --------------------------------------------------------------------------
 
-    giccs = [(o, l) for (t, o, l) in entries if t == 0x0B]
-    gicds = [(o, l) for (t, o, l) in entries if t == 0x0C]
-    gicrs = [(o, l) for (t, o, l) in entries if t == 0x0E]
+def check_madt(data: bytes, ck: Checker, plat: Platform) -> None:
+    info = read_madt(data, ck)
+    cores = plat.cores
+    count = len(cores)
+    giccs = len(info["gicc_lengths"])
 
-    ck.check(len(giccs) == 10, f"MADT: 10 GICC entries (found {len(giccs)})")
-    ck.check(len(gicds) >= 1, f"MADT: has a GICD entry ({len(gicds)} found)")
-    ck.check(len(gicrs) >= 1, f"MADT: has a GICR discovery range ({len(gicrs)} found)")
+    ck.check(giccs == count,
+             f"MADT: {count} GICC entries (found {len(info['gicc_lengths'])})")
+    ck.check(len(info["gicds"]) >= 1,
+             f"MADT: has a GICD entry ({len(info['gicds'])} found)")
+    ck.check(len(info["gicrs"]) >= 1,
+             f"MADT: has a GICR discovery range ({len(info['gicrs'])} found)")
 
-    if gicds:
-        off, length = gicds[0]
-        base = struct.unpack_from("<Q", data, off + 8)[0]
-        ck.check(base == GICD_BASE,
-                 f"MADT: GICD base 0x{base:x} == 0x{GICD_BASE:x}")
+    if info["gicds"]:
+        base = info.get("gicd_base", 0)
+        ck.check(base == plat.gicd_base,
+                 f"MADT: GICD base 0x{base:x} == 0x{plat.gicd_base:x}")
 
-    if gicrs:
-        off, length = gicrs[0]
-        base = struct.unpack_from("<Q", data, off + 4)[0]
-        size = struct.unpack_from("<I", data, off + 12)[0]
-        ck.check(base == GICR_BASE and size == GICR_STRIDE * 10,
+    if info["gicrs"]:
+        base = info.get("gicr_base", 0)
+        size = info.get("gicr_size", 0)
+        want = plat.gicr_stride * count
+        ck.check(base == plat.gicr_base and size == want,
                  f"MADT: GICR range 0x{base:x}+0x{size:x} == "
-                 f"0x{GICR_BASE:x}+0x{GICR_STRIDE * 10:x}")
+                 f"0x{plat.gicr_base:x}+0x{want:x}")
 
-    if len(giccs) != 10:
+    if giccs != count:
+        ck.note(f"      skipping per-core checks: expected {count} GICCs")
         return
 
     # ACPI 6.3 GICC layout: the 6.0 view is missing the GICH and
     # VGICMaintenanceInterrupt fields, which shift GICR/MPIDR by 12 bytes.
-    uids: list[int] = []
-    mpids: list[int] = []
-    effs: list[int] = []
-    per_cpu_gicr: list[int] = []
+    if not ck.check(all(length >= 80 for length in info["gicc_lengths"]),
+                    "MADT: every GICC is at least 80 bytes (ACPI 6.3)"):
+        return
 
-    for index, (off, length) in enumerate(giccs):
-        if length < 80:
-            ck.check(False, f"MADT: GICC {index} is {length} bytes, expected 80")
-            return
-        uids.append(struct.unpack_from("<I", data, off + 8)[0])
-        per_cpu_gicr.append(struct.unpack_from("<Q", data, off + 60)[0])
-        mpids.append(struct.unpack_from("<Q", data, off + 68)[0])
-        effs.append(data[off + 76])
-
-    ck.check(uids == list(range(10)), f"MADT: GICC UIDs are 0..9 (got {uids})")
-    ck.check(mpids == EXPECTED_MPIDRS,
-             "MADT: MPIDRs are 0x0-0x5 (E) then 0x10100-0x10103 (P)")
-    if mpids != EXPECTED_MPIDRS:
-        ck.note(f"      expected {[hex(m) for m in EXPECTED_MPIDRS]}")
-        ck.note(f"      actual   {[hex(m) for m in mpids]}")
-    ck.check(effs == [0] * 6 + [1] * 4,
-             f"MADT: efficiency class 0 for E-cores, 1 for P-cores (got {effs})")
+    ck.check(info["uids"] == list(range(count)),
+             f"MADT: GICC UIDs are 0..{count - 1} (got {info['uids']})")
+    if not ck.check(info["mpidrs"] == list(cores),
+                    "MADT: MPIDRs match the platform core list"):
+        ck.note(f"      expected {[hex(m) for m in cores]}")
+        ck.note(f"      actual   {[hex(m) for m in info['mpidrs']]}")
+    ck.check(info["efficiency"] == list(plat.efficiency),
+             f"MADT: efficiency class {list(plat.efficiency)} "
+             f"(got {info['efficiency']})")
     # A zero per-CPU GICR base means "use the GICR discovery range" (ACPI 6.3).
-    ck.check(per_cpu_gicr == [0] * 10,
+    ck.check(info["per_cpu_gicr"] == [0] * count,
              "MADT: per-CPU GICR bases are 0, GICR range is authoritative")
 
 
-def parse_pptt(data: bytes, ck: Checker) -> None:
-    header_len = 36
-    nodes: list[dict] = []
-    off = header_len
-    while off + 4 <= len(data):
-        ntype = data[off]
-        nlen = data[off + 1]
-        if nlen < 4 or off + nlen > len(data):
-            ck.check(False, f"PPTT: node at 0x{off:x} has bad length {nlen}")
-            return
-        node = {"type": ntype, "offset": off, "length": nlen}
-        if ntype == 0 and nlen >= 20:  # processor hierarchy node
-            # edk2 uses UINT16 Reserved + UINT32 Flags, so Parent is at 8.
-            node["flags"] = struct.unpack_from("<I", data, off + 4)[0]
-            node["parent"] = struct.unpack_from("<I", data, off + 8)[0]
-            node["acpi_id"] = struct.unpack_from("<I", data, off + 12)[0]
-            node["resources"] = struct.unpack_from("<I", data, off + 16)[0]
-        nodes.append(node)
-        off += nlen
+def check_pptt(data: bytes, ck: Checker, plat: Platform) -> None:
+    nodes = read_pptt(data, ck)
+    cores = plat.cores
+    runs = cluster_runs(cores)
+    expected_nodes = 1 + len(runs) + len(cores)
 
-    ck.check(len(nodes) == 13,
-             f"PPTT: 13 nodes = 1 package + 2 clusters + 10 cores (found {len(nodes)})")
-    if len(nodes) != 13:
+    ck.check(len(nodes) == expected_nodes,
+             f"PPTT: {expected_nodes} nodes = 1 package + {len(runs)} clusters "
+             f"+ {len(cores)} cores (found {len(nodes)})")
+    if len(nodes) != expected_nodes:
         return
 
     for index, node in enumerate(nodes):
-        if node["type"] != 0:
-            ck.check(False, f"PPTT: node {index} has unexpected type {node['type']}")
+        if not ck.check(node["type"] == 0,
+                        f"PPTT: node {index} is a processor hierarchy node"):
             continue
         parent = node["parent"]
         if index == 0:
@@ -220,27 +318,36 @@ def parse_pptt(data: bytes, ck: Checker) -> None:
     # its cores), so classify by parent rather than by table order.
     package = nodes[0]["offset"]
     clusters = [n for n in nodes[1:] if n.get("parent") == package]
-    cores = [n for n in nodes[1:] if n.get("parent") in {c["offset"] for c in clusters}]
+    cluster_offsets = {c["offset"] for c in clusters}
+    core_nodes = [n for n in nodes[1:] if n.get("parent") in cluster_offsets]
 
     ck.check(nodes[0]["acpi_id"] == 0,
              f"PPTT: package ACPI ID is 0 (got {nodes[0]['acpi_id']})")
-    ck.check(len(clusters) == 2, f"PPTT: 2 clusters (found {len(clusters)})")
-    ck.check(len(cores) == 10, f"PPTT: 10 cores (found {len(cores)})")
-    if len(clusters) != 2 or len(cores) != 10:
+    ck.check(len(clusters) == len(runs),
+             f"PPTT: {len(runs)} clusters (found {len(clusters)})")
+    ck.check(len(core_nodes) == len(cores),
+             f"PPTT: {len(cores)} cores (found {len(core_nodes)})")
+    if len(clusters) != len(runs) or len(core_nodes) != len(cores):
         return
-    ck.check(sorted(c["acpi_id"] for c in clusters) == [0, 1],
-             "PPTT: cluster ACPI IDs are 0 and 1")
-    core_ids = [c["acpi_id"] for c in cores]
-    ck.check(core_ids == list(range(10)),
-             f"PPTT: core ACPI IDs are 0..9 in MADT order (got {core_ids})")
-    # The efficiency cluster must come first, matching MADT UIDs 0-5.
-    e_cluster = clusters[0]
-    e_ids = [c["acpi_id"] for c in cores if c["parent"] == e_cluster["offset"]]
-    ck.check(e_ids == list(range(6)),
-             f"PPTT: first cluster holds cores 0..5 (got {e_ids})")
+
+    ck.check(sorted(c["acpi_id"] for c in clusters) == list(range(len(runs))),
+             f"PPTT: cluster ACPI IDs are 0..{len(runs) - 1}")
+
+    for run_index, run in enumerate(runs):
+        cluster = clusters[run_index]
+        members = [c["acpi_id"] for c in core_nodes
+                   if c["parent"] == cluster["offset"]]
+        ck.check(members == run,
+                 f"PPTT: cluster {run_index} holds cores {run[0]}..{run[-1]} "
+                 f"(got {members})")
+
+    core_ids = [c["acpi_id"] for c in core_nodes]
+    ck.check(core_ids == list(range(len(cores))),
+             f"PPTT: core ACPI IDs are 0..{len(cores) - 1} in MADT order "
+             f"(got {core_ids})")
 
 
-def parse_fadt(data: bytes, ck: Checker) -> None:
+def check_fadt(data: bytes, ck: Checker) -> None:
     flags = struct.unpack_from("<I", data, 112)[0]
     arm_flags = struct.unpack_from("<H", data, 129)[0]
     ck.check(bool(flags & (1 << 20)), "FADT: hardware-reduced ACPI set")
@@ -249,7 +356,7 @@ def parse_fadt(data: bytes, ck: Checker) -> None:
     ck.check(not (arm_flags & 0x2), "FADT: PSCI calls use SMC (m1n1 traps them)")
 
 
-def parse_gtdt(data: bytes, ck: Checker) -> None:
+def check_gtdt(data: bytes, ck: Checker) -> None:
     non_secure_pl1 = struct.unpack_from("<I", data, 56)[0]
     virt = struct.unpack_from("<I", data, 64)[0]
     platform_timers = struct.unpack_from("<I", data, 88)[0]
@@ -260,15 +367,14 @@ def parse_gtdt(data: bytes, ck: Checker) -> None:
              f"GTDT: no memory-mapped timer frames ({platform_timers})")
 
 
-def parse_dbg2(data: bytes, ck: Checker) -> None:
+def check_dbg2(data: bytes, ck: Checker, plat: Platform) -> None:
     header_len = 44
     count = struct.unpack_from("<I", data, header_len - 4)[0]
     ck.check(count >= 1, f"DBG2: at least one debug device ({count})")
     if count < 1:
         return
     off = header_len
-    if off + 12 > len(data):
-        ck.check(False, "DBG2: truncated device descriptor")
+    if not ck.check(off + 12 <= len(data), "DBG2: device descriptor present"):
         return
     nlen = struct.unpack_from("<H", data, off + 1)[0]
     ck.check(nlen >= 22, f"DBG2: device descriptor length {nlen}")
@@ -278,17 +384,20 @@ def parse_dbg2(data: bytes, ck: Checker) -> None:
     if not ck.check(gas_off + 12 <= len(data), "DBG2: GAS fits in the table"):
         return
     base = struct.unpack_from("<Q", data, gas_off + 4)[0]
-    ck.check(base == UART_BASE,
-             f"DBG2: debug UART at 0x{base:x} == 0x{UART_BASE:x}")
+    ck.check(base == plat.uart_base,
+             f"DBG2: debug UART at 0x{base:x} == 0x{plat.uart_base:x}")
 
 
-def check_dsdt(data: bytes, ck: Checker) -> None:
-    names = [f"CPU{i}" for i in range(10)] + ["COM0", "DIE0", "CLU0", "CLU1"]
+def check_dsdt(data: bytes, ck: Checker, plat: Platform) -> None:
+    count = len(plat.cores)
+    runs = cluster_runs(plat.cores)
+    names = [f"CPU{i}" for i in range(count)]
+    names += ["COM0", "DIE0"] + [f"CLU{i}" for i in range(len(runs))]
     for name in names:
         ck.check(name.encode() in data, f"DSDT: {name} device present")
 
 
-def check_image(build_dir: str, ck: Checker) -> None:
+def check_image(build_dir: str, ck: Checker, plat: Platform) -> None:
     """Validate the FD image header and size contract."""
     candidates = glob.glob(os.path.join(os.path.dirname(build_dir.rstrip("/")),
                                         "FV", "*_EFI.fd"))
@@ -297,11 +406,11 @@ def check_image(build_dir: str, ck: Checker) -> None:
         return
     path = candidates[0]
     size = os.path.getsize(path)
-    ck.check(size <= FD_SIZE,
+    ck.check(size <= plat.fd_size,
              f"image: {os.path.basename(path)} is 0x{size:x} bytes "
-             f"(FDF size 0x{FD_SIZE:x})")
-    if size != FD_SIZE:
-        ck.note(f"image: image ends 0x{FD_SIZE - size:x} bytes before the "
+             f"(FDF size 0x{plat.fd_size:x})")
+    if size != plat.fd_size:
+        ck.note(f"image: image ends 0x{plat.fd_size - size:x} bytes before the "
                 f"declared FD size")
 
     with open(path, "rb") as f:
@@ -310,12 +419,53 @@ def check_image(build_dir: str, ck: Checker) -> None:
     text_offset = struct.unpack_from("<Q", header, 8)[0]
     image_size = struct.unpack_from("<Q", header, 16)[0]
     flags = struct.unpack_from("<Q", header, 24)[0]
-    ck.check(text_offset == 0x80000, f"image: text_offset 0x{text_offset:x} == 0x80000")
-    ck.check(size <= image_size <= FD_SIZE,
+    ck.check(text_offset == 0x80000,
+             f"image: text_offset 0x{text_offset:x} == 0x80000")
+    ck.check(size <= image_size <= plat.fd_size,
              f"image: header image_size 0x{image_size:x} covers the payload "
-             f"(0x{size:x}) and fits the FD (0x{FD_SIZE:x})")
+             f"(0x{size:x}) and fits the FD (0x{plat.fd_size:x})")
     ck.check(flags == 0, f"image: flags 0x{flags:x} (little-endian)")
-    ck.note(f"image: loaded at 0x{FD_BASE:x}")
+
+
+# --------------------------------------------------------------------------
+# Modes.
+# --------------------------------------------------------------------------
+
+def print_topology(build_dir: str, tables: dict[str, str]) -> int:
+    """Print a Platform entry describing the tables in a build tree."""
+    for needed in ("APIC", "DBG2"):
+        if needed not in tables:
+            sys.exit(f"error: no {needed} table in this build tree")
+
+    with open(tables["APIC"], "rb") as f:
+        madt = read_madt(f.read())
+    with open(tables["DBG2"], "rb") as f:
+        dbg2 = f.read()
+    uart = struct.unpack_from("<Q", dbg2, 44 + 22 + 4)[0]
+
+    mpidrs = madt["mpidrs"]
+    cores = ",\n            ".join(
+        ", ".join(f"0x{m:x}" for m in mpidrs[i:i + 6])
+        for i in range(0, len(mpidrs), 6)
+    )
+    print("Copy this into PLATFORMS, then verify every value against the machine")
+    print("and record the source in docs/hardware-values.md:\n")
+    print('    "<platform>": Platform(')
+    print('        name="<model> (<chip>)",')
+    print(f"        cores=(\n            {cores},\n        ),")
+    print(f"        efficiency={tuple(madt['efficiency'])!r},")
+    print(f"        gicd_base=0x{madt.get('gicd_base', 0):x},")
+    print(f"        gicr_base=0x{madt.get('gicr_base', 0):x},")
+    print(f"        gicr_stride=0x{madt.get('gicr_size', 0) // max(len(mpidrs), 1):x},")
+    print(f"        uart_base=0x{uart:x},")
+    print("        uart_irq=<AIC IRQ>,")
+    images = glob.glob(os.path.join(os.path.dirname(build_dir.rstrip("/")),
+                                    "FV", "*_EFI.fd"))
+    if images:
+        print(f"        fd_size=0x{os.path.getsize(images[0]):x},  "
+              f"# actual image size")
+    print("    ),")
+    return 0
 
 
 def resolve_build_dir(platform: str, build_dir: str | None) -> str:
@@ -337,14 +487,29 @@ def main() -> int:
                         help="platform package name (default: Mac16_3)")
     parser.add_argument("--build-dir", default=None,
                         help="build output directory containing AARCH64/")
+    parser.add_argument("--print-topology", action="store_true",
+                        help="print a PLATFORMS entry for the build tree")
     args = parser.parse_args()
 
     build_dir = resolve_build_dir(args.platform, args.build_dir)
-    print(f"checking {args.platform}: {build_dir}\n")
-
     tables = find_tables(build_dir)
     if not tables:
         sys.exit(f"error: no ACPI tables found under {build_dir}")
+
+    if args.print_topology:
+        print(f"topology of {build_dir}\n")
+        return print_topology(build_dir, tables)
+
+    plat = PLATFORMS.get(args.platform)
+    if plat is None:
+        sys.exit(
+            f"error: no validated expectations for platform '{args.platform}'.\n"
+            f"  validated: {', '.join(sorted(PLATFORMS))}\n"
+            f"  run with --print-topology to generate an entry, then check "
+            f"every value against the machine before adding it."
+        )
+
+    print(f"checking {plat.name}: {build_dir}\n")
 
     ck = Checker()
     order = [("MADT", "APIC"), ("PPTT", "PPTT"), ("FADT", "FACP"),
@@ -360,21 +525,21 @@ def main() -> int:
         if not acpi_header(data, sig, ck):
             continue
         if sig == "APIC":
-            parse_madt(data, ck)
+            check_madt(data, ck, plat)
         elif sig == "PPTT":
-            parse_pptt(data, ck)
+            check_pptt(data, ck, plat)
         elif sig == "FACP":
-            parse_fadt(data, ck)
+            check_fadt(data, ck)
         elif sig == "DSDT":
-            check_dsdt(data, ck)
+            check_dsdt(data, ck, plat)
         elif sig == "DBG2":
-            parse_dbg2(data, ck)
+            check_dbg2(data, ck, plat)
         elif sig == "GTDT":
-            parse_gtdt(data, ck)
+            check_gtdt(data, ck)
         print()
 
     print("image")
-    check_image(build_dir, ck)
+    check_image(build_dir, ck, plat)
     print()
 
     if ck.failures:

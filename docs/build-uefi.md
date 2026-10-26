@@ -117,9 +117,24 @@ an invariant breaks. It parses the tables the build emits and checks:
 - the FD: ARM64 Image header, `text_offset` `0x80000`, and an `image_size` that
   covers the payload.
 
-Run it on its own with `./scripts/check-acpi.py`; pass
-`--platform MacBookProEarly2023` for the reference package or `--build-dir`
-for a build tree somewhere else.
+Run it on its own with `./scripts/check-acpi.py`; pass `--build-dir` for a build
+tree somewhere else.
+
+Expectations are per platform, in the `PLATFORMS` table at the top of the
+script, and only `Mac16_3` has validated entries. Any other platform is an
+error, not a pass: the M2 reference package would have failed five of the M4
+assertions, so a generic checker would have been actively misleading. To bring
+up a new SoC (an M4 Pro/Max, say), build it once, then
+
+```bash
+./scripts/check-acpi.py --print-topology --build-dir <tree>/AARCH64
+```
+
+prints a ready-to-paste `Platform` entry with the core MPIDRs, efficiency
+classes, vGIC bases and UART address read from the build. Verify every value
+against the machine and record its source in `docs/hardware-values.md` before
+adding it to `PLATFORMS`; the checker never treats a recorded value as
+authoritative on its own.
 
 The checker has its own regression tests (`tests/test_check_acpi.py`). They run
 it against the real tables from an M4 build, kept as fixtures under

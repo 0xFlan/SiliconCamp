@@ -1,0 +1,35 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The fixtures are the real tables an M4 build produced, so this proves the
+      # checker still understands Project Mu's output and still rejects mutated
+      # tables. It needs no firmware build and no Apple hardware.
+      - name: ACPI checker regression tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Python syntax
+        run: python3 -m py_compile scripts/check-acpi.py tests/test_check_acpi.py
+
+      - name: Shell syntax
+        run: |
+          for f in scripts/*.sh; do
+            bash -n "$f" || exit 1
+          done
+          echo "all scripts parse"
