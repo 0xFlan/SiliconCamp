@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Check the macOS host toolchain for the M4Windows bring-up tree.
+# Check the macOS host toolchain for the SiliconCamp bring-up tree.
 # This script only inspects the host; it does not install anything.
 set -euo pipefail
 
