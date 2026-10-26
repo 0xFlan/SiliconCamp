@@ -1,7 +1,7 @@
 # Status — 2026-10-26
 
 Host and target are the same machine: `Mac16,3` iMac (`target-type J624`), Apple M4
-(`T8132`), 10 cores (6 efficiency + 4 performance), 24 GB, macOS Darwin 25.6.0,
+(`T8132`), 10 cores (6 efficiency + 4 performance), 24 GB, macOS 26.6.2 (Darwin 25.6.0),
 firmware `18000.161.10`.
 
 ## Verified in this repository
