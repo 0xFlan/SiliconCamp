@@ -77,7 +77,7 @@ them compressed inside the Project Mu FV), and enforced by
 | SMMU/DART abstraction | Stub | `hv_smmu.c` is 45 lines; not a real IOMMU. |
 | vTPM | Stub | `hv_vtpm.c` is 16 lines; no TPM 2.0. |
 | NTASP UEFI firmware | Builds | M2 reference and M4 `Mac16_3` package both build in the Lima VM. |
-| M4 platform package | Builds, ACPI checked | `Silicon/Apple/T8132FamilyPkg` + `Platform/Mac16_3Pkg`; CPU/RAM/UART/PPTT now match the J624 hardware. PCIe/ANS2 still not wired. |
+| M4 platform package | Builds, ACPI checked | `Silicon/Apple/T8132FamilyPkg` + `Platform/Mac16_3Pkg`; CPU/RAM/UART/PPTT match the J624 hardware. PCIe now uses the J624 ECAM/window addresses and the map covers them (`docs/pcie.md`); the DSDT root bridge and ANS2 driver are still missing. |
 | M4 USB path | Prepared, untested | Four DWC3 controllers are described by `PcdAppleNumDwc3Controllers`; the low 1 GB MMIO window (USB and USB DARTs) is mapped. The DWC3/XHCI stack still needs hardware validation. |
 | NTASP AIC DXE | Partial | AICv1/v2; AICv3 is an explicit TODO. The M4 package uses the vGIC path. |
 | NTASP Windows drivers | Empty | Repository is README-only. |
@@ -90,9 +90,12 @@ them compressed inside the Project Mu FV), and enforced by
 
 1. **Hardware boot of m1n1 and the UEFI firmware.** The build and ACPI tables are
    coherent, but nothing has run on the M4. This is gated by `docs/safety.md`.
-2. **PCIe and storage.** The APCIE ECAM and MMIO windows are known, but the UEFI
-   host bridge still uses the old T602X PCDs. The internal SSD needs an ANS2
-   driver; until then, USB storage is the only installer target.
+2. **PCIe and storage.** The host bridge now points at the J624 ECAM
+   (`0x1cb0000000`) and maps the device windows, instead of the T602X addresses
+   that do not exist on this SoC. The exact window bounds, MSI base and DART
+   setup still need an `ioreg` capture, and the internal SSD needs an ANS2
+   driver (`AppleNANDStorageDxe` is a stub); until then, USB storage is the only
+   installer target.
 3. **Windows kernel handoff.** This is the project-wide blocker; it is not
    M4-specific, but M4 cannot bypass it.
 4. **Drivers.** Even a booting kernel has no internal disk, display, input, or

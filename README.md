@@ -89,7 +89,7 @@ third_party/ntasp-drivers/   Windows drivers/HAL extensions (currently empty)
 ## What is still missing
 
 1. Hardware validation: the firmware builds and its CPU/RAM/UART/ACPI topology matches the machine, but m1n1 and the UEFI image have not run on the M4 yet.
-2. PCIe and storage: the APCIE ECAM is known (`0x1cb0000000`), but the UEFI host bridge still uses the T602X PCDs; the internal ANS2 SSD has no driver. USB storage is the current install path.
+2. PCIe and storage: the host bridge and memory map now use the J624 APCIE ECAM (`0x1cb0000000`) and device windows instead of the T602X addresses; the exact window bounds and MSI base still need an `ioreg` capture, the root bridge is not yet in the DSDT, and the internal ANS2 SSD has no driver. USB storage is the current install path. See `docs/pcie.md`.
 3. A working Windows loader-to-kernel handoff (the central unsolved bug, even on M1/M2).
 4. Windows drivers: ANS NVMe, DART, PCIe, DCP display, SPI input, SMC, USB, Wi-Fi/Bluetooth.
 5. A Windows AGX GPU driver.

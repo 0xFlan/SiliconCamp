@@ -90,12 +90,18 @@ use a USB disk. PCIe is not yet described to the guest.
 ## PCIe
 
 The J624 APCIE ECAM is at `0x1cb0000000` (256 MB), with WLAN, Bluetooth, Ethernet,
-and four `apciec` USB4/Thunderbolt root complexes behind it. The UEFI host bridge
-still uses the T602X PCDs, so PCIe is intentionally disabled/omitted from the
-DSDT. Wiring it up requires:
+and four `apciec` USB4/Thunderbolt root complexes behind it. The T602X PCDs that
+pointed the host bridge at `0x580000000` are now replaced with the J624 values
+(ECAM, bus range 0–8, `0xb8000000`/1 GB non-prefetchable, `0xbc0000000`/512 MB
+prefetchable), and the ECAM plus both windows are mapped in
+`T8132FamilyVirtualMemoryMapDefines.h`. See `docs/pcie.md` for sources and for
+what is still uncaptured (exact window bounds, MSI base, DARTs).
 
-1. setting `PcdPciExpressBaseAddress` and the bus/MMIO windows from the J624
-   `apcie`/`apciec` nodes;
+PCIe is still omitted from the DSDT, so Windows sees no root bridge yet.
+Finishing it requires:
+
+1. capturing the J624 `apcie` `ranges`/`assigned-addresses` and correcting the
+   two window defines if they differ from the inferred bounds;
 2. enabling `AppleSiliconPciPlatformDxe` (or replacing the generic host bridge);
 3. adding the ECAM and PCIe MMIO ranges to the virtual memory map with nGnRE;
 4. validating that the DARTs and MSI path work for each root complex;

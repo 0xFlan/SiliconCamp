@@ -173,8 +173,10 @@ The ARM64 Image header in `Mac16_3.fdf` carried upstream's `image_size`
 The following remain provisional and must be checked on hardware or before PCIe is
 exposed to Windows:
 
-- PCIe ECAM/MMIO windows for each `apcie`/`apciec` root complex. The UEFI host
-  bridge still uses the T602X PCDs, and PCIe is omitted from the DSDT.
+- PCIe window bounds and MSI base for each `apcie`/`apciec` root complex. The
+  host bridge now uses the J624 ECAM (`0x1cb0000000`) and maps the device
+  windows, but the bounds are inferred and PCIe is still omitted from the DSDT;
+  `docs/pcie.md` lists the `ioreg` capture that settles it.
 - ANS2/SART storage for the internal SSD; USB storage is the current install path.
 - DCP/display handoff beyond the iBoot framebuffer.
 

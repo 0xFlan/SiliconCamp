@@ -1,6 +1,6 @@
 diff --git a/Platform/Mac16_3Pkg/AcpiTables/DBG2.aslc b/Platform/Mac16_3Pkg/AcpiTables/DBG2.aslc
 new file mode 100644
-index 0000000000000000000000000000000000000000..3060ab928ee8e21ed0da555422dd6acb30a2eeb0
+index 0000000..3060ab9
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/AcpiTables/DBG2.aslc
 @@ -0,0 +1,107 @@
@@ -114,7 +114,7 @@ index 0000000000000000000000000000000000000000..3060ab928ee8e21ed0da555422dd6acb
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl b/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl
 new file mode 100644
-index 0000000000000000000000000000000000000000..fb6581dde9db67487fec31d0c2419b3af52ca2b2
+index 0000000..fb6581d
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl
 @@ -0,0 +1,230 @@
@@ -350,7 +350,7 @@ index 0000000000000000000000000000000000000000..fb6581dde9db67487fec31d0c2419b3a
 +}
 diff --git a/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf b/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
 new file mode 100644
-index 0000000000000000000000000000000000000000..3a0d8fdad99d99f86c36d7a58ef7cb5a54abd7f4
+index 0000000..3a0d8fd
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
 @@ -0,0 +1,49 @@
@@ -406,7 +406,7 @@ index 0000000000000000000000000000000000000000..3a0d8fdad99d99f86c36d7a58ef7cb5a
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/AcpiTables/FADT.aslc b/Platform/Mac16_3Pkg/AcpiTables/FADT.aslc
 new file mode 100644
-index 0000000000000000000000000000000000000000..7805648a3acdb1a73832daab388f185b5124c2fa
+index 0000000..7805648
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/AcpiTables/FADT.aslc
 @@ -0,0 +1,97 @@
@@ -510,7 +510,7 @@ index 0000000000000000000000000000000000000000..7805648a3acdb1a73832daab388f185b
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/Mac16_3.dsc b/Platform/Mac16_3Pkg/Mac16_3.dsc
 new file mode 100644
-index 0000000000000000000000000000000000000000..74f35ea393c0a44a923b9234f645ef64a05aca1d
+index 0000000..74f35ea
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/Mac16_3.dsc
 @@ -0,0 +1,80 @@
@@ -597,7 +597,7 @@ index 0000000000000000000000000000000000000000..74f35ea393c0a44a923b9234f645ef64
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/Mac16_3.fdf b/Platform/Mac16_3Pkg/Mac16_3.fdf
 new file mode 100644
-index 0000000000000000000000000000000000000000..75a7c8899911d2c5933fbbd87b7cb74f3f347011
+index 0000000..75a7c88
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/Mac16_3.fdf
 @@ -0,0 +1,305 @@
@@ -908,7 +908,7 @@ index 0000000000000000000000000000000000000000..75a7c8899911d2c5933fbbd87b7cb74f
 +
 diff --git a/Platform/Mac16_3Pkg/Mac16_3Pkg.dec b/Platform/Mac16_3Pkg/Mac16_3Pkg.dec
 new file mode 100644
-index 0000000000000000000000000000000000000000..af726eb429930bf54600ef14521d955ef4b49f61
+index 0000000..af726eb
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/Mac16_3Pkg.dec
 @@ -0,0 +1,12 @@
@@ -926,7 +926,7 @@ index 0000000000000000000000000000000000000000..af726eb429930bf54600ef14521d955e
 +
 diff --git a/Platform/Mac16_3Pkg/PlatformBuild.py b/Platform/Mac16_3Pkg/PlatformBuild.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e3c2a97d8d2992561883dfd25aee0c33846d9d33
+index 0000000..e3c2a97
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/PlatformBuild.py
 @@ -0,0 +1,246 @@
@@ -1313,7 +1313,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/Platform/MacBookProEarly2023Pkg/PlatformBuild.py b/Platform/MacBookProEarly2023Pkg/PlatformBuild.py
-index e00f7005b684865e4eeffc83d24346ac21575c90..e43156576d270d73150c59a17b0ee6a66f7e988d 100644
+index e00f700..e431565 100644
 --- a/Platform/MacBookProEarly2023Pkg/PlatformBuild.py
 +++ b/Platform/MacBookProEarly2023Pkg/PlatformBuild.py
 @@ -33,7 +33,7 @@ class CommonPlatform():
@@ -1327,7 +1327,7 @@ index e00f7005b684865e4eeffc83d24346ac21575c90..e43156576d270d73150c59a17b0ee6a6
  
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/BERT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/BERT.aslc
 new file mode 100644
-index 0000000000000000000000000000000000000000..7014fe5fa2ff192709787a86ee7cced2cf86c4c7
+index 0000000..7014fe5
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/BERT.aslc
 @@ -0,0 +1,45 @@
@@ -1378,7 +1378,7 @@ index 0000000000000000000000000000000000000000..7014fe5fa2ff192709787a86ee7cced2
 +VOID* CONST ReferenceAcpiTable = &Bert;
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/CPUAcpiTables.inf b/Silicon/Apple/T8132FamilyPkg/AcpiTables/CPUAcpiTables.inf
 new file mode 100644
-index 0000000000000000000000000000000000000000..414daf990e1eb00f743685ca777e90c154bbe1ed
+index 0000000..414daf9
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/CPUAcpiTables.inf
 @@ -0,0 +1,45 @@
@@ -1430,7 +1430,7 @@ index 0000000000000000000000000000000000000000..414daf990e1eb00f743685ca777e90c1
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/CSRT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/CSRT.aslc
 new file mode 100644
-index 0000000000000000000000000000000000000000..833b04e64f0cb38c382c5eb68715a9894d2ca0cc
+index 0000000..833b04e
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/CSRT.aslc
 @@ -0,0 +1,46 @@
@@ -1482,7 +1482,7 @@ index 0000000000000000000000000000000000000000..833b04e64f0cb38c382c5eb68715a989
 +//
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/GTDT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/GTDT.aslc
 new file mode 100644
-index 0000000000000000000000000000000000000000..7e9b530b5edc82376de94baad7ca6c38c5a91316
+index 0000000..7e9b530
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/GTDT.aslc
 @@ -0,0 +1,134 @@
@@ -1622,7 +1622,7 @@ index 0000000000000000000000000000000000000000..7e9b530b5edc82376de94baad7ca6c38
 +VOID* CONST ReferenceAcpiTable = &Gtdt;
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc
 new file mode 100644
-index 0000000000000000000000000000000000000000..8406818ad09eff6c0dd4bc51aedbdbaaecb9ba66
+index 0000000..8406818
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc
 @@ -0,0 +1,115 @@
@@ -1743,7 +1743,7 @@ index 0000000000000000000000000000000000000000..8406818ad09eff6c0dd4bc51aedbdbaa
 +VOID* CONST ReferenceAcpiTable = &Madt;
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/PPTT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/PPTT.aslc
 new file mode 100644
-index 0000000000000000000000000000000000000000..b36ade50bf3f549c70b46fa9dfe9db3ac4731e25
+index 0000000..b36ade5
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/PPTT.aslc
 @@ -0,0 +1,148 @@
@@ -1897,10 +1897,10 @@ index 0000000000000000000000000000000000000000..b36ade50bf3f549c70b46fa9dfe9db3a
 +VOID * CONST ReferenceAcpiTable = &Pptt;
 diff --git a/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h b/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..3c80d59310a6649131e575856dfdd4bdfafa4722
+index 0000000..f6bcb5f
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,177 @@
 +/**
 + * @file AppleVirtualMemoryMapDefines.h
 + * @author amarioguy (Arminder Singh)
@@ -2059,14 +2059,32 @@ index 0000000000000000000000000000000000000000..3c80d59310a6649131e575856dfdd4bd
 +
 +
 +
++//
++// J624 PCIe windows.  Sources: docs/hardware-values.md records the APCIE ECAM
++// at 0x1cb0000000 (256 MB) from this machine's ioreg, and the WLAN/BT BARs at
++// 0xb8200000/0xb8301000, which lie inside the 32-bit window below.  The
++// prefetchable layout follows the 0xb8000000/0xbc0000000 split that Apple uses
++// on M4-class silicon; the exact bounds still need an ioreg capture (see
++// docs/pcie.md).  Without these, any PCIe access on J624 takes a translation
++// fault, because the inherited map only covered the T602X addresses.
++//
++#define APPLE_PCIE_ECAM_RANGE_BASE 0x1CB0000000
++#define APPLE_PCIE_ECAM_RANGE_SIZE 0x10000000
++
++#define APPLE_PCIE_MMIO_RANGE_23_BASE 0xB8000000
++#define APPLE_PCIE_MMIO_RANGE_23_SIZE 0x40000000
++
++#define APPLE_PCIE_MMIO_RANGE_24_BASE 0xBC0000000
++#define APPLE_PCIE_MMIO_RANGE_24_SIZE 0x20000000
++
 +#endif // APPLE_VIRTUAL_MEMORY_MAP_DEFINES_H_
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.c b/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..61dbe2e53bcd857b0fb6200c2a1ba31f15e5bfb6
+index 0000000..210f92e
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.c
-@@ -0,0 +1,596 @@
+@@ -0,0 +1,613 @@
 +/**
 + * @file MemoryInitPeiLib.c
 + * 
@@ -2099,7 +2117,7 @@ index 0000000000000000000000000000000000000000..61dbe2e53bcd857b0fb6200c2a1ba31f
 +//Device memory map configuration file for UEFI (this is to help with pagetable initialization)
 +#include <Library/T8132FamilyVirtualMemoryMapDefines.h>
 +
-+#define MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS 42
++#define MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS 48
 +
 +#define DDR_ATTRIBUTES_CACHED           ARM_MEMORY_REGION_ATTRIBUTE_WRITE_BACK
 +#define DDR_ATTRIBUTES_UNCACHED         ARM_MEMORY_REGION_ATTRIBUTE_UNCACHED_UNBUFFERED
@@ -2610,6 +2628,23 @@ index 0000000000000000000000000000000000000000..61dbe2e53bcd857b0fb6200c2a1ba31f
 +  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_16_SIZE;
 +  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
 +
++  //PCIe on J624: ECAM and the two device windows, which the inherited map
++  //did not cover (it only had the T602X addresses).
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_ECAM_RANGE_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_ECAM_RANGE_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_ECAM_RANGE_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_23_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_23_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_23_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_24_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_24_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_24_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
 +  //System DRAM
 +  VirtualMemoryTable[++Index].PhysicalBase = PcdGet64(PcdSystemMemoryBase);
 +  VirtualMemoryTable[Index].VirtualBase    = PcdGet64(PcdSystemMemoryBase);
@@ -2666,7 +2701,7 @@ index 0000000000000000000000000000000000000000..61dbe2e53bcd857b0fb6200c2a1ba31f
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.inf b/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.inf
 new file mode 100644
-index 0000000000000000000000000000000000000000..0e0a9df7939bb589840dce47223e6a872b4979e8
+index 0000000..0e0a9df
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.inf
 @@ -0,0 +1,69 @@
@@ -2741,7 +2776,7 @@ index 0000000000000000000000000000000000000000..0e0a9df7939bb589840dce47223e6a87
 +  TRUE
 diff --git a/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.c b/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..5766941e5e1d7471bcbf95beffe138164a0a14a1
+index 0000000..5766941
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.c
 @@ -0,0 +1,176 @@
@@ -2923,7 +2958,7 @@ index 0000000000000000000000000000000000000000..5766941e5e1d7471bcbf95beffe13816
 +}
 diff --git a/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.inf b/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.inf
 new file mode 100644
-index 0000000000000000000000000000000000000000..c847ca38b7eca6985a7df2841828dab26c6c4aed
+index 0000000..c847ca3
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.inf
 @@ -0,0 +1,27 @@
@@ -2956,7 +2991,7 @@ index 0000000000000000000000000000000000000000..c847ca38b7eca6985a7df2841828dab2
 +  MdeModulePkg/MdeModulePkg.dec
 diff --git a/Silicon/Apple/T8132FamilyPkg/Readme.md b/Silicon/Apple/T8132FamilyPkg/Readme.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..11eb2b734fb3d1dd4fe6c660f62b2514ac8012ba
+index 0000000..11eb2b7
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/Readme.md
 @@ -0,0 +1,7 @@
@@ -2970,7 +3005,7 @@ index 0000000000000000000000000000000000000000..11eb2b734fb3d1dd4fe6c660f62b2514
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dec b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dec
 new file mode 100644
-index 0000000000000000000000000000000000000000..3b6e2cbbbbde6b04f70da96f13f78bba06839ea1
+index 0000000..3b6e2cb
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dec
 @@ -0,0 +1,30 @@
@@ -3007,10 +3042,10 @@ index 0000000000000000000000000000000000000000..3b6e2cbbbbde6b04f70da96f13f78bba
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
 new file mode 100644
-index 0000000000000000000000000000000000000000..65c870ae6187928a69e9ca04eaf7f4b900a4086d
+index 0000000..83ccb17
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,130 @@
 +# T8132 SoC family DSC include file
 +#  Copyright (c) 2011-2015, ARM Limited. All rights reserved.
 +#  Copyright (c) 2014, Linaro Limited. All rights reserved.
@@ -3098,27 +3133,36 @@ index 0000000000000000000000000000000000000000..65c870ae6187928a69e9ca04eaf7f4b9
 +  #
 +  # Host Bridge Library settings.
 +  # 
++  #
++  # J624 (Mac16,3) PCIe.  These replace the T602X values the family inherited,
++  # which pointed the host bridge at 0x580000000 - an address that does not
++  # exist on this SoC.  Sources are recorded in docs/hardware-values.md:
++  #   - APCIE ECAM 0x1cb0000000, 256 MB, bus range 0-8 (this machine's ioreg)
++  #   - WLAN/BT BARs at 0xb8200000/0xb8301000, inside the 32-bit window
++  # The window bounds still need an ioreg capture; see docs/pcie.md.
++  #
 +  gArmTokenSpaceGuid.PcdPciBusMin|0x0
-+  gArmTokenSpaceGuid.PcdPciBusMax|0x4
++  gArmTokenSpaceGuid.PcdPciBusMax|0x8
 +  #
 +  # Apple chips don't seem to use "x86-style" I/O accesses, so use placeholder values here, and don't reference them in the host bridge driver.
 +  #
 +  gArmTokenSpaceGuid.PcdPciIoBase|0x0
 +  gArmTokenSpaceGuid.PcdPciIoSize|0x00010000
 +  #
-+  # The 32 bit PCIe MMIO is not prefetchable.
++  # The 32 bit PCIe MMIO is not prefetchable.  Translation is 0 because the
++  # BARs this machine reports are already CPU addresses.
 +  #
-+  gArmTokenSpaceGuid.PcdPciMmio32Base|0xc0000000
++  gArmTokenSpaceGuid.PcdPciMmio32Base|0xB8000000
 +  gArmTokenSpaceGuid.PcdPciMmio32Size|0x40000000
-+  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0x500000000
++  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0x0
 +  gEfiMdePkgTokenSpaceGuid.PcdPciMmio64Translation|0x0
 +  #
 +  # 64 bit PCIe MMIO *is* prefetchable.
 +  #
-+  gArmTokenSpaceGuid.PcdPciMmio64Base|0x5A0000000
++  gArmTokenSpaceGuid.PcdPciMmio64Base|0xBC0000000
 +  gArmTokenSpaceGuid.PcdPciMmio64Size|0x20000000
 +
-+  gEfiMdePkgTokenSpaceGuid.PcdPciExpressBaseAddress|0x580000000
++  gEfiMdePkgTokenSpaceGuid.PcdPciExpressBaseAddress|0x1CB0000000
 +  #
 +  # This shouldn't get used.
 +  #
