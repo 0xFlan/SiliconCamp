@@ -1,0 +1,3134 @@
+diff --git a/Platform/Mac16_3Pkg/AcpiTables/DBG2.aslc b/Platform/Mac16_3Pkg/AcpiTables/DBG2.aslc
+new file mode 100644
+index 0000000000000000000000000000000000000000..3060ab928ee8e21ed0da555422dd6acb30a2eeb0
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/AcpiTables/DBG2.aslc
+@@ -0,0 +1,107 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors).
++ * 
++ * Module Name:
++ *     DBG2.aslc
++ * 
++ * Abstract:
++ *     Debug Port Table. This source file implements the DBG2 table
++ *     for the iMac M4 (Mac16,3) platform.
++ * 
++ * Environment:
++ *     UEFI firmware/runtime services.
++ * 
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ * 
++*/
++
++#include <Library/AcpiLib.h>
++#include <Library/ArmLib.h>
++#include <Library/PcdLib.h>
++#include <IndustryStandard/Acpi.h>
++#include <IndustryStandard/DebugPort2Table.h>
++#include <Acpi/AcpiHeader.h>
++
++/**
++ * 
++ * The Mac16,3 iMac's USB/Thunderbolt topology must be verified against the
++ * M4 ADT; this table only needs the debug UART address at bring-up.
++ * 
++ * For initial bringup, we're only using KDCOM (using KDNET over USB would require UsbFunctionIo protocol working which is on delay.) over the *real* serial port.
++ * 
++ * Design here is copied from the Ampere Altra implementation.
++ * 
++*/
++
++
++#define DBG2_NUM_DEBUG_PORTS                       1
++#define DBG2_NUMBER_OF_GENERIC_ADDRESS_REGISTERS   1
++#define DBG2_NAMESPACESTRING_FIELD_SIZE            10
++#define SERIAL_PORT_8900_UART_ADDR_SIZE           0x1000
++
++#define APPLE_8900_UART_STRING     {'\\', '_', 'S', 'B', '.', 'C', 'O', 'M', '0', '\0'}
++
++typedef struct {
++  EFI_ACPI_DBG2_DEBUG_DEVICE_INFORMATION_STRUCT Dbg2Device;
++  EFI_ACPI_6_3_GENERIC_ADDRESS_STRUCTURE        BaseAddressRegister;
++  UINT32                                        AddressSize;
++  UINT8                                         NameSpaceString[DBG2_NAMESPACESTRING_FIELD_SIZE];
++} DBG2_DEBUG_DEVICE_INFORMATION;
++
++typedef struct {
++  EFI_ACPI_DEBUG_PORT_2_DESCRIPTION_TABLE       Description;
++  DBG2_DEBUG_DEVICE_INFORMATION                 Dbg2DeviceInfo[DBG2_NUM_DEBUG_PORTS];
++} DBG2_TABLE;
++
++
++#define DBG2_DEBUG_PORT_DDI(NumReg, SubType, UartBase, UartAddrLen, UartNameStr) {                                    \
++    {                                                                                                                 \
++      EFI_ACPI_DBG2_DEBUG_DEVICE_INFORMATION_STRUCT_REVISION,         /* UINT8     Revision */                        \
++      sizeof (DBG2_DEBUG_DEVICE_INFORMATION),                         /* UINT16    Length */                          \
++      NumReg,                                                         /* UINT8     NumberofGenericAddressRegisters */ \
++      DBG2_NAMESPACESTRING_FIELD_SIZE,                                /* UINT16    NameSpaceStringLength */           \
++      OFFSET_OF (DBG2_DEBUG_DEVICE_INFORMATION, NameSpaceString),     /* UINT16    NameSpaceStringOffset */           \
++      0,                                                              /* UINT16    OemDataLength */                   \
++      0,                                                              /* UINT16    OemDataOffset */                   \
++      EFI_ACPI_DBG2_PORT_TYPE_SERIAL,                                 /* UINT16    Port Type */                       \
++      SubType,                                                        /* UINT16    Port Subtype */                    \
++      {EFI_ACPI_RESERVED_BYTE, EFI_ACPI_RESERVED_BYTE},               /* UINT8     Reserved[2] */                     \
++      OFFSET_OF (DBG2_DEBUG_DEVICE_INFORMATION, BaseAddressRegister), /* UINT16    BaseAddressRegister Offset */      \
++      OFFSET_OF (DBG2_DEBUG_DEVICE_INFORMATION, AddressSize)          /* UINT16    AddressSize Offset */              \
++    },                                                                                                                \
++    ARM_GAS32 (UartBase),                            /* EFI_ACPI_6_3_GENERIC_ADDRESS_STRUCTURE BaseAddressRegister */ \
++    UartAddrLen,                                     /* UINT32  AddressSize */                                        \
++    UartNameStr                                      /* UINT8   NameSpaceString[DBG2_NAMESPACESTRING_FIELD_SIZE] */   \
++  }
++
++
++STATIC DBG2_TABLE Dbg2 = {
++  {
++    __ACPI_HEADER (
++      EFI_ACPI_6_5_DEBUG_PORT_2_TABLE_SIGNATURE,
++      DBG2_TABLE,
++      EFI_ACPI_DBG2_DEBUG_DEVICE_INFORMATION_STRUCT_REVISION
++    ),
++    OFFSET_OF (DBG2_TABLE, Dbg2DeviceInfo),
++    DBG2_NUM_DEBUG_PORTS                                 /* UINT32  NumberDbgDeviceInfo */
++  },
++  {
++    // Kernel Debug Port
++    DBG2_DEBUG_PORT_DDI (
++      DBG2_NUMBER_OF_GENERIC_ADDRESS_REGISTERS,
++      0xA, /* SAM5250, seems to be more or less compatible with the 8900 UART (which isn't 5250 based but is close enough for WinDbg) */
++      FixedPcdGet64 (PcdAppleUartBase),
++      SERIAL_PORT_8900_UART_ADDR_SIZE,
++      APPLE_8900_UART_STRING
++      ),
++  }
++};
++
++#pragma pack()
++
++//
++// Reference the table being generated to prevent the optimizer from removing
++// the data structure from the executable
++//
++VOID* CONST ReferenceAcpiTable = &Dbg2;
+\ No newline at end of file
+diff --git a/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl b/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb6581dde9db67487fec31d0c2419b3af52ca2b2
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl
+@@ -0,0 +1,230 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors).
++ * 
++ * Module Name:
++ *     DSDT.asl
++ * 
++ * Abstract:
++ *     Differentiated System Description Table. This source file implements the DSDT table
++ *     for the iMac M4 (Mac16,3 / J624) platform.  The processor topology,
++ *     UART base, and UART interrupt are taken from the J624 ioreg and the
++ *     Asahi t8132.dtsi; PCIe is deliberately left out until it is validated.
++ * 
++ * Environment:
++ *     UEFI firmware/runtime services.
++ * 
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ * 
++ **/
++#include <IndustryStandard/Acpi65.h>
++
++ DefinitionBlock("DSDT.aml", "DSDT", 0x02, "Apple", "Mac16", 0x8132) {
++    Scope(\_SB) {
++
++        //
++        // Cluster Low Power States defined here. Seem to be the same for E-cores/P-cores?
++        // Note: there is a state where the cluster can be powered off, unsure how to use so not implemented.
++        // If all cores in a cluster are in "deep WFI" mode, the cluster enters "deep WFI" as well.
++        //
++
++        Name (CLPI, Package() {
++            0, // Version
++            0, // Level Index
++            1, // Count
++            Package() { // Power Gating state for Cluster
++            1, // Min residency (uS)
++            1, // Wake latency (uS)
++            1, // Flags
++            1, // Arch Context Flags
++            0, //Residency Counter Frequency
++            0, // No Parent State
++            0x00000000, // Integer Entry method (currently NULL, TODO actually add an entry method)
++            ResourceTemplate() { // Null Residency Counter
++                Register (SystemMemory, 0, 0, 0, 0)
++            },
++            ResourceTemplate() { // Null Usage Counter
++                Register (SystemMemory, 0, 0, 0, 0)
++            },
++            "ClusterRetention"
++            },
++        })
++
++        //
++        // Per processor low power states. Currently shallow/deep WFI, suspend to ram not implemented yet.
++        // Side note, not gonna be fun having ACPI handle the reconfig engine...
++        // TODO: actually implement this.
++        //
++        Name(PLPI, Package() {
++            0, // Version
++            0, // Level Index
++            2, // Count
++            Package() { // WFI for CPU
++            1, // Min residency (uS)
++            1, // Wake latency (uS)
++            1, // Flags
++            0, // Arch Context Flags
++            0, //Residency Counter Frequency
++            0, // No parent state
++            ResourceTemplate () {
++                // Register Entry method
++                Register (SystemMemory,
++                0x00,               // Bit Width
++                0x00,               // Bit Offset
++                0x00,         // Address
++                0x00,               // Access Size
++                )
++            },
++            ResourceTemplate() { // Null Residency Counter
++                Register (SystemMemory, 0, 0, 0, 0)
++            },
++            ResourceTemplate() { // Null Usage Counter
++                Register (SystemMemory, 0, 0, 0, 0)
++            },
++            "WFI",
++            },
++            Package() { // Power Gating state for CPU
++            1, // Min residency (uS)
++            1, // Wake latency (uS)
++            1, // Flags
++            1, // Arch Context Flags
++            0, //Residency Counter Frequency
++            1, // Parent node can be in any state
++            ResourceTemplate () {
++                // Register Entry method
++                Register (SystemMemory,
++                0x00,               // Bit Width
++                0x00,               // Bit Offset
++                0x00000000,         // Address
++                0x00,               // Access Size
++                )
++            },
++            ResourceTemplate() { // Null Residency Counter
++                Register (SystemMemory, 0, 0, 0, 0)
++            },
++            ResourceTemplate() { // Null Usage Counter
++                Register (SystemMemory, 0, 0, 0, 0)
++            },
++            "CorePwrDn"
++            },
++        })
++
++        // Device(PCI0) {
++        //     Name (_HID, EISAID ("PNP0A08")) // PCI Express Root Bridge
++        //     Name (_CID, EISAID ("PNP0A03")) // Compatible PCI Root Bridge
++        //     Name (_SEG, Zero) // PCI Segment Group number
++        //     Name (_BBN, Zero) // PCI Base Bus Number
++        //     Name (_ADR, Zero)
++        //     Name (_UID, "PCI0")
++        // }
++
++        //
++        // M4 serial0: Apple's S5L8900-compatible UART at 0x3ad200000.
++        // The AIC hardware IRQ is 1046 (Asahi t8132.dtsi serial0).  The m1n1
++        // vGIC exposes AIC hardware IRQs 1:1 as GIC INTIDs for the guest.
++        //
++        Device(COM0) {
++            Name(_HID, "APPL8900") // naming it APPL8900 since the Samsung based UART was used since the S5L8900
++            Name(_UID, Zero)
++            Name (_CRS, ResourceTemplate () {
++                QWordMemory (
++                ResourceProducer,     // ResourceUsage
++                PosDecode,            // Decode
++                MinFixed,             // IsMinFixed
++                MaxFixed,             // IsMaxFixed
++                NonCacheable,         // Cacheable
++                ReadWrite,            // ReadAndWrite
++                0x0000000000000000,   // AddressGranularity - GRA
++                0x3ad200000,          // AddressMinimum - MIN
++                0x3ad200fff,          // AddressMaximum - MAX
++                0x0000000000000000,   // AddressTranslation - TRA
++                0x0000000000001000    // RangeLength - LEN
++                )
++                Interrupt(ResourceConsumer, Level, ActiveHigh, Exclusive) { 1046 }
++            })
++            Method (_STA) {
++                Return (0xF)
++            }
++        }
++
++        //
++        // One package (die), one 6-core efficiency cluster, and one 4-core
++        // performance cluster.  The _UID values here are the ACPI processor
++        // UIDs that Windows matches against the MADT GICC entries; they must
++        // stay in the same order as the MADT and PPTT.
++        //
++        Device(DIE0) {
++            Name(_HID, "ACPI0010") // all "processor containers" must have this HID
++            Name(_UID, Zero) // unique identifier of the container
++
++            Device(CLU0) {
++                Name(_HID, "ACPI0010")
++                Name(_UID, 0x1)
++
++                Device(CPU0) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 0)
++                    Method (_STA) { Return (0xF) }
++                }
++                Device(CPU1) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 1)
++                    Method (_STA) { Return (0xF) }
++                }
++                Device(CPU2) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 2)
++                    Method (_STA) { Return (0xF) }
++                }
++                Device(CPU3) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 3)
++                    Method (_STA) { Return (0xF) }
++                }
++                Device(CPU4) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 4)
++                    Method (_STA) { Return (0xF) }
++                }
++                Device(CPU5) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 5)
++                    Method (_STA) { Return (0xF) }
++                }
++            }
++
++            Device(CLU1) {
++                Name(_HID, "ACPI0010")
++                Name(_UID, 0x2)
++
++                Device(CPU6) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 6)
++                    Method (_STA) { Return (0xF) }
++                }
++                Device(CPU7) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 7)
++                    Method (_STA) { Return (0xF) }
++                }
++                Device(CPU8) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 8)
++                    Method (_STA) { Return (0xF) }
++                }
++                Device(CPU9) {
++                    Name(_HID, "ACPI0007")
++                    Name(_UID, 9)
++                    Method (_STA) { Return (0xF) }
++                }
++            }
++        }
++
++        //
++        // PCIe root complex is intentionally not described yet.  The iMac M4
++        // has an APCIE ECAM at 0x1cb0000000 and separate PCIe MMIO windows;
++        // those values need their own validated host bridge configuration
++        // before the root bridge is exposed to Windows.
++        //
++    }
++}
+diff --git a/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf b/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a0d8fdad99d99f86c36d7a58ef7cb5a54abd7f4
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
+@@ -0,0 +1,49 @@
++## @file
++#  Borrowed from edk2-platforms/JunoPkg and AmpereAltraPkg, original header below.
++#  Copyright (c) 2023, amarioguy (AppleWOA authors)
++#  ACPI table data and ASL sources required to boot the platform.
++#
++#  Copyright (c) 2014-2017, ARM Ltd. All rights reserved.
++#
++#  SPDX-License-Identifier: BSD-2-Clause-Patent
++#
++##
++
++[Defines]
++  INF_VERSION                    = 0x00010005
++  BASE_NAME                      = DeviceAcpiTables
++  FILE_GUID                      = 3ff4732c-9411-4e10-a10c-8b39df282e83
++  MODULE_TYPE                    = USER_DEFINED
++  VERSION_STRING                 = 1.0
++
++[Sources]
++  DBG2.aslc
++  FADT.aslc
++  DSDT.asl
++
++[Packages]
++  ArmPkg/ArmPkg.dec
++  ArmPlatformPkg/ArmPlatformPkg.dec
++  EmbeddedPkg/EmbeddedPkg.dec
++  MdePkg/MdePkg.dec
++  MdeModulePkg/MdeModulePkg.dec
++  AppleSiliconPkg/AppleSiliconPkg.dec
++
++[FixedPcd]
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultCreatorId          ## CONSUMES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultCreatorRevision    ## CONSUMES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultOemId              ## CONSUMES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultOemTableId         ## CONSUMES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultOemRevision        ## CONSUMES
++  gArmTokenSpaceGuid.PcdPciBusMin
++  gArmTokenSpaceGuid.PcdPciBusMax
++  gArmTokenSpaceGuid.PcdPciMmio32Base
++  gArmTokenSpaceGuid.PcdPciMmio32Size
++  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation
++  gEfiMdePkgTokenSpaceGuid.PcdPciMmio64Translation
++  gArmTokenSpaceGuid.PcdPciMmio64Base
++  gArmTokenSpaceGuid.PcdPciMmio64Size
++  gEfiMdePkgTokenSpaceGuid.PcdPciExpressBaseAddress
++  gAppleSiliconPkgTokenSpaceGuid.PcdPciExpressBarSize
++  gAppleSiliconPkgTokenSpaceGuid.PcdPciExpressBarLimit
++  gAppleSiliconPkgTokenSpaceGuid.PcdAppleUartBase
+\ No newline at end of file
+diff --git a/Platform/Mac16_3Pkg/AcpiTables/FADT.aslc b/Platform/Mac16_3Pkg/AcpiTables/FADT.aslc
+new file mode 100644
+index 0000000000000000000000000000000000000000..7805648a3acdb1a73832daab388f185b5124c2fa
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/AcpiTables/FADT.aslc
+@@ -0,0 +1,97 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors).
++ * 
++ * Module Name:
++ *     FADT.aslc
++ * 
++ * Abstract:
++ *     Fixed ACPI Descripton Table. This source file implements the FADT table
++ *     for MacBook Pros.
++ * 
++ * Environment:
++ *     UEFI firmware/runtime services.
++ * 
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ * 
++*/
++
++#include <Library/AcpiLib.h>
++#include <IndustryStandard/Acpi64.h>
++#include <Acpi/AcpiHeader.h>
++
++/**
++ * Note: Most of these fields are zero, as per Arm SBBR/SBSA specs we are using "hardware-reduced" ACPI mode
++ * which removes the need for most of the FADT variables.
++ * 
++ * PSCI for now will be an SMC event despite not being implemented on Apple, as we can trap SMCs to EL2 anyways.
++ * The original intention was to use SPRR/GXF to bootstrap a custom secure monitor that can handle these calls, but with
++ * page tables having to be the same under the assumption of GXF, this is a more complicated endeavor put on hold for now.
++ * SMC PSCI calls will still be used, however we are not using Hyper-V for now so the recipient will be our custom hypervisor.
++ * 
++*/
++EFI_ACPI_6_4_FIXED_ACPI_DESCRIPTION_TABLE Fadt = {
++    __ACPI_HEADER(EFI_ACPI_6_4_FIXED_ACPI_DESCRIPTION_TABLE_SIGNATURE, EFI_ACPI_6_4_FIXED_ACPI_DESCRIPTION_TABLE, EFI_ACPI_6_4_FIXED_ACPI_DESCRIPTION_TABLE_REVISION),
++    0, //FIRMWARE_CTRL (UINT32)
++    0, //DSDT (UINT32)
++    EFI_ACPI_RESERVED_BYTE, //Reserved0
++    EFI_ACPI_6_4_PM_PROFILE_DESKTOP, //preferred power management profile (iMac M4 desktop)
++    0, //SCI interrupt num (UINT16)
++    0, //SMI Command (UINT32)
++    0, //ACPI enable (UINT8)
++    0, //ACPI disable (UINT8)
++    0, //S4 bios state (UINT8)
++    0, //PState counter (UINT8)
++    0, //PM1A_EVT_BLK port address (UINT32)
++    0, //PM1B_EVT_BLK port address (UINT32)
++    0, //PM1A_CNT_BLK port address (UINT32)
++    0, //PM1B_CNT_BLK port address (UINT32)
++    0, //PM2_CNT_BLK port address (UINT32)
++    0, //PM_TMR_BLK port address (UINT32)
++    0, //GPE0_BLK port address (UINT32)
++    0, //GPE1_BLK port address (UINT32)
++    0, //PM1_EVT_LEN (bytes decoded/supported by PM1A/B EVT BLK) (UINT8)
++    0, //PM1_CNT_LEN (bytes supported by PM1A/B_CNT_BLK) (UINT8)
++    0, //PM2_CNT_LEN (bytes supported by PM2_CNT_BLK) (UINT8)
++    0, //PM_TMR_LEN (UINT8)
++    0, //GPE0_BLK_LEN (UINT8)
++    0, //GPE1_BLK_LEN (UINT8)
++    0, //GPE1_BASE (UINT8)
++    0, //CST_CNT (UINT8)
++    0, //P_LVL2_LAT (worst case latency to exit C2 state) (UINT16)
++    0, //P_LVL3_LAT (worst case latency to exit C3 state) (UINT16)
++    0, //FLUSH_SIZE (cache size to flush if "WBINVD" flag is not available) (UINT16)
++    0, //FLUSH_STRIDE (cache line width if "WBINVD" flag not available) (UINT16)
++    0, //DUTY_OFFSET (UINT8)
++    0, //DUTY_WIDTH (UINT8)
++    0, //DAY_ALRM (day of month RTC RAM location) (UINT8)
++    0, //MON_ALRM (month of year RTC RAM location) (UINT8)
++    0, //CENTURY (UINT8)
++    0, //IAPC_BOOT_ARCH (Intel boot flags) (UINT16)
++    0, //Reserved1 (UINT8)
++    ((EFI_ACPI_6_4_HW_REDUCED_ACPI) | (EFI_ACPI_6_4_LOW_POWER_S0_IDLE_CAPABLE) | (EFI_ACPI_6_3_PWR_BUTTON)), //ACPI feature flags (currently HW reduced, S0ix capable, power button as control) (UINT32)
++    NULL_GAS, //Reset register (TODO: do we want to put the Apple watchdog timer register here?) (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    0, //Reset value (UINT8)
++    ((EFI_ACPI_6_4_ARM_PSCI_COMPLIANT)), //ARM boot flags (using PSCI, NOT using HVC conduit (we trap SMCs to EL2 since EL3 not implemented, and more useful for bare metal booting))
++    EFI_ACPI_6_4_FIXED_ACPI_DESCRIPTION_TABLE_REVISION, //Minor revision of FADT (UINT8)
++    0, //extended FIRMWARE_CTRL (UINT64)
++    0, //extended DSDT address (UINT64) (probably necessary but not decided yet)
++    NULL_GAS, //extended PM1A event reg block address (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    NULL_GAS, //extended PM1B event reg block address (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    NULL_GAS, // extended PM1A count reg block address (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    NULL_GAS, // extended PM1B count reg block address (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    NULL_GAS, //extended PM2 count reg block address (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    NULL_GAS, //extended PM_TMR_BLK (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    NULL_GAS, //extended GPE0_BLK address (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    NULL_GAS, //extended GPE1_BLK address (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    ARM_GASN(0), //sleep control reg (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    ARM_GASN(0), //sleep status reg (EFI_ACPI_6_4_GENERIC_ADDRESS_STRUCTURE)
++    0 //Hypervisor vendor identity (UINT64)
++
++};
++
++//
++// Reference the table being generated to prevent the optimizer from removing the
++// data structure from the executable
++//
++VOID* CONST ReferenceAcpiTable = &Fadt;
+\ No newline at end of file
+diff --git a/Platform/Mac16_3Pkg/Mac16_3.dsc b/Platform/Mac16_3Pkg/Mac16_3.dsc
+new file mode 100644
+index 0000000000000000000000000000000000000000..74f35ea393c0a44a923b9234f645ef64a05aca1d
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/Mac16_3.dsc
+@@ -0,0 +1,80 @@
++#Apple M4 iMac (Mac16,3) UEFI DSC file
++#some parts borrowed from WOA-Project/SurfaceDuoPkg
++#Disclaimer: probably not the best UEFI dev out there
++#
++#  Copyright (c) 2011-2015, ARM Limited. All rights reserved.
++#  Copyright (c) 2014, Linaro Limited. All rights reserved.
++#  Copyright (c) 2015 - 2016, Intel Corporation. All rights reserved.
++#  Copyright (c) 2018, Bingxing Wang. All rights reserved.
++#
++#  This program and the accompanying materials
++#  are licensed and made available under the terms and conditions of the BSD License
++#  which accompanies this distribution.  The full text of the license may be found at
++#  http://opensource.org/licenses/bsd-license.php
++#
++#  THE PROGRAM IS DISTRIBUTED UNDER THE BSD LICENSE ON AN "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
++#
++#
++
++#SPDX-License-Identifier: BSD 2-Clause
++
++#Basic Defines
++
++[Defines]
++  PLATFORM_NAME                  = Mac16_3
++  PLATFORM_GUID                  = d7d529ec-4827-494a-85e7-5900d9841a9e
++  PLATFORM_VERSION               = 1.0
++  DSC_SPECIFICATION              = 0x00010005
++  OUTPUT_DIRECTORY               = Build/Mac16_3-$(ARCH)
++  SUPPORTED_ARCHITECTURES        = AARCH64
++  BUILD_TARGETS                  = DEBUG|RELEASE
++  SKUID_IDENTIFIER               = DEFAULT
++  FLASH_DEFINITION               = Mac16_3Pkg/Mac16_3.fdf
++  SECURE_BOOT_ENABLE             = FALSE #disable secure boot for now
++  AIC_BUILD                      = FALSE #use the m1n1 vGIC during bring-up
++  NETWORK_TLS_ENABLE             = TRUE
++
++
++[BuildOptions.common]
++  GCC:*_*_AARCH64_CC_FLAGS = -DSILICON_PLATFORM=8132
++  #*_*_*_CC_FLAGS = -D DISABLE_NEW_DEPRECATED_INTERFACES -D HAS_MEMCPY_INTRINSICS
++
++
++[PcdsFixedAtBuild.common]
++  gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemModel|"iMac (24-inch, M4, 2024)"
++  gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemModelNumber|"Mac16,3"
++  gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemSku|"iMac (Mac16,3)"
++  # J624 has four DWC3 controllers (usb-drd0..usb-drd3 in the ioreg); the
++  # bring-up driver skips the two DFU controllers (0 and 2), leaving the two
++  # host controllers (1 and 3).
++  gAppleSiliconPkgTokenSpaceGuid.PcdAppleNumDwc3Controllers|4
++  gAppleSiliconPkgTokenSpaceGuid.PcdAppleNumDwc3Darts|8
++  #will be changed later on, default values
++  # gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferWidth|1920
++  # gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferHeight|1080
++  # gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferPixelBpp|30
++  
++[PcdsDynamicDefault.common]
++  # #borrowed from SurfaceDuoPkg
++  # gEfiMdeModulePkgTokenSpaceGuid.PcdVideoHorizontalResolution|1920
++  # gEfiMdeModulePkgTokenSpaceGuid.PcdVideoVerticalResolution|1080
++  # gEfiMdeModulePkgTokenSpaceGuid.PcdSetupVideoHorizontalResolution|1920
++  # gEfiMdeModulePkgTokenSpaceGuid.PcdSetupVideoVerticalResolution|1080
++  # gEfiMdeModulePkgTokenSpaceGuid.PcdSetupConOutRow|300
++  # gEfiMdeModulePkgTokenSpaceGuid.PcdSetupConOutColumn|50
++  # gEfiMdeModulePkgTokenSpaceGuid.PcdConOutRow|300 
++  # gEfiMdeModulePkgTokenSpaceGuid.PcdConOutColumn|50
++
++[Components.common]
++
++  Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
++  #
++  # PCIe support is disabled for now.
++  #
++  #AppleSiliconPkg/Drivers/AppleBootTimeEmbeddedFirmwareHelperDxe/AppleBootTimeEmbeddedFirmwareHelperDxe.inf
++
++
++!include T8132FamilyPkg/T8132FamilyPkg.dsc.inc
++!include AppleSiliconPkg/AppleSiliconPkg.dsc.inc
++!include AppleSiliconPkg/FrontpageDsc.inc
+\ No newline at end of file
+diff --git a/Platform/Mac16_3Pkg/Mac16_3.fdf b/Platform/Mac16_3Pkg/Mac16_3.fdf
+new file mode 100644
+index 0000000000000000000000000000000000000000..75a7c8899911d2c5933fbbd87b7cb74f3f347011
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/Mac16_3.fdf
+@@ -0,0 +1,305 @@
++#UEFI Flash Description File for the iMac M4 (Mac16,3, T8132)
++#based on OnePlus6TPkg/OnePlus6TPkg.fdf
++#
++#  Copyright (c) 2018, Linaro Limited. All rights reserved.
++#
++#  This program and the accompanying materials
++#  are licensed and made available under the terms and conditions of the BSD License
++#  which accompanies this distribution.  The full text of the license may be found at
++#  http://opensource.org/licenses/bsd-license.php
++#
++#  THE PROGRAM IS DISTRIBUTED UNDER THE BSD LICENSE ON AN "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
++#
++
++################################################################################
++#
++# FD Section
++# The [FD] Section is made up of the definition statements and a
++# description of what goes into  the Flash Device Image.  Each FD section
++# defines one flash "device" image.  A flash device image may be one of
++# the following: Removable media bootable image (like a boot floppy
++# image,) an Option ROM image (that would be "flashed" into an add-in
++# card,) a System "Flash"  image (that would be burned into a system's
++# flash) or an Update ("Capsule") image that will be used to update and
++# existing system flash.
++#
++################################################################################
++
++[FD.Mac16_3_EFI]
++BaseAddress   = 0x10030000000|gArmTokenSpaceGuid.PcdFdBaseAddress  # Desired address of firmware (will always be loaded from RAM)
++#Size          = 0x00014000000|gArmTokenSpaceGuid.PcdFdSize         # The size in bytes
++Size          = 0x00001E00000|gArmTokenSpaceGuid.PcdFdSize         # The size in bytes
++ErasePolarity = 1
++
++
++BlockSize     = 0x4000
++NumBlocks     = 0x780
++
++################################################################################
++#
++# Following are lists of FD Region layout which correspond to the locations of different
++# images within the flash device.
++#
++# Regions must be defined in ascending order and may not overlap.
++#
++# A Layout Region start with a eight digit hex offset (leading "0x" required) followed by
++# the pipe "|" character, followed by the size of the region, also in hex with the leading
++# "0x" characters. Like:
++# Offset|Size
++# PcdOffsetCName|PcdSizeCName
++# RegionType <FV, DATA, or FILE>
++#
++################################################################################
++
++# from ArmVirtPkg/ArmVirtQemuKernel.fdf
++#
++# Implement the Linux kernel header layout so that the loader (m1n1) will identify
++# it as something bootable, and execute it with a FDT pointer in x0 or r2.
++0x000000000|0x000008000
++DATA = {
++  0x01, 0x00, 0x00, 0x10,                         # code0: adr x1, .
++  0xff, 0x1f, 0x00, 0x14,                         # code1: b 0x8000
++  0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, # text_offset: 512 KB
++  0x00, 0x00, 0xe0, 0x01, 0x00, 0x00, 0x00, 0x00, # image_size: 0x1E00000 (FD size)
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # flags
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # res2
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # res3
++  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, # res4
++  0x41, 0x52, 0x4d, 0x64,                         # magic: "ARM\x64"
++  0x00, 0x00, 0x00, 0x00                          # res5
++}
++
++
++0x000008000|0x001D80000
++gArmTokenSpaceGuid.PcdFvBaseAddress|gArmTokenSpaceGuid.PcdFvSize
++FV = FVMAIN_COMPACT
++
++
++################################################################################
++#
++# FV Section
++#
++# [FV] section is used to define what components or modules are placed within a flash
++# device file.  This section also defines order the components and modules are positioned
++# within the image.  The [FV] section consists of define statements, set statements and
++# module statements.
++#
++################################################################################
++
++[FV.FvMain]
++BlockSize          = 0x40
++FvAlignment        = 16         # FV alignment and FV attributes setting.
++ERASE_POLARITY     = 1
++MEMORY_MAPPED      = TRUE
++STICKY_WRITE       = TRUE
++LOCK_CAP           = TRUE
++LOCK_STATUS        = TRUE
++WRITE_DISABLED_CAP = TRUE
++WRITE_ENABLED_CAP  = TRUE
++WRITE_STATUS       = TRUE
++WRITE_LOCK_CAP     = TRUE
++WRITE_LOCK_STATUS  = TRUE
++READ_DISABLED_CAP  = TRUE
++READ_ENABLED_CAP   = TRUE
++READ_STATUS        = TRUE
++READ_LOCK_CAP      = TRUE
++READ_LOCK_STATUS   = TRUE
++FvNameGuid         = 84c90f2e-22a5-4c84-a199-a17f7ea7cf6d
++
++  !include AppleSiliconPkg/Include/DXEApriori.fdf.inc
++  
++
++  #Main DXE core
++  INF MdeModulePkg/Core/Dxe/DxeMain.inf
++
++  #
++  # PI DXE Drivers producing Architectural Protocols (EFI Services)
++  #
++  INF MdeModulePkg/Universal/PCD/Dxe/Pcd.inf
++  INF ArmPkg/Drivers/CpuDxe/CpuDxe.inf
++  INF MdeModulePkg/Core/RuntimeDxe/RuntimeDxe.inf
++  INF MdeModulePkg/Universal/SecurityStubDxe/SecurityStubDxe.inf
++  INF MdeModulePkg/Universal/CapsuleRuntimeDxe/CapsuleRuntimeDxe.inf
++  INF EmbeddedPkg/EmbeddedMonotonicCounter/EmbeddedMonotonicCounter.inf
++  INF MdeModulePkg/Universal/ResetSystemRuntimeDxe/ResetSystemRuntimeDxe.inf
++  INF EmbeddedPkg/RealTimeClockRuntimeDxe/RealTimeClockRuntimeDxe.inf
++  INF EmbeddedPkg/MetronomeDxe/MetronomeDxe.inf
++  INF AppleSiliconPkg/Drivers/AppleDartIoMmuDxe/AppleDartIoMmuDxe.inf
++
++  INF MdeModulePkg/Universal/Variable/RuntimeDxe/VariableRuntimeDxe.inf
++!if $(SECURE_BOOT_ENABLE) == TRUE
++  INF SecurityPkg/VariableAuthenticated/SecureBootConfigDxe/SecureBootConfigDxe.inf
++!endif
++
++  #
++  # Multiple Console IO support
++  #
++  INF MdeModulePkg/Universal/Console/ConPlatformDxe/ConPlatformDxe.inf
++  INF MdeModulePkg/Universal/Console/ConSplitterDxe/ConSplitterDxe.inf
++  INF MdeModulePkg/Universal/Console/GraphicsConsoleDxe/GraphicsConsoleDxe.inf
++  INF MdeModulePkg/Universal/Console/TerminalDxe/TerminalDxe.inf
++  INF ArmPkg/Drivers/TimerDxe/TimerDxe.inf
++!if $(AIC_BUILD) == FALSE
++  INF ArmPkg/Drivers/ArmGicDxe/ArmGicDxe.inf
++!else 
++  INF AppleSiliconPkg/Drivers/AppleAicDxe/AppleAicDxe.inf
++!endif
++  INF MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
++
++  INF AppleSiliconPkg/Drivers/SimpleFbDxe/SimpleFbDxe.inf
++
++  #
++  # PCIe Support (required to bring up USB-A among other fun stuff)
++  #
++  INF ArmPkg/Drivers/ArmPciCpuIo2Dxe/ArmPciCpuIo2Dxe.inf
++  INF MdeModulePkg/Bus/Pci/PciHostBridgeDxe/PciHostBridgeDxe.inf
++  INF MdeModulePkg/Bus/Pci/PciBusDxe/PciBusDxe.inf
++  INF MdeModulePkg/Bus/Pci/NonDiscoverablePciDeviceDxe/NonDiscoverablePciDeviceDxe.inf
++
++  #NVMe Support
++  #TODO: ANS2/SART driver
++  #INF AppleSiliconPkg/Drivers/AppleANS2Dxe/AppleANS2Dxe.inf
++  #INF MdeModulePkg/Bus/Pci/NvmExpressDxe/NvmExpressDxe.inf
++
++  #
++  # Virtual Keyboard
++  #
++  INF EmbeddedPkg/Drivers/VirtualKeyboardDxe/VirtualKeyboardDxe.inf
++  #INF OemPkg/FrontpageButtonsVolumeUp/FrontpageButtonsVolumeUp.inf
++
++  # FV FileSystem
++  INF MdeModulePkg/Universal/FvSimpleFileSystemDxe/FvSimpleFileSystemDxe.inf
++
++  INF AppleSiliconPkg/Drivers/AppleEmbeddedGpioControllerDxe/AppleEmbeddedGpioControllerDxe.inf
++  #
++  # PCIe support is disabled for now.
++  #
++  #INF AppleSiliconPkg/Drivers/AppleSiliconPciPlatformDxe/AppleSiliconPciPlatformDxe.inf
++  #INF AppleSiliconPkg/Drivers/AppleBootTimeEmbeddedFirmwareHelperDxe/AppleBootTimeEmbeddedFirmwareHelperDxe.inf
++
++  #
++  # DWC3 bringup module.
++  #
++  INF AppleSiliconPkg/Drivers/AppleUsbTypeCBringupDxe/AppleUsbTypeCBringupDxe.inf
++
++  #
++  # Usb Support
++  #
++  INF  MdeModulePkg/Bus/Pci/UhciDxe/UhciDxe.inf
++  INF  MdeModulePkg/Bus/Pci/EhciDxe/EhciDxe.inf
++  INF  MdeModulePkg/Bus/Pci/XhciDxe/XhciDxe.inf
++  INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
++  INF MdeModulePkg/Bus/Usb/UsbMouseAbsolutePointerDxe/UsbMouseAbsolutePointerDxe.inf
++  #
++  # USB Host Support
++  #
++  INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
++
++  #
++  # USB Mass Storage Support
++  #
++  INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
++  #
++  # Some miscellaneous Mu modules
++  #
++  INF  MsCorePkg/Universal/StatusCodeHandler/Serial/Dxe/SerialStatusCodeHandlerDxe.inf
++  INF  MsCorePkg/MuVarPolicyFoundationDxe/MuVarPolicyFoundationDxe.inf
++
++  #
++  # FAT filesystem + GPT/MBR partitioning
++  #
++  INF MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf
++  INF MdeModulePkg/Universal/Disk/PartitionDxe/PartitionDxe.inf
++  INF FatPkg/EnhancedFatDxe/Fat.inf
++  INF MdeModulePkg/Universal/Disk/UnicodeCollation/EnglishDxe/EnglishDxe.inf
++  INF MdeModulePkg/Universal/Disk/RamDiskDxe/RamDiskDxe.inf
++  INF AppleSiliconPkg/Drivers/BootRamdiskHelperDxe/BootRamdiskHelperDxe.inf
++
++
++  INF MdeModulePkg/Universal/HiiDatabaseDxe/HiiDatabaseDxe.inf
++
++  #
++  # ACPI Support
++  #
++  INF MdeModulePkg/Universal/Acpi/AcpiTableDxe/AcpiTableDxe.inf
++  INF AppleSiliconPkg/Drivers/AcpiPlatformDxe/AcpiPlatformDxe.inf
++  INF MdeModulePkg/Universal/Acpi/BootGraphicsResourceTableDxe/BootGraphicsResourceTableDxe.inf
++  INF RuleOverride=ACPITABLE AppleSiliconPkg/AcpiTables/GenericAcpiTables.inf
++  INF RuleOverride=ACPITABLE Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
++  INF RuleOverride=ACPITABLE T8132FamilyPkg/AcpiTables/CPUAcpiTables.inf
++  #
++  # SMBIOS Support
++  #
++  INF AppleSiliconPkg/Drivers/SmbiosInfoDxe/SmbiosInfoDxe.inf
++  INF MdeModulePkg/Universal/SmbiosDxe/SmbiosDxe.inf
++
++  #
++  # UEFI applications
++  #
++  INF ShellPkg/Application/Shell/Shell.inf
++!ifdef $(INCLUDE_TFTP_COMMAND)
++  INF ShellPkg/DynamicCommand/TftpDynamicCommand/TftpDynamicCommand.inf
++!endif #$(INCLUDE_TFTP_COMMAND)
++
++  #
++  # Bds
++  #
++  INF AppleSiliconPkg/Drivers/ColorbarsDxe/ColorbarsDxe.inf
++  INF MdeModulePkg/Universal/PrintDxe/PrintDxe.inf
++  INF MdeModulePkg/Universal/DevicePathDxe/DevicePathDxe.inf
++  INF MdeModulePkg/Universal/DisplayEngineDxe/DisplayEngineDxe.inf
++  INF MdeModulePkg/Universal/SetupBrowserDxe/SetupBrowserDxe.inf
++  INF MdeModulePkg/Universal/DriverHealthManagerDxe/DriverHealthManagerDxe.inf
++  INF MdeModulePkg/Universal/BdsDxe/BdsDxe.inf
++
++  # DT
++  #INF EmbeddedPkg/Drivers/DtPlatformDxe/DtPlatformDxe.inf
++
++  FILE FREEFORM = PCD(gMsCorePkgTokenSpaceGuid.PcdRegulatoryGraphicFileGuid) {
++    SECTION RAW = Mac16_3Pkg/Resources/RegulatoryLogos.png
++  }
++
++  # Embedded RAMDisk (ISO format)
++  #FILE FREEFORM = 650B7CD0-94F8-46CC-88DE-8C199D41EDA3 {
++  #SECTION RAW = AppleSiliconPkg/RAMDisk/WinPE.iso
++  #SECTION UI = "Embedded RAMDisk"  
++#}
++
++  # Embedded RAMDisk (IMG format)
++  #FILE FREEFORM = 650B7CD0-94F8-46CC-88DE-8C199D41EDA3 {
++  #SECTION RAW = AppleSiliconPkg/RAMDisk/WinPE.img
++  #SECTION UI = "Embedded RAMDisk"  
++#}
++  
++!include AppleSiliconPkg/FrontpageFdf.inc
++
++[FV.FVMAIN_COMPACT]
++FvAlignment        = 16
++ERASE_POLARITY     = 1
++MEMORY_MAPPED      = TRUE
++STICKY_WRITE       = TRUE
++LOCK_CAP           = TRUE
++LOCK_STATUS        = TRUE
++WRITE_DISABLED_CAP = TRUE
++WRITE_ENABLED_CAP  = TRUE
++WRITE_STATUS       = TRUE
++WRITE_LOCK_CAP     = TRUE
++WRITE_LOCK_STATUS  = TRUE
++READ_DISABLED_CAP  = TRUE
++READ_ENABLED_CAP   = TRUE
++READ_STATUS        = TRUE
++READ_LOCK_CAP      = TRUE
++READ_LOCK_STATUS   = TRUE
++
++  INF RuleOverride = SELF_RELOC AppleSiliconPkg/PrePi/PrePi.inf
++
++  FILE FV_IMAGE = 9E21FD93-9C72-4c15-8C4B-E77F1DB2D792 {
++    SECTION GUIDED EE4E5898-3914-4259-9D6E-DC7BD79403CF PROCESSING_REQUIRED = TRUE {
++      SECTION FV_IMAGE = FVMAIN
++    }
++  }
++
++!include AppleSiliconPkg/AppleSiliconFdfRules.fdf.inc
++
++
+diff --git a/Platform/Mac16_3Pkg/Mac16_3Pkg.dec b/Platform/Mac16_3Pkg/Mac16_3Pkg.dec
+new file mode 100644
+index 0000000000000000000000000000000000000000..af726eb429930bf54600ef14521d955ef4b49f61
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/Mac16_3Pkg.dec
+@@ -0,0 +1,12 @@
++[Defines]
++  DEC_SPECIFICATION              = 0x00010005
++  PACKAGE_NAME                   = Mac16_3Pkg
++  PACKAGE_GUID                   = a711eb2c-accc-41ac-aa53-1cfd6aa1170a
++  PACKAGE_VERSION                = 1.0
++
++[Includes.common]
++  Include
++
++[Guids.common]
++  gMac16_3PkgTokenSpaceGuid = { 0x0d1fa988, 0x0510, 0x4329, { 0x9a, 0x3a, 0x56, 0x01, 0x47, 0x73, 0x95, 0xc3 } }
++
+diff --git a/Platform/Mac16_3Pkg/PlatformBuild.py b/Platform/Mac16_3Pkg/PlatformBuild.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3c2a97d8d2992561883dfd25aee0c33846d9d33
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/PlatformBuild.py
+@@ -0,0 +1,246 @@
++# @file
++# Script to build the iMac M4 (Mac16,3) Mu UEFI firmware 
++# (this script is based off WOA-Project/SurfaceDuoPkg PlatformBuild.py)
++#
++# Copyright (c) Microsoft Corporation.
++# SPDX-License-Identifier: BSD-2-Clause-Patent
++##
++import datetime
++import logging
++import os
++import uuid
++from io import StringIO
++from pathlib import Path
++
++from edk2toolext.environment import shell_environment
++from edk2toolext.environment.uefi_build import UefiBuilder
++from edk2toolext.invocables.edk2_platform_build import BuildSettingsManager
++from edk2toolext.invocables.edk2_pr_eval import PrEvalSettingsManager
++from edk2toolext.invocables.edk2_setup import (RequiredSubmodule,
++                                               SetupSettingsManager)
++from edk2toolext.invocables.edk2_update import UpdateSettingsManager
++from edk2toolext.invocables.edk2_parse import ParseSettingsManager
++from edk2toollib.utility_functions import RunCmd
++
++
++    # ####################################################################################### #
++    #                                Common Configuration                                     #
++    # ####################################################################################### #
++class CommonPlatform():
++    ''' Common settings for this platform.  Define static data here and use
++        for the different parts of stuart
++    '''
++    PackagesSupported = ("Mac16_3Pkg",)
++    ArchSupported = ("AARCH64",)
++    TargetsSupported = ("DEBUG", "RELEASE", "NOOPT")
++    Scopes = ('Mac16_3', 'gcc_aarch64_linux', 'edk2-build')
++    WorkspaceRoot = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++    PackagesPath = ("Platform", "MU_BASECORE", "Common/MU", "Common/TIANO", "Common/MU_OEM_SAMPLE", "Silicon/ARM/TIANO", "Silicon/Apple", "Common/MU_DFCI", "mu_feature_debugger")
++
++
++    # ####################################################################################### #
++    #                         Configuration for Update & Setup                                #
++    # ####################################################################################### #
++class SettingsManager(UpdateSettingsManager, SetupSettingsManager, PrEvalSettingsManager):
++
++    def GetPackagesSupported(self):
++        ''' return iterable of edk2 packages supported by this build.
++        These should be edk2 workspace relative paths '''
++        return CommonPlatform.PackagesSupported
++
++    def GetArchitecturesSupported(self):
++        ''' return iterable of edk2 architectures supported by this build '''
++        return CommonPlatform.ArchSupported
++
++    def GetTargetsSupported(self):
++        ''' return iterable of edk2 target tags supported by this build '''
++        return CommonPlatform.TargetsSupported
++
++    def GetRequiredSubmodules(self):
++        """Return iterable containing RequiredSubmodule objects.
++        
++        !!! note
++            If no RequiredSubmodules return an empty iterable
++        """
++        return [
++            RequiredSubmodule("MU_BASECORE", True),
++            RequiredSubmodule("Common/MU", True),
++            RequiredSubmodule("Common/TIANO", True),
++            RequiredSubmodule("Common/MU_OEM_SAMPLE", True),
++            RequiredSubmodule("Silicon/ARM/TIANO", True),
++            RequiredSubmodule("Common/MU_DFCI", True),
++            RequiredSubmodule("mu_feature_debugger", True),
++        ]
++
++    def SetArchitectures(self, list_of_requested_architectures):
++        ''' Confirm the requests architecture list is valid and configure SettingsManager
++        to run only the requested architectures.
++
++        Raise Exception if a list_of_requested_architectures is not supported
++        '''
++        unsupported = set(list_of_requested_architectures) - \
++            set(self.GetArchitecturesSupported())
++        if(len(unsupported) > 0):
++            errorString = (
++                "Unsupported Architecture Requested: " + " ".join(unsupported))
++            logging.critical( errorString )
++            raise Exception( errorString )
++        self.ActualArchitectures = list_of_requested_architectures
++
++    def GetWorkspaceRoot(self):
++        ''' get WorkspacePath '''
++        return CommonPlatform.WorkspaceRoot
++
++    def GetActiveScopes(self):
++        ''' return tuple containing scopes that should be active for this process '''
++        return CommonPlatform.Scopes
++
++    def FilterPackagesToTest(self, changedFilesList: list, potentialPackagesList: list) -> list:
++        ''' Filter other cases that this package should be built
++        based on changed files. This should cover things that can't
++        be detected as dependencies. '''
++        build_these_packages = []
++        possible_packages = potentialPackagesList.copy()
++        for f in changedFilesList:
++            # BaseTools files that might change the build
++            if "BaseTools" in f:
++                if os.path.splitext(f) not in [".txt", ".md"]:
++                    build_these_packages = possible_packages
++                    break
++
++            # if the azure pipeline platform template file changed
++            if "platform-build-run-steps.yml" in f:
++                build_these_packages = possible_packages
++                break
++
++        return build_these_packages
++
++    def GetPlatformDscAndConfig(self) -> tuple:
++        ''' If a platform desires to provide its DSC then Policy 4 will evaluate if
++        any of the changes will be built in the dsc.
++
++        The tuple should be (<workspace relative path to dsc file>, <input dictionary of dsc key value pairs>)
++        '''
++        return ("Mac16_3Pkg/Mac16_3.dsc", {})
++
++    def GetName(self):
++        return "Mac16_3"
++
++    def GetPackagesPath(self):
++        ''' Return a list of paths that should be mapped as edk2 PackagesPath '''
++        return CommonPlatform.PackagesPath
++
++    # ####################################################################################### #
++    #                         Actual Configuration for Platform Build                         #
++    # ####################################################################################### #
++class PlatformBuilder( UefiBuilder, BuildSettingsManager):
++    def __init__(self):
++        UefiBuilder.__init__(self)
++
++    def AddCommandLineOptions(self, parserObj):
++        ''' Add command line options to the argparser '''
++
++        # In an effort to support common server based builds this parameter is added.  It is
++        # checked for correctness but is never uses as this platform only supports a single set of
++        # architectures.
++        parserObj.add_argument('-a', "--arch", dest="build_arch", type=str, default="AARCH64",
++            help="Optional - CSV of architecture to build.  AARCH64 is used for PEI and "
++            "DXE and is the only valid option for this platform.")
++
++    def RetrieveCommandLineOptions(self, args):
++        '''  Retrieve command line options from the argparser '''
++        if args.build_arch.upper() != "AARCH64":
++            raise Exception("Invalid Arch Specified.  Please see comments in PlatformBuild.py::PlatformBuilder::AddCommandLineOptions")
++
++    def GetWorkspaceRoot(self):
++        ''' get WorkspacePath '''
++        return CommonPlatform.WorkspaceRoot
++
++    def GetPackagesPath(self):
++        ''' Return a list of paths that should be mapped as edk2 PackagesPath '''
++        result = [
++            shell_environment.GetBuildVars().GetValue("FEATURE_CONFIG_PATH", "")
++        ]
++        for a in CommonPlatform.PackagesPath:
++            result.append(a)
++        return result
++
++    def GetActiveScopes(self):
++        ''' return tuple containing scopes that should be active for this process '''
++        return CommonPlatform.Scopes
++
++    def GetName(self):
++        ''' Get the name of the repo, platform, or product being build '''
++        ''' Used for naming the log file, among others '''
++        return "Mac16_3Pkg"
++
++    def GetLoggingLevel(self, loggerType):
++        ''' Get the logging level for a given type
++        base == lowest logging level supported
++        con  == Screen logging
++        txt  == plain text file logging
++        md   == markdown file logging
++        '''
++        return logging.DEBUG
++        #return super().GetLoggingLevel(loggerType)
++
++    def SetPlatformEnv(self):
++        logging.debug("PlatformBuilder SetPlatformEnv")
++        self.env.SetValue("PRODUCT_NAME", "Mac16_3", "Platform Hardcoded")
++        self.env.SetValue("ACTIVE_PLATFORM", "Mac16_3Pkg/Mac16_3.dsc", "Platform Hardcoded")
++        self.env.SetValue("TARGET_ARCH", "AARCH64", "Platform Hardcoded")
++        self.env.SetValue("TOOL_CHAIN_TAG", "CLANGPDB", "set default to clangpdb")
++        self.env.SetValue("EMPTY_DRIVE", "FALSE", "Default to false")
++        self.env.SetValue("RUN_TESTS", "FALSE", "Default to false")
++        self.env.SetValue("SHUTDOWN_AFTER_RUN", "FALSE", "Default to false")
++        # needed to make FV size build report happy
++        # self.env.SetValue("BLD_*_BUILDID_STRING", "Unknown", "Default")
++        # # Default turn on build reporting.
++        self.env.SetValue("BUILDREPORTING", "TRUE", "Enabling build report")
++        self.env.SetValue("BUILDREPORT_TYPES", "PCD DEPEX FLASH BUILD_FLAGS LIBRARY FIXED_ADDRESS HASH", "Setting build report types")
++        # Include the MFCI test cert by default, override on the commandline with "BLD_*_SHIP_MODE=TRUE" if you want the retail MFCI cert
++        self.env.SetValue("BLD_*_SHIP_MODE", "FALSE", "Default")
++
++        return 0
++
++    def PlatformPreBuild(self):
++        return 0
++
++    def PlatformPostBuild(self):
++        return 0
++
++    def FlashRomImage(self):
++        return 0
++
++if __name__ == "__main__":
++    import argparse
++    import sys
++    from edk2toolext.invocables.edk2_update import Edk2Update
++    from edk2toolext.invocables.edk2_setup import Edk2PlatformSetup
++    from edk2toolext.invocables.edk2_platform_build import Edk2PlatformBuild
++    print("Invoking Stuart")
++    print("     ) _     _")
++    print("    ( (^)-~-(^)")
++    print("__,-.\_( 0 0 )__,-.___")
++    print("  'W'   \   /   'W'")
++    print("         >o<")
++    SCRIPT_PATH = os.path.relpath(__file__)
++    parser = argparse.ArgumentParser(add_help=False)
++    parse_group = parser.add_mutually_exclusive_group()
++    parse_group.add_argument("--update", "--UPDATE",
++                             action='store_true', help="Invokes stuart_update")
++    parse_group.add_argument("--setup", "--SETUP",
++                             action='store_true', help="Invokes stuart_setup")
++    args, remaining = parser.parse_known_args()
++    new_args = ["stuart", "-c", SCRIPT_PATH]
++    new_args = new_args + remaining
++    sys.argv = new_args
++    if args.setup:
++        print("Running stuart_setup -c " + SCRIPT_PATH)
++        Edk2PlatformSetup().Invoke()
++    elif args.update:
++        print("Running stuart_update -c " + SCRIPT_PATH)
++        Edk2Update().Invoke()
++    else:
++        print("Running stuart_build -c " + SCRIPT_PATH)
++        Edk2PlatformBuild().Invoke()
+\ No newline at end of file
+diff --git a/Platform/Mac16_3Pkg/Resources/RegulatoryLogos.png b/Platform/Mac16_3Pkg/Resources/RegulatoryLogos.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8c902e98cd753bf25db5cecff4fd00edf57f89b
+GIT binary patch
+literal 8806
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/Platform/MacBookProEarly2023Pkg/PlatformBuild.py b/Platform/MacBookProEarly2023Pkg/PlatformBuild.py
+index e00f7005b684865e4eeffc83d24346ac21575c90..e43156576d270d73150c59a17b0ee6a66f7e988d 100644
+--- a/Platform/MacBookProEarly2023Pkg/PlatformBuild.py
++++ b/Platform/MacBookProEarly2023Pkg/PlatformBuild.py
+@@ -33,7 +33,7 @@ class CommonPlatform():
+     PackagesSupported = ("MacBookProEarly2023Pkg",)
+     ArchSupported = ("AARCH64",)
+     TargetsSupported = ("DEBUG", "RELEASE", "NOOPT")
+-    Scopes = ('MacBookProEarly2023', 'gcc_aarch64_linux', 'edk2-build', 'cibuild')
++    Scopes = ('MacBookProEarly2023', 'gcc_aarch64_linux', 'edk2-build')
+     WorkspaceRoot = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+     PackagesPath = ("Platform", "MU_BASECORE", "Common/MU", "Common/TIANO", "Common/MU_OEM_SAMPLE", "Silicon/ARM/TIANO", "Silicon/Apple", "Common/MU_DFCI", "mu_feature_debugger")
+ 
+diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/BERT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/BERT.aslc
+new file mode 100644
+index 0000000000000000000000000000000000000000..7014fe5fa2ff192709787a86ee7cced2cf86c4c7
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/BERT.aslc
+@@ -0,0 +1,45 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors).
++ * 
++ * Module Name:
++ *     BERT.aslc
++ * 
++ * Abstract:
++ *     Boot Error Record Table. This source file implements the BERT table
++ *     for "Jade" (M1 Pro/Max/Ultra) SoCs.
++ * 
++ *     Original source file from AmpereAltraPkg.
++ * 
++ * Environment:
++ *     UEFI firmware/runtime services.
++ * 
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ * 
++*/
++
++#include <IndustryStandard/Acpi.h>
++#include <Acpi/AcpiHeader.h>
++
++#define BOOT_ERROR_REGION_LENGTH  0x50000
++//#define BOOT_ERROR_REGION_BASE    0x0000000088230000
++
++#pragma pack(1)
++
++EFI_ACPI_6_3_BOOT_ERROR_RECORD_TABLE_HEADER Bert = {
++  __ACPI_HEADER (
++    EFI_ACPI_6_3_BOOT_ERROR_RECORD_TABLE_SIGNATURE,
++    EFI_ACPI_6_3_BOOT_ERROR_RECORD_TABLE_HEADER,
++    EFI_ACPI_6_3_BOOT_ERROR_RECORD_TABLE_REVISION
++  ),
++  BOOT_ERROR_REGION_LENGTH,
++  BOOT_ERROR_REGION_BASE
++};
++
++#pragma pack()
++
++//
++// Reference the table being generated to prevent the optimizer from removing
++// the data structure from the executable
++//
++VOID* CONST ReferenceAcpiTable = &Bert;
+diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/CPUAcpiTables.inf b/Silicon/Apple/T8132FamilyPkg/AcpiTables/CPUAcpiTables.inf
+new file mode 100644
+index 0000000000000000000000000000000000000000..414daf990e1eb00f743685ca777e90c154bbe1ed
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/CPUAcpiTables.inf
+@@ -0,0 +1,45 @@
++## @file
++#  Borrowed from edk2-platforms/JunoPkg and AmpereAltraPkg, original header below.
++#  Copyright (c) 2023, amarioguy (AppleWOA authors)
++#  ACPI table data and ASL sources required to boot the platform.
++#
++#  Copyright (c) 2014-2017, ARM Ltd. All rights reserved.
++#
++#  SPDX-License-Identifier: BSD-2-Clause-Patent
++#
++##
++
++[Defines]
++  INF_VERSION                    = 0x00010005
++  BASE_NAME                      = CPUAcpiTables
++  FILE_GUID                      = d1430d86-24a4-4c2f-8f22-d24376e2e888
++  MODULE_TYPE                    = USER_DEFINED
++  VERSION_STRING                 = 1.0
++
++[Sources]
++  # GTDT.aslc is provided by AppleSiliconPkg/AcpiTables/GenericAcpiTables.inf
++  MADT_Static.aslc
++  PPTT.aslc
++
++
++[Packages]
++  ArmPkg/ArmPkg.dec
++  ArmPlatformPkg/ArmPlatformPkg.dec
++  EmbeddedPkg/EmbeddedPkg.dec
++  MdePkg/MdePkg.dec
++  MdeModulePkg/MdeModulePkg.dec
++  AppleSiliconPkg/AppleSiliconPkg.dec
++
++[FixedPcd]
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultCreatorId          ## CONSUMES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultCreatorRevision    ## CONSUMES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultOemId              ## CONSUMES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultOemTableId         ## CONSUMES
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultOemRevision        ## CONSUMES
++  gArmTokenSpaceGuid.PcdArmArchTimerSecIntrNum                    ## CONSUMES
++  gArmTokenSpaceGuid.PcdArmArchTimerIntrNum                       ## CONSUMES
++  gArmTokenSpaceGuid.PcdArmArchTimerHypIntrNum                    ## CONSUMES
++  gArmTokenSpaceGuid.PcdArmArchTimerVirtIntrNum                   ## CONSUMES
++  gAppleSiliconPkgTokenSpaceGuid.PcdCoreCount                     ## CONSUMES
++  gArmTokenSpaceGuid.PcdGicRedistributorsBase
++  gArmTokenSpaceGuid.PcdGicDistributorBase
+\ No newline at end of file
+diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/CSRT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/CSRT.aslc
+new file mode 100644
+index 0000000000000000000000000000000000000000..833b04e64f0cb38c382c5eb68715a9894d2ca0cc
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/CSRT.aslc
+@@ -0,0 +1,46 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors).
++ * 
++ * Module Name:
++ *     CSRT.aslc
++ * 
++ * Abstract:
++ *     Core System Resource Table. This source file implements the CSRT table for
++ *     "Donan" (M4) SoCs.
++ *     CSRT basis from edk2-platforms/RaspberryPi platform.
++ * 
++ * Environment:
++ *     UEFI firmware/runtime services.
++ * 
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ * 
++*/
++
++#include <Library/AcpiLib.h>
++#include <Library/ArmLib.h>
++#include <Library/PcdLib.h>
++#include <IndustryStandard/Acpi.h>
++
++//
++// We need to define CSRT ACPI definitions here, as AcpiLib doesn't have them.
++//
++
++#define EFI_ACPI_6_3_CSRT_REVISION            0x00000000
++
++typedef enum
++{
++  EFI_ACPI_CSRT_RESOURCE_TYPE_RESERVED,           // 0
++  EFI_ACPI_CSRT_RESOURCE_TYPE_INTERRUPT,          // 1
++  EFI_ACPI_CSRT_RESOURCE_TYPE_TIMER,              // 2
++  EFI_ACPI_CSRT_RESOURCE_TYPE_DMA,                // 3
++  EFI_ACPI_CSRT_RESOURCE_TYPE_CACHE,              // 4
++}
++CSRT_RESOURCE_TYPE;
++
++
++//
++// The non-standard system resources we need to support here are mainly the IOMMU and
++// the AIC
++// TODO: implement this
++//
+diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/GTDT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/GTDT.aslc
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e9b530b5edc82376de94baad7ca6c38c5a91316
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/GTDT.aslc
+@@ -0,0 +1,134 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors).
++ * 
++ * Module Name:
++ *     GTDT.aslc
++ * 
++ * Abstract:
++ *     Generic Timer Description Table. This source file implements the GTDT table for
++ *     "Donan" (M4) SoCs.
++ * 
++ * Environment:
++ *     UEFI firmware/runtime services.
++ * 
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ * 
++ * Based on AmpereAltraPkg (part of edk2-platforms) and QemuSbsaPkg (part of mu_tiano_platforms)
++ * 
++*/
++
++#include <Library/PcdLib.h>
++#include <Library/AcpiLib.h>
++#include <IndustryStandard/Acpi64.h>
++#include <Acpi/AcpiHeader.h>
++
++
++/**
++ * Apple platforms basically just implement the standard ARM timer, with the only major distinction
++ * being that the timer interrupts (and most things considered a "PPI" on GIC systems) are using
++ * FIQs and not IRQs.
++ * 
++ * As a result we will assign an arbitrary interrupt number (17 currently) and then proceed to define a standard ARM timer here.
++*/
++
++#define SYSTEM_TIMER_BASE_ADDRESS       0xFFFFFFFFFFFFFFFF
++#define CNT_READ_BASE_ADDRESS           0xFFFFFFFFFFFFFFFF
++
++#define GTDT_TIMER_EDGE_TRIGGERED   EFI_ACPI_6_4_GTDT_TIMER_FLAG_TIMER_INTERRUPT_MODE
++#define GTDT_TIMER_LEVEL_TRIGGERED  0
++#define GTDT_TIMER_ACTIVE_LOW       EFI_ACPI_6_4_GTDT_TIMER_FLAG_TIMER_INTERRUPT_POLARITY
++#define GTDT_TIMER_ACTIVE_HIGH      0
++#define GTDT_TIMER_SAVE_CONTEXT     EFI_ACPI_6_4_GTDT_TIMER_FLAG_ALWAYS_ON_CAPABILITY
++#define GTDT_TIMER_LOSE_CONTEXT     0
++
++#define GTDT_GTIMER_FLAGS          (GTDT_TIMER_LOSE_CONTEXT | GTDT_TIMER_ACTIVE_HIGH | GTDT_TIMER_LEVEL_TRIGGERED)
++
++/**
++ * Per the Linux driver for the Apple WDT, Apple platforms have three watchdog timers on the platform,
++ * they seem to be contiguously mapped in the same MMIO space.
++ * 
++ * Watchdog 0 is a "boot to recovery mode" watchdog, not useful.
++ * 
++ * Watchdog 1 is the one we will use and set as the "generic" watchdog in this specific table.
++ * 
++ * There is an alternate watchdog timer that serves the same purpose as Watchdog 1, can use either, but will use Watchdog 1.
++ * 
++ * Reset flow of the Apple watchdog timer:
++ *   1) Write 0x4 to wdt_base + 0x1c
++ *   2) write zeros to the wdt_base + 0x10 and wdt_base + 0x14
++ * 
++*/
++#define WATCHDOG_COUNT              0
++
++
++#define ARM_WATCHDOG_REFRESH_BASE     0x000000029E2C4010
++#define ARM_WATCHDOG_CONTROL_BASE     0x000000029E2C401C
++#define ARM_WATCHDOG_GSIV             719
++
++#define ARM_WATCHDOG_EDGE_TRIGGERED   EFI_ACPI_6_4_GTDT_ARM_GENERIC_WATCHDOG_FLAG_TIMER_INTERRUPT_MODE
++#define ARM_WATCHDOG_LEVEL_TRIGGERED  0
++#define ARM_WATCHDOG_ACTIVE_LOW       EFI_ACPI_6_4_GTDT_ARM_GENERIC_WATCHDOG_FLAG_TIMER_INTERRUPT_POLARITY
++#define ARM_WATCHDOG_ACTIVE_HIGH      0
++#define ARM_WATCHDOG_SECURE           EFI_ACPI_6_4_GTDT_ARM_GENERIC_WATCHDOG_FLAG_SECURE_TIMER
++#define ARM_WATCHDOG_NON_SECURE       0
++
++#define ARM_WATCHDOG_FLAGS            (ARM_WATCHDOG_NON_SECURE | ARM_WATCHDOG_ACTIVE_HIGH | ARM_WATCHDOG_LEVEL_TRIGGERED)
++
++#pragma pack (1)
++
++typedef struct {
++  EFI_ACPI_6_4_GENERIC_TIMER_DESCRIPTION_TABLE          Gtdt;
++#if (WATCHDOG_COUNT != 0)
++  EFI_ACPI_6_4_GTDT_ARM_GENERIC_WATCHDOG_STRUCTURE     Watchdogs[WATCHDOG_COUNT];
++#endif
++} EFI_ACPI_6_4_GENERIC_TIMER_DESCRIPTION_TABLES;
++
++#pragma pack ()
++
++EFI_ACPI_6_4_GENERIC_TIMER_DESCRIPTION_TABLES Gtdt = {
++  {
++    __ACPI_HEADER (
++      EFI_ACPI_6_4_GENERIC_TIMER_DESCRIPTION_TABLE_SIGNATURE,
++      EFI_ACPI_6_4_GENERIC_TIMER_DESCRIPTION_TABLES,
++      EFI_ACPI_6_4_GENERIC_TIMER_DESCRIPTION_TABLE_REVISION
++    ),
++    SYSTEM_TIMER_BASE_ADDRESS,                              // UINT64  CntControlBasePhysicalAddress
++    EFI_ACPI_RESERVED_DWORD,                                // UINT32  Reserved
++    FixedPcdGet32 (PcdArmArchTimerSecIntrNum),              // UINT32  SecurePL1TimerGSIV
++    GTDT_GTIMER_FLAGS,                                      // UINT32  SecurePL1TimerFlags
++    FixedPcdGet32 (PcdArmArchTimerIntrNum),                 // UINT32  NonSecurePL1TimerGSIV
++    GTDT_GTIMER_FLAGS,                                      // UINT32  NonSecurePL1TimerFlags
++    FixedPcdGet32 (PcdArmArchTimerVirtIntrNum),             // UINT32  VirtualTimerGSIV
++    GTDT_GTIMER_FLAGS,                                      // UINT32  VirtualTimerFlags
++    FixedPcdGet32 (PcdArmArchTimerHypIntrNum),              // UINT32  NonSecurePL2TimerGSIV
++    GTDT_GTIMER_FLAGS,                                      // UINT32  NonSecurePL2TimerFlags
++    CNT_READ_BASE_ADDRESS,                                  // UINT64  CntReadBasePhysicalAddress
++#if (WATCHDOG_COUNT != 0)
++    1                                                       // UINT32  PlatformTimerCount
++#else
++    0,                                                      // UINT32  PlatformTimerCount
++#endif
++    sizeof (EFI_ACPI_6_4_GENERIC_TIMER_DESCRIPTION_TABLE),  // UINT32  PlatformTimerOffset
++    0,                                                      // UINT32  VirtualPL2TimerGSIV
++    0                                                       // UINT32  VirtualPL2TimerFlags
++  },
++#if (WATCHDOG_COUNT != 0)
++  {
++    {
++      EFI_ACPI_6_4_GTDT_ARM_GENERIC_WATCHDOG,                      // UINT8 Type
++      sizeof(EFI_ACPI_6_4_GTDT_ARM_GENERIC_WATCHDOG_STRUCTURE),    // UINT16 Length
++      EFI_ACPI_RESERVED_BYTE,                                      // UINT8 Reserved
++      ARM_WATCHDOG_REFRESH_BASE,                                   // UINT64 RefreshFramePhysicalAddress
++      ARM_WATCHDOG_CONTROL_BASE,                                   // UINT64 WatchdogControlFramePhysicalAddress
++      ARM_WATCHDOG_GSIV,                                           // UINT32 WatchdogTimerGSIV
++      ARM_WATCHDOG_FLAGS                                           // UINT32 WatchdogTimerFlags
++    }
++  }
++#endif
++};
++
++
++// Reference the table being generated to prevent the optimizer from removing the
++// data structure from the executable
++VOID* CONST ReferenceAcpiTable = &Gtdt;
+diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc
+new file mode 100644
+index 0000000000000000000000000000000000000000..8406818ad09eff6c0dd4bc51aedbdbaaecb9ba66
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc
+@@ -0,0 +1,115 @@
++/**
++ * Copyright (c) 2025 NTASP authors.
++ *
++ * Module Name:
++ *     MADT_Static.aslc
++ *
++ * Abstract:
++ *     Multiple APIC Description Table for the Apple M4 (T8132) family.
++ *     This is a temporary static implementation until dynamic allocation
++ *     in AcpiPlatformDxe is implemented.
++ *
++ *     M4 base (Mac16,3 / J624): 6 efficiency cores + 4 performance cores.
++ *     The MPIDR affinity values below match the Asahi t8132.dtsi CPU nodes
++ *     (E cores 0x000-0x005, P cores 0x10100-0x10103) and the J624 ioreg
++ *     topology.  Keep them in sync with the DSDT processor containers.
++ *
++ * Environment:
++ *     UEFI firmware/runtime services.
++ *
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ *
++ */
++
++#include <Library/AcpiLib.h>
++#include <Library/ArmLib.h>
++#include <Library/PcdLib.h>
++#include <IndustryStandard/Acpi63.h>
++#include <Acpi/AcpiHeader.h>
++
++//
++// pulled from mu_tiano_platforms, since there's no equivalent GICR initializer.
++//
++#define MADT_GICR_INIT()  {                                           \
++   EFI_ACPI_6_4_GICR,                        /* Type */                        \
++   sizeof (EFI_ACPI_6_4_GICR_STRUCTURE),     /* Length */                      \
++   EFI_ACPI_RESERVED_WORD,                   /* Reserved */                    \
++   FixedPcdGet32 (PcdGicRedistributorsBase), /* DiscoveryRangeBaseAddress */   \
++   0x20000 * FixedPcdGet32(PcdCoreCount)     /* DiscoveryRangeLength */        \
++   }
++
++#pragma pack (1)
++
++typedef struct {
++  EFI_ACPI_6_3_MULTIPLE_APIC_DESCRIPTION_TABLE_HEADER Header;
++  EFI_ACPI_6_3_GIC_STRUCTURE                         GicInterfaces[FixedPcdGet32 (PcdCoreCount)];
++  EFI_ACPI_6_0_GIC_DISTRIBUTOR_STRUCTURE             GicDistributor;
++  EFI_ACPI_6_4_GICR_STRUCTURE                        GicRedistributor;
++} MULTIPLE_APIC_DESCRIPTION_TABLE;
++
++#pragma pack ()
++
++MULTIPLE_APIC_DESCRIPTION_TABLE Madt = {
++  {
++    __ACPI_HEADER (
++      EFI_ACPI_6_3_MULTIPLE_APIC_DESCRIPTION_TABLE_SIGNATURE,
++      MULTIPLE_APIC_DESCRIPTION_TABLE,
++      EFI_ACPI_6_3_MULTIPLE_APIC_DESCRIPTION_TABLE_REVISION
++    ),
++    //
++    // MADT specific fields
++    //
++    0, // LocalApicAddress
++    0, // Flags
++  },
++  {
++    //
++    // Format: EFI_ACPI_6_3_GICC_STRUCTURE_INIT(GicId, AcpiCpuUid, Flags, PmuIrq,
++    //          GicBase, GicVBase, GicHBase, GsivId, GicRBase, Mpidr,
++    //          Efficiency, SpeOvflIrq)
++    //
++    // The primary CPU must be first. The PMU IRQ is 0 until the M4 PMU
++    // GSIVs are verified; GICRBase is 0 because the GICR structure below
++    // describes the redistributor range.
++    //
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // E-core 0
++        0, 0, GET_MPIDR(0, 0, 0, 0), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 0, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // E-core 1
++        1, 1, GET_MPIDR(0, 0, 0, 1), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 0, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // E-core 2
++        2, 2, GET_MPIDR(0, 0, 0, 2), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 0, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // E-core 3
++        3, 3, GET_MPIDR(0, 0, 0, 3), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 0, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // E-core 4
++        4, 4, GET_MPIDR(0, 0, 0, 4), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 0, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // E-core 5
++        5, 5, GET_MPIDR(0, 0, 0, 5), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 0, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // P-core 0
++        6, 6, GET_MPIDR(0, 1, 1, 0), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 1, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // P-core 1
++        7, 7, GET_MPIDR(0, 1, 1, 1), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 1, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // P-core 2
++        8, 8, GET_MPIDR(0, 1, 1, 2), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 1, 0),
++    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // P-core 3
++        9, 9, GET_MPIDR(0, 1, 1, 3), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
++        0, 0, 25, 0, 1, 0),
++  },
++  EFI_ACPI_6_0_GIC_DISTRIBUTOR_INIT(0, FixedPcdGet64 (PcdGicDistributorBase), 0, 3),
++  MADT_GICR_INIT(),
++};
++
++//
++// Reference the table being generated to prevent the optimizer from removing the
++// data structure from the executable
++//
++VOID* CONST ReferenceAcpiTable = &Madt;
+diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/PPTT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/PPTT.aslc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b36ade50bf3f549c70b46fa9dfe9db3ac4731e25
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/PPTT.aslc
+@@ -0,0 +1,148 @@
++/**
++ * Copyright (c) 2025 NTASP authors.
++ *
++ * Module Name:
++ *     PPTT.aslc
++ *
++ * Abstract:
++ *     Processor Properties Topology Table for the Apple M4 (T8132) family.
++ *     M4 base (Mac16,3 / J624): one 6-core efficiency cluster and one 4-core
++ *     performance cluster, matching the Asahi t8132.dtsi cpu-map and the
++ *     J624 ioreg topology. This is a temporary static implementation until
++ *     dynamic allocation in AcpiPlatformDxe is implemented.
++ *
++ *     The ACPI IDs here MUST match the MADT GICC ACPI UIDs (0-5 efficiency,
++ *     6-9 performance).
++ *
++ * Environment:
++ *     UEFI firmware/runtime services.
++ *
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ *
++ */
++
++#include <Library/AcpiLib.h>
++#include <Library/ArmLib.h>
++#include <Library/PcdLib.h>
++#include <IndustryStandard/Acpi64.h>
++#include <Acpi/AcpiHeader.h>
++#include <Acpi/SgiAcpiHeader.h>
++
++#define E_CORE_COUNT 6
++#define P_CORE_COUNT 4
++#define DIE_COUNT    1
++
++#pragma pack(1)
++typedef struct {
++  EFI_ACPI_6_4_PPTT_STRUCTURE_PROCESSOR Core;
++} PPTT_CORE;
++
++typedef struct {
++  EFI_ACPI_6_4_PPTT_STRUCTURE_PROCESSOR Cluster;
++  PPTT_CORE                             Cores[E_CORE_COUNT];
++} PPTT_E_CLUSTER;
++
++typedef struct {
++  EFI_ACPI_6_4_PPTT_STRUCTURE_PROCESSOR Cluster;
++  PPTT_CORE                             Cores[P_CORE_COUNT];
++} PPTT_P_CLUSTER;
++
++typedef struct {
++  EFI_ACPI_6_4_PPTT_STRUCTURE_PROCESSOR Die;
++  PPTT_E_CLUSTER                        ECluster;
++  PPTT_P_CLUSTER                        PCluster;
++} PPTT_DIE;
++#pragma pack ()
++
++#define CORE_INIT(ParentOffset, AcpiId)                                                             \
++{                                                                                                   \
++    EFI_ACPI_6_4_PPTT_STRUCTURE_PROCESSOR_INIT (                                                    \
++        0x14,                                                           /* Length */                \
++        PPTT_PROCESSOR_CORE_FLAGS,                                      /* Flag */                  \
++        ParentOffset,                                                   /* Parent */                \
++        AcpiId,                                                         /* ACPI Id */               \
++        0                                                               /* Private resources */     \
++    ),                                                                                              \
++}
++
++#define E_CLUSTER_INIT()                                                                            \
++{                                                                                                   \
++    EFI_ACPI_6_4_PPTT_STRUCTURE_PROCESSOR_INIT (                                                    \
++        OFFSET_OF (PPTT_E_CLUSTER, Cores),                              /* Length */                \
++        PPTT_PROCESSOR_CLUSTER_FLAGS,                                   /* Flag */                  \
++        OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE, Dies[0].Die), /* Parent */   \
++        0,                                                              /* ACPI Id */               \
++        0                                                               /* Private resources */     \
++    ),                                                                                              \
++    {                                                                                               \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].ECluster), 0),                                                \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].ECluster), 1),                                                \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].ECluster), 2),                                                \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].ECluster), 3),                                                \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].ECluster), 4),                                                \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].ECluster), 5),                                                \
++    },                                                                                              \
++}
++
++#define P_CLUSTER_INIT()                                                                            \
++{                                                                                                   \
++    EFI_ACPI_6_4_PPTT_STRUCTURE_PROCESSOR_INIT (                                                    \
++        OFFSET_OF (PPTT_P_CLUSTER, Cores),                              /* Length */                \
++        PPTT_PROCESSOR_CLUSTER_FLAGS,                                   /* Flag */                  \
++        OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE, Dies[0].Die), /* Parent */   \
++        1,                                                              /* ACPI Id */               \
++        0                                                               /* Private resources */     \
++    ),                                                                                              \
++    {                                                                                               \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].PCluster), E_CORE_COUNT + 0),                                  \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].PCluster), E_CORE_COUNT + 1),                                  \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].PCluster), E_CORE_COUNT + 2),                                  \
++        CORE_INIT (OFFSET_OF (EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,                  \
++                              Dies[0].PCluster), E_CORE_COUNT + 3),                                  \
++    },                                                                                              \
++}
++
++#define DIE_INIT()                                                                                  \
++{                                                                                                   \
++    EFI_ACPI_6_4_PPTT_STRUCTURE_PROCESSOR_INIT (                                                    \
++        OFFSET_OF (PPTT_DIE, ECluster),                                 /* Length */                \
++        PPTT_PROCESSOR_PACKAGE_FLAGS,                                   /* Flag */                  \
++        0,                                                              /* Parent */                \
++        0,                                                              /* ACPI Id */               \
++        0                                                               /* Private resources */     \
++    ),                                                                                              \
++    E_CLUSTER_INIT (),                                                                              \
++    P_CLUSTER_INIT (),                                                                              \
++}
++
++#pragma pack(1)
++typedef struct {
++  EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE_HEADER Header;
++  PPTT_DIE                                                Dies[DIE_COUNT];
++} EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE;
++#pragma pack ()
++
++EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE Pptt = {
++  {
++    __ACPI_HEADER (
++        EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE_STRUCTURE_SIGNATURE,
++        EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE,
++        EFI_ACPI_6_4_PROCESSOR_PROPERTIES_TOPOLOGY_TABLE_REVISION
++    )
++  },
++  {
++    DIE_INIT (),
++  }
++};
++
++VOID * CONST ReferenceAcpiTable = &Pptt;
+diff --git a/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h b/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c80d59310a6649131e575856dfdd4bdfafa4722
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h
+@@ -0,0 +1,159 @@
++/**
++ * @file AppleVirtualMemoryMapDefines.h
++ * @author amarioguy (Arminder Singh)
++ * 
++ * Defines used in configuring the virtual memory map for M4.
++ * 
++ * @version 0.1
++ * @date 2022-08-22
++ * 
++ * @copyright Copyright (c) amarioguy (Arminder Singh) 2022.
++ * 
++ * SPDX-License-Identiifer: BSD-2-Clause-Patent
++ * 
++ */
++
++ //
++ // Note as of 5/25/2025: this is based on the M2 Pro MBP that I have - the memory map file should be machine specific, and the driver
++ // seems like it should become general to all SoCs. Note this change for later - but leave this machine specific for right now.
++ // What I would really want is a way to generalize this based on a memory map passed in. This *seems* like it should fall to the DeviceTree...
++ // Most ranges seem to match M1 Pro series, so this should probably remain the same (M3/M4 series definitely do not keep this same mapping)
++ //
++
++#include <Base.h>
++
++#ifndef APPLE_VIRTUAL_MEMORY_MAP_DEFINES_H_
++#define APPLE_VIRTUAL_MEMORY_MAP_DEFINES_H_
++
++//"core" MMIO devices, like PMGR, AIC, USB, etc. (mappings need to be nGnRnE)
++//
++// M4/J624 keeps the USB DWC3 controllers at low physical addresses
++// (usb-drd0@0x2280000 ... usb-drd3@0x1a280000), so the low 1GB window has to
++// be mapped even though the M1/M2 map started at 0x280000000.
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_0_BASE 0x000000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_0_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_1_BASE 0x280000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_1_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_2_BASE 0x380000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_2_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_3_BASE 0x580000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_3_SIZE SIZE_512MB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_4_BASE 0x700000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_4_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_5_BASE 0xB00000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_5_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_6_BASE 0xF00000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_6_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_7_BASE 0x1300000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_7_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_8_BASE 0x2280000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_8_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_9_BASE 0x2380000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_9_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_10_BASE 0x2580000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_10_SIZE SIZE_512MB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_11_BASE 0x2700000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_11_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_12_BASE 0x2B00000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_12_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_13_BASE 0x2F00000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_13_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_14_BASE 0x3300000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_14_SIZE SIZE_1GB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_15_BASE 0x5000000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_15_SIZE SIZE_64KB
++
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_16_BASE 0x5100000000
++#define APPLE_CORE_SYSTEM_MMIO_RANGE_16_SIZE SIZE_2MB
++
++
++
++//PCIe MMIO (mappings need to be nGnRE)
++#define APPLE_PCIE_MMIO_RANGE_1_BASE 0x5A0000000
++#define APPLE_PCIE_MMIO_RANGE_1_SIZE SIZE_512MB
++
++#define APPLE_PCIE_MMIO_RANGE_2_BASE 0x5C0000000
++#define APPLE_PCIE_MMIO_RANGE_2_SIZE SIZE_1GB
++
++#define APPLE_PCIE_MMIO_RANGE_3_BASE 0x800000000
++#define APPLE_PCIE_MMIO_RANGE_3_SIZE SIZE_8GB
++
++#define APPLE_PCIE_MMIO_RANGE_4_BASE 0xA00000000
++#define APPLE_PCIE_MMIO_RANGE_4_SIZE SIZE_2GB
++
++#define APPLE_PCIE_MMIO_RANGE_5_BASE 0xC00000000
++#define APPLE_PCIE_MMIO_RANGE_5_SIZE SIZE_8GB
++
++#define APPLE_PCIE_MMIO_RANGE_6_BASE 0xE00000000
++#define APPLE_PCIE_MMIO_RANGE_6_SIZE SIZE_2GB
++
++#define APPLE_PCIE_MMIO_RANGE_7_BASE 0x1000000000
++#define APPLE_PCIE_MMIO_RANGE_7_SIZE SIZE_8GB
++
++#define APPLE_PCIE_MMIO_RANGE_8_BASE 0x1200000000
++#define APPLE_PCIE_MMIO_RANGE_8_SIZE SIZE_2GB
++
++#define APPLE_PCIE_MMIO_RANGE_9_BASE 0x1400000000
++#define APPLE_PCIE_MMIO_RANGE_9_SIZE SIZE_8GB
++
++#define APPLE_PCIE_MMIO_RANGE_10_BASE 0x1600000000
++#define APPLE_PCIE_MMIO_RANGE_10_SIZE SIZE_2GB
++
++#define APPLE_PCIE_MMIO_RANGE_21_BASE 0x1800000000
++#define APPLE_PCIE_MMIO_RANGE_21_SIZE SIZE_16GB
++
++#define APPLE_PCIE_MMIO_RANGE_22_BASE 0x1700000000
++#define APPLE_PCIE_MMIO_RANGE_22_SIZE SIZE_4GB
++
++//
++// Should be harmless to leave these in as long as memory doesn't access it?
++// Will need to remove these later though.
++
++#define APPLE_PCIE_MMIO_RANGE_11_BASE 0x25A0000000
++#define APPLE_PCIE_MMIO_RANGE_11_SIZE SIZE_512MB
++
++#define APPLE_PCIE_MMIO_RANGE_12_BASE 0x25C0000000
++#define APPLE_PCIE_MMIO_RANGE_12_SIZE SIZE_1GB
++
++#define APPLE_PCIE_MMIO_RANGE_13_BASE 0x2800000000
++#define APPLE_PCIE_MMIO_RANGE_13_SIZE SIZE_8GB
++
++#define APPLE_PCIE_MMIO_RANGE_14_BASE 0x2A00000000
++#define APPLE_PCIE_MMIO_RANGE_14_SIZE SIZE_2GB
++
++#define APPLE_PCIE_MMIO_RANGE_15_BASE 0x2C00000000
++#define APPLE_PCIE_MMIO_RANGE_15_SIZE SIZE_8GB
++
++#define APPLE_PCIE_MMIO_RANGE_16_BASE 0x2E00000000
++#define APPLE_PCIE_MMIO_RANGE_16_SIZE SIZE_2GB
++
++#define APPLE_PCIE_MMIO_RANGE_17_BASE 0x3000000000
++#define APPLE_PCIE_MMIO_RANGE_17_SIZE SIZE_8GB
++
++#define APPLE_PCIE_MMIO_RANGE_18_BASE 0x3200000000
++#define APPLE_PCIE_MMIO_RANGE_18_SIZE SIZE_2GB
++
++#define APPLE_PCIE_MMIO_RANGE_19_BASE 0x3400000000
++#define APPLE_PCIE_MMIO_RANGE_19_SIZE SIZE_8GB
++
++#define APPLE_PCIE_MMIO_RANGE_20_BASE 0x3600000000
++#define APPLE_PCIE_MMIO_RANGE_20_SIZE SIZE_2GB
++
++
++
++#endif // APPLE_VIRTUAL_MEMORY_MAP_DEFINES_H_
+\ No newline at end of file
+diff --git a/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.c b/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..61dbe2e53bcd857b0fb6200c2a1ba31f15e5bfb6
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.c
+@@ -0,0 +1,596 @@
++/**
++ * @file MemoryInitPeiLib.c
++ * 
++ * @author amarioguy (Arminder Singh)
++ * 
++ * This file implements page table setup, memory HOB setup, and MMU initialization.
++ * Adapted from SurfaceDuoPkg/MemoryInitPeiLib.c
++ * 
++ * @version 1.0
++ * @date 2022-07-31
++ * 
++ * @copyright Copyright (c) amarioguy (Arminder Singh) 2022.
++ * 
++ * SPDX-License-Identifier: BSD-2-Clause-Patent
++ * 
++ **/
++
++#include <PiPei.h>
++
++#include <Library/ArmMmuLib.h>
++#include <Library/ArmPlatformLib.h>
++#include <Library/DebugLib.h>
++#include <Library/HobLib.h>
++#include <Library/MemoryAllocationLib.h>
++#include <Library/PcdLib.h>
++#include <Library/IoLib.h>
++#include <Library/PrintLib.h>
++#include <Library/AppleDTLib.h>
++
++//Device memory map configuration file for UEFI (this is to help with pagetable initialization)
++#include <Library/T8132FamilyVirtualMemoryMapDefines.h>
++
++#define MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS 42
++
++#define DDR_ATTRIBUTES_CACHED           ARM_MEMORY_REGION_ATTRIBUTE_WRITE_BACK
++#define DDR_ATTRIBUTES_UNCACHED         ARM_MEMORY_REGION_ATTRIBUTE_UNCACHED_UNBUFFERED
++
++VOID BuildMemoryTypeInformationHob(VOID);
++
++VOID BuildVirtualMemoryMap(OUT ARM_MEMORY_REGION_DESCRIPTOR **VirtualMemoryMap);
++
++STATIC VOID InitMmu(IN ARM_MEMORY_REGION_DESCRIPTOR *MemoryTable)
++{
++    VOID *MemoryTranslationTableBase;
++    UINTN MemoryTranslationTableSize;
++    RETURN_STATUS StatusCode;
++
++    DEBUG(
++        (DEBUG_INFO, 
++        "MemoryInitPeiLib: Enabling MMU, Page Table Base: 0x%p, Page Table Size: 0x%p\n", 
++        &MemoryTranslationTableBase, &MemoryTranslationTableSize)
++        );
++    StatusCode = ArmConfigureMmu(MemoryTable, &MemoryTranslationTableBase, &MemoryTranslationTableSize);
++    DEBUG((DEBUG_INFO, "MMU enable successful\n"));
++
++    if(EFI_ERROR(StatusCode))
++    {
++        DEBUG((DEBUG_ERROR | DEBUG_INFO, "MemoryInitPeiLib: MMU enable failed!! Status: %llx\n", StatusCode));
++    }
++}
++
++
++//borrowed from edk2-platforms:Armada7k8kMemoryInitPeiLib
++STATIC VOID ReserveMemoryRegion ( IN EFI_PHYSICAL_ADDRESS ReservedRegionBase, IN UINT32 ReservedRegionSize)
++{
++  EFI_RESOURCE_ATTRIBUTE_TYPE  ResourceAttributes;
++  EFI_PHYSICAL_ADDRESS         ReservedRegionTop;
++  EFI_PHYSICAL_ADDRESS         ResourceTop;
++  EFI_PEI_HOB_POINTERS         NextHob;
++  UINT64                       ResourceLength;
++
++  ReservedRegionTop = ReservedRegionBase + ReservedRegionSize;
++
++  //
++  // Search for System Memory Hob that covers the reserved region,
++  // and punch a hole in it
++  //
++  for (NextHob.Raw = GetHobList ();
++       NextHob.Raw != NULL;
++       NextHob.Raw = GetNextHob (EFI_HOB_TYPE_RESOURCE_DESCRIPTOR,
++                                 NextHob.Raw)) {
++
++    if ((NextHob.ResourceDescriptor->ResourceType == EFI_RESOURCE_SYSTEM_MEMORY) &&
++        (ReservedRegionBase >= NextHob.ResourceDescriptor->PhysicalStart) &&
++        (ReservedRegionTop <= NextHob.ResourceDescriptor->PhysicalStart +
++                      NextHob.ResourceDescriptor->ResourceLength))
++    {
++      ResourceAttributes = NextHob.ResourceDescriptor->ResourceAttribute;
++      ResourceLength = NextHob.ResourceDescriptor->ResourceLength;
++      ResourceTop = NextHob.ResourceDescriptor->PhysicalStart + ResourceLength;
++
++      if (ReservedRegionBase == NextHob.ResourceDescriptor->PhysicalStart) {
++        //
++        // This region starts right at the start of the reserved region, so we
++        // can simply move its start pointer and reduce its length by the same
++        // value
++        //
++        NextHob.ResourceDescriptor->PhysicalStart += ReservedRegionSize;
++        NextHob.ResourceDescriptor->ResourceLength -= ReservedRegionSize;
++
++      } else if ((NextHob.ResourceDescriptor->PhysicalStart +
++                  NextHob.ResourceDescriptor->ResourceLength) ==
++                  ReservedRegionTop) {
++
++        //
++        // This region ends right at the end of the reserved region, so we
++        // can simply reduce its length by the size of the region.
++        //
++        NextHob.ResourceDescriptor->ResourceLength -= ReservedRegionSize;
++
++      } else {
++        //
++        // This region covers the reserved region. So split it into two regions,
++        // each one touching the reserved region at either end, but not covering
++        // it.
++        //
++        NextHob.ResourceDescriptor->ResourceLength =
++                 ReservedRegionBase - NextHob.ResourceDescriptor->PhysicalStart;
++
++        // Create the System Memory HOB for the remaining region (top of the FD)
++        BuildResourceDescriptorHob (EFI_RESOURCE_SYSTEM_MEMORY,
++                                    ResourceAttributes,
++                                    ReservedRegionTop,
++                                    ResourceTop - ReservedRegionTop);
++      }
++
++      //
++      // Reserve the memory space.
++      //
++      BuildResourceDescriptorHob (EFI_RESOURCE_MEMORY_RESERVED,
++        0,
++        ReservedRegionBase,
++        ReservedRegionSize);
++
++      break;
++    }
++    NextHob.Raw = GET_NEXT_HOB (NextHob);
++  }
++}
++
++//Borrowed from ArmPlatformPkg
++EFI_STATUS EFIAPI MemoryPeim(IN EFI_PHYSICAL_ADDRESS UefiMemoryBase, IN UINT64 UefiMemorySize)
++{
++  ARM_MEMORY_REGION_DESCRIPTOR  *MemoryTable;
++  EFI_RESOURCE_ATTRIBUTE_TYPE   ResourceAttributes;
++  UINT64                        ResourceLength;
++  EFI_PEI_HOB_POINTERS          NextHob;
++  EFI_PHYSICAL_ADDRESS          FdTop;
++  EFI_PHYSICAL_ADDRESS          SystemMemoryTop;
++  EFI_PHYSICAL_ADDRESS          ResourceTop;
++  BOOLEAN                       Found;
++
++  DEBUG((DEBUG_INFO, "%a: Building VirtualMemoryMap\n", __FUNCTION__));
++  // build up virtual memory map
++  BuildVirtualMemoryMap(&MemoryTable);
++
++  // Ensure PcdSystemMemorySize has been set
++  ASSERT (PcdGet64 (PcdSystemMemorySize) != 0);
++
++  //
++  // Now, the permanent memory has been installed, we can call AllocatePages()
++  //
++
++  DEBUG((DEBUG_INFO, "%a: Building VirtualMemoryMap\n", __FUNCTION__));
++  ResourceAttributes = (
++                        EFI_RESOURCE_ATTRIBUTE_PRESENT |
++                        EFI_RESOURCE_ATTRIBUTE_INITIALIZED |
++                        EFI_RESOURCE_ATTRIBUTE_WRITE_COMBINEABLE |
++                        EFI_RESOURCE_ATTRIBUTE_WRITE_THROUGH_CACHEABLE |
++                        EFI_RESOURCE_ATTRIBUTE_WRITE_BACK_CACHEABLE |
++                        EFI_RESOURCE_ATTRIBUTE_TESTED
++                        );
++
++  DEBUG((DEBUG_INFO, "%a: Resource Attributes: 0x%lx\n", __FUNCTION__, ResourceAttributes));
++  //
++  // Check if the resource for the main system memory has been declared
++  //
++  Found       = FALSE;
++  NextHob.Raw = GetHobList ();
++  while ((NextHob.Raw = GetNextHob (EFI_HOB_TYPE_RESOURCE_DESCRIPTOR, NextHob.Raw)) != NULL) {
++    if ((NextHob.ResourceDescriptor->ResourceType == EFI_RESOURCE_SYSTEM_MEMORY) &&
++        (PcdGet64 (PcdSystemMemoryBase) >= NextHob.ResourceDescriptor->PhysicalStart) &&
++        (NextHob.ResourceDescriptor->PhysicalStart + NextHob.ResourceDescriptor->ResourceLength <= PcdGet64 (PcdSystemMemoryBase) + PcdGet64 (PcdSystemMemorySize)))
++    {
++      Found = TRUE;
++      break;
++    }
++
++    NextHob.Raw = GET_NEXT_HOB (NextHob);
++  }
++
++  if (!Found) {
++    // Reserved the memory space occupied by the firmware volume
++    BuildResourceDescriptorHob (
++      EFI_RESOURCE_SYSTEM_MEMORY,
++      ResourceAttributes,
++      PcdGet64 (PcdSystemMemoryBase),
++      PcdGet64 (PcdSystemMemorySize)
++      );
++  }
++
++  //
++  // Reserved the memory space occupied by the firmware volume
++  //
++
++  SystemMemoryTop = (EFI_PHYSICAL_ADDRESS)PcdGet64 (PcdSystemMemoryBase) + (EFI_PHYSICAL_ADDRESS)PcdGet64 (PcdSystemMemorySize);
++  FdTop           = (EFI_PHYSICAL_ADDRESS)PcdGet64 (PcdFdBaseAddress) + (EFI_PHYSICAL_ADDRESS)PcdGet32 (PcdFdSize);
++
++  // EDK2 does not have the concept of boot firmware copied into DRAM. To avoid the DXE
++  // core to overwrite this area we must create a memory allocation HOB for the region,
++  // but this only works if we split off the underlying resource descriptor as well.
++  if ((PcdGet64 (PcdFdBaseAddress) >= PcdGet64 (PcdSystemMemoryBase)) && (FdTop <= SystemMemoryTop)) {
++    Found = FALSE;
++
++    // Search for System Memory Hob that contains the firmware
++    NextHob.Raw = GetHobList ();
++    while ((NextHob.Raw = GetNextHob (EFI_HOB_TYPE_RESOURCE_DESCRIPTOR, NextHob.Raw)) != NULL) {
++      if ((NextHob.ResourceDescriptor->ResourceType == EFI_RESOURCE_SYSTEM_MEMORY) &&
++          (PcdGet64 (PcdFdBaseAddress) >= NextHob.ResourceDescriptor->PhysicalStart) &&
++          (FdTop <= NextHob.ResourceDescriptor->PhysicalStart + NextHob.ResourceDescriptor->ResourceLength))
++      {
++        ResourceAttributes = NextHob.ResourceDescriptor->ResourceAttribute;
++        ResourceLength     = NextHob.ResourceDescriptor->ResourceLength;
++        ResourceTop        = NextHob.ResourceDescriptor->PhysicalStart + ResourceLength;
++
++        if (PcdGet64 (PcdFdBaseAddress) == NextHob.ResourceDescriptor->PhysicalStart) {
++          if (SystemMemoryTop != FdTop) {
++            // Create the System Memory HOB for the firmware
++            BuildResourceDescriptorHob (
++              EFI_RESOURCE_SYSTEM_MEMORY,
++              ResourceAttributes,
++              PcdGet64 (PcdFdBaseAddress),
++              PcdGet32 (PcdFdSize)
++              );
++
++            // Top of the FD is system memory available for UEFI
++            NextHob.ResourceDescriptor->PhysicalStart  += PcdGet32 (PcdFdSize);
++            NextHob.ResourceDescriptor->ResourceLength -= PcdGet32 (PcdFdSize);
++          }
++        } else {
++          // Create the System Memory HOB for the firmware
++          BuildResourceDescriptorHob (
++            EFI_RESOURCE_SYSTEM_MEMORY,
++            ResourceAttributes,
++            PcdGet64 (PcdFdBaseAddress),
++            PcdGet32 (PcdFdSize)
++            );
++
++          // Update the HOB
++          NextHob.ResourceDescriptor->ResourceLength = PcdGet64 (PcdFdBaseAddress) - NextHob.ResourceDescriptor->PhysicalStart;
++
++          // If there is some memory available on the top of the FD then create a HOB
++          if (FdTop < NextHob.ResourceDescriptor->PhysicalStart + ResourceLength) {
++            // Create the System Memory HOB for the remaining region (top of the FD)
++            BuildResourceDescriptorHob (
++              EFI_RESOURCE_SYSTEM_MEMORY,
++              ResourceAttributes,
++              FdTop,
++              ResourceTop - FdTop
++              );
++          }
++        }
++
++        // Mark the memory covering the Firmware Device as runtime services data
++        BuildMemoryAllocationHob (
++          PcdGet64 (PcdFdBaseAddress),
++          PcdGet32 (PcdFdSize),
++          EfiRuntimeServicesData
++          );
++
++        Found = TRUE;
++        break;
++      }
++
++      NextHob.Raw = GET_NEXT_HOB (NextHob);
++    }
++
++    ASSERT (Found);
++  }
++
++  //reserve secondary stacks carveouts passed into cpm-impl-reg 
++  for(int i = 0; i < PcdGet32(PcdCoreCount); i++){
++    CHAR8 CpuNodeName[14];
++    UINTN CarveoutLength = 0;
++
++    AsciiSPrint(CpuNodeName, ARRAY_SIZE(CpuNodeName), "/cpus/cpu%d", i);
++    dt_node_t *CpuNode = dt_get(CpuNodeName);
++    UINT32 *Carveout = (UINT32 *)dt_node_prop(CpuNode, "cpm-impl-reg", &CarveoutLength);
++
++    ReserveMemoryRegion (
++      ((UINT64)Carveout[1] << 32) | Carveout[0],
++      ((UINT64)Carveout[3] << 32) | Carveout[2]
++    );
++  }
++
++  // Build Memory Allocation Hob
++  InitMmu (MemoryTable);
++
++  if (FeaturePcdGet (PcdPrePiProduceMemoryTypeInformationHob)) {
++    // Optional feature that helps prevent EFI memory map fragmentation.
++    BuildMemoryTypeInformationHob ();
++  }
++
++  return EFI_SUCCESS;
++}
++
++/**
++ * BuildVirtualMemoryMap
++ * 
++ * This will build up the memory map of the platform used to initialize the MMU and page tables.
++ * 
++ * @param VirtualMemoryMap - A pointer to a pointer to be used for page table setup.
++ * 
++ * does not return anything as the value will be stored in a pointer accessible by MemoryPeim.
++ * 
++ */
++VOID BuildVirtualMemoryMap(OUT ARM_MEMORY_REGION_DESCRIPTOR **VirtualMemoryMap)
++{
++  ARM_MEMORY_REGION_ATTRIBUTES CacheAttributes;
++  UINTN Index = 0;
++  ARM_MEMORY_REGION_DESCRIPTOR *VirtualMemoryTable;
++
++  //ensure we actually have a valid memory map pointer
++  ASSERT(VirtualMemoryMap != NULL);
++
++  DEBUG((DEBUG_INFO, "Allocating virtual memory table pages\n"));
++  VirtualMemoryTable = (ARM_MEMORY_REGION_DESCRIPTOR *)AllocatePages (EFI_SIZE_TO_PAGES (sizeof (ARM_MEMORY_REGION_DESCRIPTOR) * MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS));
++  if (VirtualMemoryTable == NULL) {
++    DEBUG((DEBUG_INFO, "Unexpected failure to allocate VirtualMemoryTable\n"));
++    return;
++  }
++
++  CacheAttributes = DDR_ATTRIBUTES_CACHED;
++
++  /**
++   * NOTE - On Apple silicon platforms, non PCIe MMIO regions *must* use nGnRnE mappings, 
++   * while all PCIe regions *must* use nGnRE mappings.
++   * by default EDK2 sets up the MMIO as nGnRnE, good for core system devices
++   * though we will need to add an attribute for nGnRE mappings at some point.
++   * 
++   * TODO: add ARM_MEMORY_REGION_ATTRIBUTE_DEVICE_POSTED_WRITE
++   **/
++
++  //MMIO - low USB/PHY window on M4, then PMGR/AIC/Core System Peripherals and PCIe
++  VirtualMemoryTable[Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_0_BASE;
++  VirtualMemoryTable[Index].VirtualBase  = APPLE_CORE_SYSTEM_MMIO_RANGE_0_BASE;
++  VirtualMemoryTable[Index].Length       = APPLE_CORE_SYSTEM_MMIO_RANGE_0_SIZE;
++  VirtualMemoryTable[Index].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_1_BASE;
++  VirtualMemoryTable[Index].VirtualBase  = APPLE_CORE_SYSTEM_MMIO_RANGE_1_BASE;
++  VirtualMemoryTable[Index].Length       = APPLE_CORE_SYSTEM_MMIO_RANGE_1_SIZE;
++  VirtualMemoryTable[Index].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_2_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_2_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_2_SIZE;
++  VirtualMemoryTable[Index].Attributes   = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_3_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_3_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_3_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_1_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_1_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_1_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_2_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_2_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_2_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_4_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_4_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_4_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_3_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_3_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_3_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_4_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_4_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_4_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_5_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_5_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_5_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_5_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_5_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_5_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_6_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_6_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_6_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_6_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_6_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_6_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_7_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_7_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_7_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_8_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_8_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_8_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_7_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_7_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_7_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_9_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_9_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_9_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_10_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_10_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_10_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  //
++  // HACK: shoving in the two ranges that aren't on M1 Pro/Max/Ultra - this code has to get mega refactored later...
++  //
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_22_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_22_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_22_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_21_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_21_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_21_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_8_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_8_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_8_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_9_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_9_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_9_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_10_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_10_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_10_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_11_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_11_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_11_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_12_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_12_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_12_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_11_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_11_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_11_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_13_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_13_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_13_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_14_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_14_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_14_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_12_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_12_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_12_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_15_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_15_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_15_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_16_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_16_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_16_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_13_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_13_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_13_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_17_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_17_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_17_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_18_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_18_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_18_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_14_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_14_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_14_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_19_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_19_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_19_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_PCIE_MMIO_RANGE_20_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_PCIE_MMIO_RANGE_20_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_PCIE_MMIO_RANGE_20_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_15_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_15_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_15_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  VirtualMemoryTable[++Index].PhysicalBase = APPLE_CORE_SYSTEM_MMIO_RANGE_16_BASE;
++  VirtualMemoryTable[Index].VirtualBase    = APPLE_CORE_SYSTEM_MMIO_RANGE_16_BASE;
++  VirtualMemoryTable[Index].Length         = APPLE_CORE_SYSTEM_MMIO_RANGE_16_SIZE;
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_DEVICE;
++
++  //System DRAM
++  VirtualMemoryTable[++Index].PhysicalBase = PcdGet64(PcdSystemMemoryBase);
++  VirtualMemoryTable[Index].VirtualBase    = PcdGet64(PcdSystemMemoryBase);
++  VirtualMemoryTable[Index].Length         = PcdGet64(PcdSystemMemorySize);
++  VirtualMemoryTable[Index].Attributes     = CacheAttributes;
++
++
++  DEBUG ((
++    DEBUG_ERROR,
++    "%a: Dumping System DRAM Memory Map:\n"
++    "\tPhysicalBase: 0x%lX\n"
++    "\tVirtualBase: 0x%lX\n"
++    "\tLength: 0x%lX\n"
++    "\tTop of system RAM: 0x%lX\n",
++    __FUNCTION__,
++    VirtualMemoryTable[Index].PhysicalBase,
++    VirtualMemoryTable[Index].VirtualBase,
++    VirtualMemoryTable[Index].Length,
++    VirtualMemoryTable[Index].PhysicalBase + VirtualMemoryTable[Index].Length
++    ));
++
++  //Framebuffer
++  VirtualMemoryTable[++Index].PhysicalBase = PcdGet64(PcdFrameBufferAddress);
++  VirtualMemoryTable[Index].VirtualBase    = PcdGet64(PcdFrameBufferAddress);
++  VirtualMemoryTable[Index].Length         = PcdGet64(PcdFrameBufferSize);
++  VirtualMemoryTable[Index].Attributes     = ARM_MEMORY_REGION_ATTRIBUTE_UNCACHED_UNBUFFERED;
++
++  DEBUG ((
++    DEBUG_ERROR,
++    "%a: Dumping Framebuffer Memory Map:\n"
++    "\tPhysicalBase: 0x%lX\n"
++    "\tVirtualBase: 0x%lX\n"
++    "\tLength: 0x%lX\n"
++    "\tTop of framebuffer RAM: 0x%lX\n",
++    __FUNCTION__,
++    VirtualMemoryTable[Index].PhysicalBase,
++    VirtualMemoryTable[Index].VirtualBase,
++    VirtualMemoryTable[Index].Length,
++    VirtualMemoryTable[Index].PhysicalBase + VirtualMemoryTable[Index].Length
++    ));
++
++  //TODO: add other NC regions here?
++
++  // End of Table
++  VirtualMemoryTable[++Index].PhysicalBase  = 0;
++  VirtualMemoryTable[Index].VirtualBase     = 0;
++  VirtualMemoryTable[Index].Length          = 0;
++  VirtualMemoryTable[Index].Attributes      = (ARM_MEMORY_REGION_ATTRIBUTES)0;
++
++  ASSERT((Index + 1) <= MAX_VIRTUAL_MEMORY_MAP_DESCRIPTORS);
++
++  *VirtualMemoryMap = VirtualMemoryTable;
++}
+\ No newline at end of file
+diff --git a/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.inf b/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.inf
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e0a9df7939bb589840dce47223e6a872b4979e8
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.inf
+@@ -0,0 +1,69 @@
++#Memory initialization PEI Library INF description file
++#borrowed from ArmPlatformPkg, original copyright notice below.
++
++#/** @file
++#
++#  Copyright (c) 2011-2014, ARM Ltd. All rights reserved.<BR>
++#  SPDX-License-Identifier: BSD-2-Clause-Patent
++#
++#**/
++
++[Defines]
++  INF_VERSION                    = 0x00010005
++  BASE_NAME                      = ArmMemoryInitPeiLib
++  FILE_GUID                      = 55ddb6e0-70b5-11e0-b33e-0002a5d5c51b
++  MODULE_TYPE                    = BASE
++  VERSION_STRING                 = 1.0
++  LIBRARY_CLASS                  = MemoryInitPeiLib|SEC PEIM
++
++[Sources]
++  MemoryInitPeiLib.c
++
++
++[Packages]
++  MdePkg/MdePkg.dec
++  MdeModulePkg/MdeModulePkg.dec
++  EmbeddedPkg/EmbeddedPkg.dec
++  ArmPkg/ArmPkg.dec
++  ArmPlatformPkg/ArmPlatformPkg.dec
++  T8132FamilyPkg/T8132FamilyPkg.dec
++  AppleSiliconPkg/AppleSiliconPkg.dec
++
++[LibraryClasses]
++  DebugLib
++  HobLib
++  ArmMmuLib
++  AppleDTLib
++  PrintLib
++
++[Guids]
++  gEfiMemoryTypeInformationGuid
++
++[FeaturePcd]
++  gEmbeddedTokenSpaceGuid.PcdPrePiProduceMemoryTypeInformationHob
++
++[FixedPcd]
++  gArmTokenSpaceGuid.PcdFdSize
++
++  gAppleSiliconPkgTokenSpaceGuid.PcdSystemMemoryUefiRegionSize
++
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiACPIReclaimMemory
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiACPIMemoryNVS
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiReservedMemoryType
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiRuntimeServicesData
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiRuntimeServicesCode
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiBootServicesCode
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiBootServicesData
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiLoaderCode
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiLoaderData
++
++[Pcd]
++  gArmTokenSpaceGuid.PcdFdBaseAddress
++  gArmTokenSpaceGuid.PcdSystemMemorySize
++  gArmTokenSpaceGuid.PcdSystemMemoryBase
++  gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferAddress
++  gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferSize
++  gAppleSiliconPkgTokenSpaceGuid.PcdCoreCount
++
++[Depex]
++  TRUE
+diff --git a/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.c b/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..5766941e5e1d7471bcbf95beffe138164a0a14a1
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.c
+@@ -0,0 +1,176 @@
++/** @file
++ *MsPlatformDevicesLib  - Device specific library.
++
++Copyright (C) Microsoft Corporation. All rights reserved.
++SPDX-License-Identifier: BSD-2-Clause-Patent
++
++**/
++
++#include <Uefi.h>
++
++#include <Protocol/DevicePath.h>
++
++#include <Library/BaseMemoryLib.h>
++#include <Library/DebugLib.h>
++#include <Library/DeviceBootManagerLib.h>
++#include <Library/DevicePathLib.h>
++#include <Library/IoLib.h>
++#include <Library/MsPlatformDevicesLib.h>
++#include <Library/PcdLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++#include <Library/UefiLib.h>
++
++typedef struct {
++  VENDOR_DEVICE_PATH       DisplayDevicePath;
++  EFI_DEVICE_PATH_PROTOCOL EndDevicePath;
++} EFI_DISPLAY_DEVICE_PATH;
++
++EFI_DISPLAY_DEVICE_PATH DisplayDevicePath =
++{
++  {
++    {
++      HARDWARE_DEVICE_PATH,
++      HW_VENDOR_DP,
++      {
++        (UINT8)(sizeof(VENDOR_DEVICE_PATH)),
++        (UINT8)((sizeof(VENDOR_DEVICE_PATH)) >> 8)
++      }
++    },
++    EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID
++  },
++  {
++    END_DEVICE_PATH_TYPE,
++    END_ENTIRE_DEVICE_PATH_SUBTYPE,
++    {
++      (UINT8)(END_DEVICE_PATH_LENGTH),
++      (UINT8)((END_DEVICE_PATH_LENGTH) >> 8)
++    }
++  }
++};
++//
++// Predefined platform default console device path
++//
++BDS_CONSOLE_CONNECT_ENTRY gPlatformConsoles[] =
++{
++  {
++    (EFI_DEVICE_PATH_PROTOCOL *)&DisplayDevicePath,
++    CONSOLE_OUT | STD_ERROR
++  },
++  {
++    NULL,
++    0
++  }
++};
++
++EFI_DEVICE_PATH_PROTOCOL *gPlatformConInDeviceList[] = {NULL};
++
++/**
++Library function used to provide the platform SD Card device path
++**/
++EFI_DEVICE_PATH_PROTOCOL *
++EFIAPI
++GetSdCardDevicePath (
++  VOID
++  )
++{
++  return NULL;
++}
++
++/**
++  Library function used to determine if the DevicePath is a valid bootable 'USB' device.
++  USB here indicates the port connection type not the device protocol.
++  With TBT or USB4 support PCIe storage devices are valid 'USB' boot options.
++**/
++BOOLEAN
++EFIAPI
++PlatformIsDevicePathUsb (
++  IN EFI_DEVICE_PATH_PROTOCOL  *DevicePath
++  )
++{
++  return TRUE;
++}
++
++/**
++Library function used to provide the list of platform devices that MUST be
++connected at the beginning of BDS
++**/
++EFI_DEVICE_PATH_PROTOCOL **
++EFIAPI
++GetPlatformConnectList (
++  VOID
++  )
++{
++  return NULL;
++}
++
++/**
++ * Library function used to provide the list of platform console devices.
++ */
++BDS_CONSOLE_CONNECT_ENTRY *
++EFIAPI
++GetPlatformConsoleList (
++  VOID
++  )
++{
++  return (BDS_CONSOLE_CONNECT_ENTRY *)&gPlatformConsoles;
++}
++
++/**
++Library function used to provide the list of platform devices that MUST be connected
++to support ConsoleIn activity.  This call occurs on the ConIn connect event, and
++allows platforms to do enable specific devices ConsoleIn support.
++**/
++EFI_DEVICE_PATH_PROTOCOL **
++EFIAPI
++GetPlatformConnectOnConInList (
++  VOID
++  )
++{
++  return NULL;
++}
++
++/**
++Library function used to provide the console type.  For ConType == DisplayPath,
++device path is filled in to the exact controller to use.  For other ConTypes, DisplayPath
++must NULL. The device path must NOT be freed.
++**/
++EFI_HANDLE
++EFIAPI
++GetPlatformPreferredConsole (
++  OUT EFI_DEVICE_PATH_PROTOCOL  **DevicePath
++  )
++{
++  EFI_STATUS                Status;
++  EFI_HANDLE                Handle = NULL;
++  EFI_DEVICE_PATH_PROTOCOL *TempDevicePath;
++
++  TempDevicePath = (EFI_DEVICE_PATH_PROTOCOL *)&DisplayDevicePath;
++
++  Status = gBS->LocateDevicePath(
++      &gEfiGraphicsOutputProtocolGuid, &TempDevicePath, &Handle);
++  if (!EFI_ERROR(Status) && IsDevicePathEnd(TempDevicePath)) {
++  }
++  else {
++    DEBUG(
++        (DEBUG_ERROR,
++         "%a - Unable to locate platform preferred console. Code=%r\n",
++         __FUNCTION__, Status));
++    Status = EFI_DEVICE_ERROR;
++  }
++
++  if (Handle != NULL) {
++    //
++    // Connect the GOP driver
++    //
++    gBS->ConnectController(Handle, NULL, NULL, TRUE);
++
++    //
++    // Get the GOP device path
++    // NOTE: We may get a device path that contains Controller node in it.
++    //
++    TempDevicePath = EfiBootManagerGetGopDevicePath(Handle);
++    *DevicePath    = TempDevicePath;
++  }
++
++  return Handle;
++}
+diff --git a/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.inf b/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.inf
+new file mode 100644
+index 0000000000000000000000000000000000000000..c847ca38b7eca6985a7df2841828dab26c6c4aed
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.inf
+@@ -0,0 +1,27 @@
++## @file
++# Ms Platform Devices Library
++#
++# Copyright (C) Microsoft Corporation. All rights reserved.
++# SPDX-License-Identifier: BSD-2-Clause-Patent
++##
++
++[Defines]
++  INF_VERSION                    = 0x00010005
++  BASE_NAME                      = MsPlatformDevicesLib
++  FILE_GUID                      = ec510a5b-1038-4c6e-a1f7-b987ff3594bd
++  MODULE_TYPE                    = DXE_DRIVER
++  VERSION_STRING                 = 1.0
++  LIBRARY_CLASS                  = MsPlatformDevicesLib|DXE_DRIVER DXE_RUNTIME_DRIVER UEFI_APPLICATION
++
++#
++#  VALID_ARCHITECTURES           = IA32 X64
++#
++
++[Sources]
++ MsPlatformDevicesLib.c
++
++[Packages]
++  MdePkg/MdePkg.dec
++  PcBdsPkg/PcBdsPkg.dec
++  MsCorePkg/MsCorePkg.dec
++  MdeModulePkg/MdeModulePkg.dec
+diff --git a/Silicon/Apple/T8132FamilyPkg/Readme.md b/Silicon/Apple/T8132FamilyPkg/Readme.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..11eb2b734fb3d1dd4fe6c660f62b2514ac8012ba
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/Readme.md
+@@ -0,0 +1,7 @@
++# T8132-specific platform support UEFI package
++
++## About
++
++This package provides platform-specific code for all machines that use an M4 SoC, 
++internally H14S/H14C or Donan. Mainly for SoC specific ACPI tables, all platforms can share the same tables
++because all Donan chip variants are the same platform internally just with different configurations from the factory.
+\ No newline at end of file
+diff --git a/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dec b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dec
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b6e2cbbbbde6b04f70da96f13f78bba06839ea1
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dec
+@@ -0,0 +1,30 @@
++#T8132 SoC specific EDK2 Package Description File
++#SPDX-License-Identifier: BSD-2-Clause-Patent
++[Defines]
++  DEC_SPECIFICATION              = 0x00010005
++  PACKAGE_NAME                   = T8132FamilyPkg
++  PACKAGE_GUID                   = 4941ad03-1d3d-4177-a1d7-3d30699cb5a5
++  PACKAGE_VERSION                = 1.0
++
++[Includes.common]
++  Include
++
++[Guids.common]
++  # e2dcafca-abcd-48c4-baf7-042ecb5a0558
++  gT8132FamilyPkgTokenSpaceGuid = { 0xe2dcafca, 0xabcd, 0x48c4, { 0xba, 0xf7, 0x04, 0x2e, 0xcb, 0x5a, 0x05, 0x58 } }
++
++
++[PcdsFixedAtBuild.common]
++
++  #Fallback stack base in case ModuleEntryPoint setup won't work.
++  #gT8132FamilyPkgTokenSpaceGuid.PcdSecPhaseStackBase|0x10300000000|UINT64|0x0000440b
++
++[PcdsPatchableInModule.common]
++
++  # #number of cores
++  # gT8132FamilyPkgTokenSpaceGuid.PcdCoreCount|12|UINT32|0x00004406
++  # #all Donan chips have three clusters, "boot", P-core/E-core clusters
++  # # for multi-die systems, this cluster setup is duplicated on the second die
++  # gT8132FamilyPkgTokenSpaceGuid.PcdClusterCount|3|UINT32|0x00004407
++
++  
+\ No newline at end of file
+diff --git a/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
+new file mode 100644
+index 0000000000000000000000000000000000000000..65c870ae6187928a69e9ca04eaf7f4b900a4086d
+--- /dev/null
++++ b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
+@@ -0,0 +1,121 @@
++# T8132 SoC family DSC include file
++#  Copyright (c) 2011-2015, ARM Limited. All rights reserved.
++#  Copyright (c) 2014, Linaro Limited. All rights reserved.
++#  Copyright (c) 2015 - 2016, Intel Corporation. All rights reserved.
++#  Copyright (c) 2018 - 2019, Bingxing Wang. All rights reserved.
++#
++#  This program and the accompanying materials
++#  are licensed and made available under the terms and conditions of the BSD License
++#  which accompanies this distribution.  The full text of the license may be found at
++#  http://opensource.org/licenses/bsd-license.php
++#
++#  THE PROGRAM IS DISTRIBUTED UNDER THE BSD LICENSE ON AN "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
++#
++#
++# SPDX-License-Identifier: BSD-2-Clause OR MIT
++
++
++[PcdsPatchableInModule.common]
++  # These defaults are patched from the Apple boot_args by PrePi's
++  # DiscoverDramFromDt.  The Mac16,3 (J624) iMac has 24GB of DRAM at the
++  # 1TB boot alias (chosen/dram-base = 0x10000000000, dram-size = 0x600000000).
++  gArmTokenSpaceGuid.PcdSystemMemoryBase|0x10000000000
++  gArmTokenSpaceGuid.PcdSystemMemorySize|0x600000000 #24GB, Mac16,3
++  gArmTokenSpaceGuid.PcdFdBaseAddress|0x0
++  gArmTokenSpaceGuid.PcdFvBaseAddress|0x0
++  gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferAddress|0x0
++  gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferSize|0x0
++
++[PcdsFixedAtBuild.common]
++  #ARM architectural fixed build-time settings
++  # Setting timer frequency to 0 means "read from CNTFRQ_EL0"
++  #gArmTokenSpaceGuid.PcdArmArchTimerFreqInHz|0
++  #gArmTokenSpaceGuid.PcdCpuVectorBaseAddress|0x100FF000000 #fair warning this location is *totally random*
++  gArmTokenSpaceGuid.PcdArmArchTimerSecIntrNum|19 # placeholder 
++  gArmTokenSpaceGuid.PcdArmArchTimerIntrNum|17 # phys timer IRQ number (this is arbitrary because per-cpu fiq)
++  gArmTokenSpaceGuid.PcdArmArchTimerHypIntrNum|20 #this disables the HV timer
++  gArmTokenSpaceGuid.PcdArmArchTimerVirtIntrNum|18 #virt timer
++  gAppleSiliconPkgTokenSpaceGuid.PcdAppleUartBase|0x3ad200000
++  gAppleSiliconPkgTokenSpaceGuid.PcdAppleSocIdentifier|0x8132
++  gAppleSiliconPkgTokenSpaceGuid.PcdInitializeRamdisk|TRUE
++  gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosCpuIdentifier|"T8132"
++  gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosCpuModel|"Apple M4 (Donan)"
++  gAppleSiliconPkgTokenSpaceGuid.PcdSecPhaseStackBase|0x10300000000
++  gAppleSiliconPkgTokenSpaceGuid.PcdAppleSartVersion|4
++  gAppleSiliconPkgTokenSpaceGuid.PcdXhciPcieDeviceNumber|3
++  # M4 base (Mac16,3 / J624): 6 E-cores + 4 P-cores, one die, two clusters.
++  # M4 Pro/Max variants need their own platform packages and cluster counts.
++  gAppleSiliconPkgTokenSpaceGuid.PcdCoreCount|10|UINT32|0x00004406
++  gAppleSiliconPkgTokenSpaceGuid.PcdClusterCount|2|UINT32|0x00004407
++  # These live in the 1TB DRAM alias, 8.5GB above its base, and are inside
++  # the Mac16,3 24GB window.  PrePi copies boot_args and the ADT here before
++  # UEFI installs its own page tables.
++  gAppleSiliconPkgTokenSpaceGuid.PcdBootArgsPointer|0x10220000000
++  gAppleSiliconPkgTokenSpaceGuid.PcdAdtPointer|0x10220004000
++#AIC/GIC configuration settings
++!if $(AIC_BUILD) == FALSE
++  #
++  # if GIC is used, it's expected to be virtualized by EL2 at the below addresses 
++  # as Donan/T8132 has no onboard GIC. (but does contain the MSRs to do accelerated virt)
++  #
++  gArmTokenSpaceGuid.PcdGicDistributorBase|0x5000000000
++  gArmTokenSpaceGuid.PcdGicRedistributorsBase|0x5100000000
++!endif
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAcpiDefaultOemRevision|0x00008132
++
++!if $(SECURE_BOOT_ENABLE) == TRUE
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiRuntimeServicesData|600
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiRuntimeServicesCode|400
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiBootServicesCode|1500
++!else
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiRuntimeServicesData|300
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiRuntimeServicesCode|150
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiBootServicesCode|1000
++!endif
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiBootServicesData|800
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiLoaderCode|10
++  gEmbeddedTokenSpaceGuid.PcdMemoryTypeEfiLoaderData|0
++  gEmbeddedTokenSpaceGuid.PcdPrePiCpuIoSize|40
++  
++  #PCIe settings
++  gEfiMdeModulePkgTokenSpaceGuid.PcdSrIovSupport|FALSE
++  gEfiMdeModulePkgTokenSpaceGuid.PcdAriSupport|FALSE
++  gEfiMdeModulePkgTokenSpaceGuid.PcdMrIovSupport|FALSE
++  #
++  # Host Bridge Library settings.
++  # 
++  gArmTokenSpaceGuid.PcdPciBusMin|0x0
++  gArmTokenSpaceGuid.PcdPciBusMax|0x4
++  #
++  # Apple chips don't seem to use "x86-style" I/O accesses, so use placeholder values here, and don't reference them in the host bridge driver.
++  #
++  gArmTokenSpaceGuid.PcdPciIoBase|0x0
++  gArmTokenSpaceGuid.PcdPciIoSize|0x00010000
++  #
++  # The 32 bit PCIe MMIO is not prefetchable.
++  #
++  gArmTokenSpaceGuid.PcdPciMmio32Base|0xc0000000
++  gArmTokenSpaceGuid.PcdPciMmio32Size|0x40000000
++  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0x500000000
++  gEfiMdePkgTokenSpaceGuid.PcdPciMmio64Translation|0x0
++  #
++  # 64 bit PCIe MMIO *is* prefetchable.
++  #
++  gArmTokenSpaceGuid.PcdPciMmio64Base|0x5A0000000
++  gArmTokenSpaceGuid.PcdPciMmio64Size|0x20000000
++
++  gEfiMdePkgTokenSpaceGuid.PcdPciExpressBaseAddress|0x580000000
++  #
++  # This shouldn't get used.
++  #
++  gEfiMdePkgTokenSpaceGuid.PcdPciIoTranslation|0x0
++
++
++[LibraryClasses.common]
++  MemoryInitPeiLib|T8132FamilyPkg/Library/MemoryInitPeiLib/MemoryInitPeiLib.inf
++  MsPlatformDevicesLib  |T8132FamilyPkg/Library/MsPlatformDevicesLib/MsPlatformDevicesLib.inf
++
++[Components.common]
++
++  T8132FamilyPkg/AcpiTables/CPUAcpiTables.inf

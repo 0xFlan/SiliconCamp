@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+# Patches must keep their bytes exactly: a hunk that changes a CRLF file
+# carries CRLF context lines, and EOL normalisation would make git apply fail.
+*.patch -text
+*.sh    text eol=lf
+
+*.fd    binary
+*.bin   binary
+*.macho binary
+*.aml   binary
+*.acpi  binary
