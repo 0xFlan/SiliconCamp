@@ -84,28 +84,44 @@ the DWC3 blocks and the USB DARTs) is mapped as device memory in
 `BuildVirtualMemoryMap`.
 
 The internal SSD is an Apple ANS2 device, not a standard PCIe NVMe controller.
-There is no ANS2 driver in the tree, so the first Windows installer attempt must
-use a USB disk. PCIe is not yet described to the guest.
+`AppleNANDStorageDxe` is a 22-line stub with no DSC entry, so the first Windows
+installer attempt must use a USB disk.
 
 ## PCIe
 
 The J624 APCIE ECAM is at `0x1cb0000000` (256 MB), with WLAN, Bluetooth, Ethernet,
 and four `apciec` USB4/Thunderbolt root complexes behind it. The T602X PCDs that
-pointed the host bridge at `0x580000000` are now replaced with the J624 values
-(ECAM, bus range 0–8, `0xb8000000`/1 GB non-prefetchable, `0xbc0000000`/512 MB
-prefetchable), and the ECAM plus both windows are mapped in
-`T8132FamilyVirtualMemoryMapDefines.h`. See `docs/pcie.md` for sources and for
-what is still uncaptured (exact window bounds, MSI base, DARTs).
+pointed the host bridge at `0x580000000` were replaced with the values decoded
+from this machine:
+
+| Item | Value |
+|---|---|
+| ECAM | `0x1cb0000000`, 256 MB |
+| Bus range | 0–8 |
+| 32-bit window | bus `0x80000000` → host `0xb80000000`, 1 GB |
+| Host offset | `0xb00000000` (`PcdPciMmio32Translation` = `-0xb00000000`) |
+| Prefetchable | `0xbc0000000`, 512 MB, no translation |
+
+The host bridge library wants the *bus* base plus the offset, while the page
+tables map the *host* addresses; `docs/pcie.md` shows the raw property cells and
+the arithmetic. The ECAM and both windows are mapped in
+`T8132FamilyVirtualMemoryMapDefines.h`.
+
+Only the first root complex (`apcie@B0000000`) is described. `apciec0`–`apciec3`
+are separate complexes with their own ECAMs (starting at `0x1c50000000`), bus
+ranges and apertures; a single host-bridge descriptor cannot represent them.
 
 PCIe is still omitted from the DSDT, so Windows sees no root bridge yet.
 Finishing it requires:
 
-1. capturing the J624 `apcie` `ranges`/`assigned-addresses` and correcting the
-   two window defines if they differ from the inferred bounds;
-2. enabling `AppleSiliconPciPlatformDxe` (or replacing the generic host bridge);
-3. adding the ECAM and PCIe MMIO ranges to the virtual memory map with nGnRE;
-4. validating that the DARTs and MSI path work for each root complex;
-5. only then adding a `PCI0` device and `_CRS` to the DSDT.
+1. writing `PCI0` and its `_CRS` from the captured windows —
+   `PcdPciExpressBarSize`/`PcdPciExpressBarLimit` are not defined for T8132, so
+   the resource template has to be derived here rather than copied;
+2. enabling the APCIE DARTs (`0x90000000`, `0x92000000`) so devices can DMA;
+3. deciding how to describe the four `apciec` complexes (one host bridge each);
+4. validating BAR assignment and the guest MSI path on hardware. In the vGIC
+   build MSIs go through the emulated ITS at `0x5200000000`; Apple's
+   `0xfffff000` doorbell is only used by a bare-metal AIC build.
 
 ## AICv3
 
@@ -124,8 +140,8 @@ still required.
 ## Remaining unknowns
 
 - Whether the low 1 GB mapping is sufficient for every USB/DART path on J624.
-- Exact PCIe MMIO windows for each `apcie`/`apciec` root complex and the MSI
-  controller.
+- The `apciec0`–`apciec3` apertures and DART programming; the `apcie` windows
+  themselves are captured and written down.
 - ANS2/SART storage protocol for the internal SSD.
 - DCP/display handoff beyond the iBoot framebuffer.
 - M4 SMC/SEP behavior under the m1n1 hypervisor.

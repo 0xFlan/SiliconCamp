@@ -16,8 +16,15 @@ inventory is read from `Silicon/Apple/*FamilyPkg` and `Platform/*Pkg`.
 ## Current state (2026-10-26)
 
 ```
-machines: 59, silicon package present: 33, missing: 26
+machines: 59
+  SoC family has a silicon package: 33
+  machine has a platform package: 1
+  no silicon package at all: 26
 ```
+
+The first number counts machines whose **SoC family** has a package. That is not
+a machine port: it means the SoC half of a possible firmware exists. Only
+`Mac16,3` has a platform package, and nothing in this repository has booted.
 
 | Family | SoCs | Machines | Silicon package |
 |---|---|---|---|

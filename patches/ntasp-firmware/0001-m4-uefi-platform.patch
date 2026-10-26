@@ -114,10 +114,10 @@ index 0000000..3060ab9
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl b/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl
 new file mode 100644
-index 0000000..fb6581d
+index 0000000..2bfe2e7
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,231 @@
 +/**
 + * Copyright (c) 2023, amarioguy (AppleWOA authors).
 + * 
@@ -341,10 +341,11 @@ index 0000000..fb6581d
 +        }
 +
 +        //
-+        // PCIe root complex is intentionally not described yet.  The iMac M4
-+        // has an APCIE ECAM at 0x1cb0000000 and separate PCIe MMIO windows;
-+        // those values need their own validated host bridge configuration
-+        // before the root bridge is exposed to Windows.
++        // PCIe root complex is intentionally not described yet.  The host
++        // bridge and page tables already use the captured APCIE ECAM
++        // (0x1cb0000000) and windows, but the APCIE DARTs are not enabled, so
++        // a device enumerated here could not DMA.  PCI0 waits for that, and
++        // for a _CRS checked against the captured windows.
 +        //
 +    }
 +}
@@ -510,10 +511,10 @@ index 0000000..7805648
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/Mac16_3.dsc b/Platform/Mac16_3Pkg/Mac16_3.dsc
 new file mode 100644
-index 0000000..74f35ea
+index 0000000..9e44c64
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/Mac16_3.dsc
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,82 @@
 +#Apple M4 iMac (Mac16,3) UEFI DSC file
 +#some parts borrowed from WOA-Project/SurfaceDuoPkg
 +#Disclaimer: probably not the best UEFI dev out there
@@ -586,7 +587,9 @@ index 0000000..74f35ea
 +
 +  Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
 +  #
-+  # PCIe support is disabled for now.
++  # Apple's PCI platform DXE (MSI doorbell/AIC hooks) is disabled for now; the
++  # generic host bridge and AppleSiliconPciHostBridgeLib come from the common
++  # includes and do build.  See docs/pcie.md for what is wired and what is not.
 +  #
 +  #AppleSiliconPkg/Drivers/AppleBootTimeEmbeddedFirmwareHelperDxe/AppleBootTimeEmbeddedFirmwareHelperDxe.inf
 +
@@ -597,10 +600,10 @@ index 0000000..74f35ea
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/Mac16_3.fdf b/Platform/Mac16_3Pkg/Mac16_3.fdf
 new file mode 100644
-index 0000000..75a7c88
+index 0000000..93f5dae
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/Mac16_3.fdf
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,307 @@
 +#UEFI Flash Description File for the iMac M4 (Mac16,3, T8132)
 +#based on OnePlus6TPkg/OnePlus6TPkg.fdf
 +#
@@ -776,7 +779,9 @@ index 0000000..75a7c88
 +
 +  INF AppleSiliconPkg/Drivers/AppleEmbeddedGpioControllerDxe/AppleEmbeddedGpioControllerDxe.inf
 +  #
-+  # PCIe support is disabled for now.
++  # Apple's PCI platform DXE (MSI doorbell/AIC hooks) is disabled for now; the
++  # generic host bridge is in the FV.  The APCIE DARTs are not enabled yet, so
++  # a device can be enumerated but cannot DMA.  See docs/pcie.md.
 +  #
 +  #INF AppleSiliconPkg/Drivers/AppleSiliconPciPlatformDxe/AppleSiliconPciPlatformDxe.inf
 +  #INF AppleSiliconPkg/Drivers/AppleBootTimeEmbeddedFirmwareHelperDxe/AppleBootTimeEmbeddedFirmwareHelperDxe.inf
@@ -1622,10 +1627,10 @@ index 0000000..7e9b530
 +VOID* CONST ReferenceAcpiTable = &Gtdt;
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc
 new file mode 100644
-index 0000000..8406818
+index 0000000..7d13e7f
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,117 @@
 +/**
 + * Copyright (c) 2025 NTASP authors.
 + *
@@ -1693,13 +1698,15 @@ index 0000000..8406818
 +  },
 +  {
 +    //
-+    // Format: EFI_ACPI_6_3_GICC_STRUCTURE_INIT(GicId, AcpiCpuUid, Flags, PmuIrq,
-+    //          GicBase, GicVBase, GicHBase, GsivId, GicRBase, Mpidr,
++    // Format: EFI_ACPI_6_3_GICC_STRUCTURE_INIT(GicId, AcpiCpuUid, Mpidr, Flags,
++    //          PmuIrq, GicBase, GicVBase, GicHBase, GsivId, GicRBase,
 +    //          Efficiency, SpeOvflIrq)
 +    //
-+    // The primary CPU must be first. The PMU IRQ is 0 until the M4 PMU
-+    // GSIVs are verified; GICRBase is 0 because the GICR structure below
-+    // describes the redistributor range.
++    // The primary CPU must be first.  PmuIrq (the performance-monitor GSIV) is
++    // 0, which ACPI defines as "no interrupt": the M4 PMU GSIVs are not
++    // verified yet, and a guessed GSIV is worse than none.  GsivId 25 is the
++    // vGIC maintenance interrupt, the same value NTASP uses on T602X.  GICRBase
++    // is 0 because the GICR discovery range below is authoritative.
 +    //
 +    EFI_ACPI_6_3_GICC_STRUCTURE_INIT( // E-core 0
 +        0, 0, GET_MPIDR(0, 0, 0, 0), EFI_ACPI_6_3_GIC_ENABLED, 0, 0,
@@ -1897,10 +1904,10 @@ index 0000000..b36ade5
 +VOID * CONST ReferenceAcpiTable = &Pptt;
 diff --git a/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h b/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h
 new file mode 100644
-index 0000000..f6bcb5f
+index 0000000..e9ef8a5
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/Include/Library/T8132FamilyVirtualMemoryMapDefines.h
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,176 @@
 +/**
 + * @file AppleVirtualMemoryMapDefines.h
 + * @author amarioguy (Arminder Singh)
@@ -2060,18 +2067,17 @@ index 0000000..f6bcb5f
 +
 +
 +//
-+// J624 PCIe windows.  Sources: docs/hardware-values.md records the APCIE ECAM
-+// at 0x1cb0000000 (256 MB) from this machine's ioreg, and the WLAN/BT BARs at
-+// 0xb8200000/0xb8301000, which lie inside the 32-bit window below.  The
-+// prefetchable layout follows the 0xb8000000/0xbc0000000 split that Apple uses
-+// on M4-class silicon; the exact bounds still need an ioreg capture (see
-+// docs/pcie.md).  Without these, any PCIe access on J624 takes a translation
-+// fault, because the inherited map only covered the T602X addresses.
++// J624 PCIe windows, decoded from this machine's device tree (docs/pcie.md
++// records the raw ranges cells).  The 32-bit aperture is bus 0x80000000 ->
++// host 0xb80000000, so the page tables must map the *host* addresses below
++// while PcdPciMmio32Translation tells the PCI core the bus->host offset.
++// Mapping the bus address instead leaves every BAR access faulting.  The
++// prefetchable window follows immediately after it at 0xbc0000000.
 +//
 +#define APPLE_PCIE_ECAM_RANGE_BASE 0x1CB0000000
 +#define APPLE_PCIE_ECAM_RANGE_SIZE 0x10000000
 +
-+#define APPLE_PCIE_MMIO_RANGE_23_BASE 0xB8000000
++#define APPLE_PCIE_MMIO_RANGE_23_BASE 0xB80000000
 +#define APPLE_PCIE_MMIO_RANGE_23_SIZE 0x40000000
 +
 +#define APPLE_PCIE_MMIO_RANGE_24_BASE 0xBC0000000
@@ -3042,10 +3048,10 @@ index 0000000..3b6e2cb
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
 new file mode 100644
-index 0000000..c4c61d0
+index 0000000..9f00724
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,138 @@
 +# T8132 SoC family DSC include file
 +#  Copyright (c) 2011-2015, ARM Limited. All rights reserved.
 +#  Copyright (c) 2014, Linaro Limited. All rights reserved.
@@ -3136,10 +3142,13 @@ index 0000000..c4c61d0
 +  #
 +  # J624 (Mac16,3) PCIe.  These replace the T602X values the family inherited,
 +  # which pointed the host bridge at 0x580000000 - an address that does not
-+  # exist on this SoC.  Sources are recorded in docs/hardware-values.md:
-+  #   - APCIE ECAM 0x1cb0000000, 256 MB, bus range 0-8 (this machine's ioreg)
-+  #   - WLAN/BT BARs at 0xb8200000/0xb8301000, inside the 32-bit window
-+  # The window bounds still need an ioreg capture; see docs/pcie.md.
++  # exist on this SoC.  Every value below was decoded from this machine's
++  # device tree; docs/pcie.md records the raw cells so they can be re-checked:
++  #   - APCIE ECAM 0x1cb0000000, 256 MB, bus range 0-8
++  #   - 32-bit window: bus 0x80000000 -> host 0xb80000000, 1 GB
++  #     (host offset 0xb00000000; WLAN BARs land at 0xb82000000/0xb83000000)
++  #   - prefetchable window: 0xbc0000000, 512 MB, no translation
++  #   - WLAN BARs at 0xb82000000/0xb83000000, inside the 32-bit window
 +  #
 +  gArmTokenSpaceGuid.PcdPciBusMin|0x0
 +  gArmTokenSpaceGuid.PcdPciBusMax|0x8
@@ -3150,15 +3159,16 @@ index 0000000..c4c61d0
 +  gArmTokenSpaceGuid.PcdPciIoSize|0x00010000
 +  #
 +  # The 32 bit PCIe MMIO is not prefetchable.  The DT ranges entry on this
-+  # machine maps bus 0x80000000 to CPU 0xb8000000, so the aperture base is the
-+  # bus address and the translation is the host offset (PciHostBridgeLib
-+  # computes Translation = -PcdPciMmio32Translation, so the PCD carries
-+  # bus - host = -0x38000000).  Getting this backwards silently hands devices
-+  # BARs that nothing decodes.
++  # machine maps bus 0x80000000 to host 0xb80000000, so the aperture base is
++  # the bus address and the host offset is 0xb00000000.
++  # AppleSiliconPciHostBridgeLib computes Translation = -PcdPciMmio32Translation,
++  # so the PCD carries bus - host = -0xb00000000 (0xFFFFFFF500000000).
++  # Dropping one hex digit (0xb8000000) silently hands devices BARs that nothing
++  # decodes; docs/pcie.md's raw cells are the source of truth.
 +  #
 +  gArmTokenSpaceGuid.PcdPciMmio32Base|0x80000000
 +  gArmTokenSpaceGuid.PcdPciMmio32Size|0x40000000
-+  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0xFFFFFFFFC8000000
++  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0xFFFFFFF500000000
 +  gEfiMdePkgTokenSpaceGuid.PcdPciMmio64Translation|0x0
 +  #
 +  # 64 bit PCIe MMIO *is* prefetchable; this window is not translated.

@@ -54,6 +54,14 @@ class TestCoverage(unittest.TestCase):
         self.assertEqual(report["families_found"], [])
         self.assertTrue(all(not m["silicon"] for m in report["machines"]))
 
+    def test_model_identifiers_are_unique(self) -> None:
+        # One machine cannot have two identifiers, and a duplicated row silently
+        # mis-attributes coverage.  Mac15,4 was once both an iMac and a Studio.
+        report = run(self.tree)
+        models = [m["model"] for m in report["machines"]]
+        self.assertEqual(len(models), len(set(models)),
+                         "duplicate model identifier in the device table")
+
     def test_silicon_package_covers_its_family(self) -> None:
         self.touch_package("Silicon", "Apple", "T8132FamilyPkg")
         report = run(self.tree)

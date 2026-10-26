@@ -155,6 +155,41 @@ class TestCheckerRejects(FixtureCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("too short", result.stdout)
 
+    def test_wrong_cpu_uid(self) -> None:
+        # The device name and the MADT stay valid; only the _UID is wrong.
+        # Windows matches CPUs by _UID, so this must fail the build.
+        dsdt = self.table("DSDT.aml")
+        with open(dsdt, "rb") as f:
+            data = f.read()
+        uid = data.find(b"\x08_UID", data.find(b"CPU3") + 4)
+        self.assertGreater(uid, 0, "fixture lost CPU3's _UID")
+        self.patch_bytes(dsdt, uid + 5, b"\x07")
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("CPU3 _UID", result.stdout)
+
+    def test_wrong_uart_address(self) -> None:
+        dsdt = self.table("DSDT.aml")
+        with open(dsdt, "rb") as f:
+            data = f.read()
+        address = data.find(struct.pack("<Q", 0x3AD200000))
+        self.assertGreater(address, 0, "fixture lost COM0's MMIO base")
+        self.patch_bytes(dsdt, address, struct.pack("<Q", 0x3AD201000))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("COM0 _CRS", result.stdout)
+
+    def test_wrong_uart_irq(self) -> None:
+        dsdt = self.table("DSDT.aml")
+        with open(dsdt, "rb") as f:
+            data = f.read()
+        irq = data.find(struct.pack("<I", 1046))
+        self.assertGreater(irq, 0, "fixture lost COM0's interrupt")
+        self.patch_bytes(dsdt, irq, struct.pack("<I", 1045))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("COM0 _CRS interrupt", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
