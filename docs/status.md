@@ -103,6 +103,19 @@ them compressed inside the Project Mu FV), and enforced by
 5. **GPU.** No path to a usable desktop or games without a WDDM driver.
 6. **Trust.** Anti-cheat is a platform-certification problem, not just a driver.
 
+## What each remaining epic needs first
+
+Every item below is blocked on the machine, not on code:
+
+| Epic | First action | Needs |
+|---|---|---|
+| Windows handoff | Boot m1n1 + UEFI once and capture the serial log. `exception.c` already prints ESR/ELR/FAR and "Unhandled exception, rebooting...", which localises the fault to a trap class. | the Mac, a data-capable USB-C cable, a serial capture |
+| ANS2 storage | Port m1n1's `nvme.c` (581 lines: ANS mailbox, SART, Apple NVMe quirks) to a UEFI `BlockIo` driver, then to a Windows KMDF driver. | the machine to test against; the two drivers are separate projects |
+| PCIe | Capture `apcie` `ranges`/`assigned-addresses`, MSI base and DART addresses, then add `PCI0` to the DSDT. | `ioreg` output from the machine (`docs/pcie.md`) |
+| Drivers (DCP, SPI, SMC, USB, Wi-Fi) | One KMDF driver per block; each needs the hardware. | the machine plus a Windows test-signing setup |
+| GPU | No public WDDM driver for AGX exists; this is research, not a port. | GPU documentation/reverse engineering plus a machine |
+| Trust | Secure Boot signing + iBoot key enrollment, TPM 2.0 (vTPM is a 16-line stub), SART/DART IOMMU. VBS/HVCI additionally needs Windows' hypervisor at EL2, which m1n1 occupies. | owner consent for boot-policy changes; `ID_AA64MMFR4_EL1` to check FEAT_NV/NV2 |
+
 ## Reproduce the build
 
 ```bash
