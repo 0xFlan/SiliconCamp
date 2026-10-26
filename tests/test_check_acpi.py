@@ -82,7 +82,30 @@ class TestCheckerPasses(FixtureCase):
             self.assertIn(label, result.stdout)
 
 
+class TestTopologyDump(FixtureCase):
+    def test_dump_describes_the_build(self) -> None:
+        result = subprocess.run(
+            [sys.executable, CHECKER, "--print-topology", "--build-dir",
+             self.build_dir],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for mpidr in ("0x0", "0x5", "0x10100", "0x10103"):
+            self.assertIn(mpidr, result.stdout)
+        self.assertIn("efficiency=(0, 0, 0, 0, 0, 0, 1, 1, 1, 1)", result.stdout)
+        self.assertIn("gicr_base=0x5100000000", result.stdout)
+        self.assertIn("uart_base=0x3ad200000", result.stdout)
+
+
 class TestCheckerRejects(FixtureCase):
+    def test_unvalidated_platform_is_an_error(self) -> None:
+        # A checker that guesses would bless a wrong package; it must refuse.
+        result = subprocess.run(
+            [sys.executable, CHECKER, "--platform", "NotARealPlatform",
+             "--build-dir", self.build_dir],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no validated expectations", result.stderr)
+
     def test_wrong_mpidr(self) -> None:
         madt = self.table("*MADT*")
         with open(madt, "rb") as f:
