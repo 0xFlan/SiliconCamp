@@ -1,0 +1,139 @@
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+index 3d875bf5..2952c6ed 100644
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -100,6 +100,8 @@ static u16 num_cpus;
+ static bool vgic_inited;
+ static u64 igrpen1;
+ 
++extern uint64_t vaddr_bits;
++
+ 
+ static bool handle_vgic_its_access(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+ {
+@@ -1799,69 +1801,29 @@ void hv_vgicv3_init(void)
+     printf("HV vGIC DEBUG: start\n");
+     vgic_inited = false;
+     //
+-    // First things first - set the parameters appropriately based on whether
+-    // we're running on a 36-bit or 42-bit platform.
+-    // Also for now, we are catering to "lowest common denominator" for all chips,
+-    // so on more powerful systems we may not be using all cores.
++    // Pick the vGIC MMIO window from the guest's physical address size.
++    // 36-bit platforms get the low window; 40/42/44-bit platforms get the
++    // high window. This covers M1 through M4 without a per-SoC table.
+     //
+-    switch(chip_id) {
+-        case T8103:
+-        case T8112:
+-            dist_base = DIST_BASE_36_BIT;
+-            redist_base = REDIST_BASE_36_BIT;
+-            its_base = ITS_BASE_36_BIT;
+-            num_cpus = 8;
+-            break;
+-        // case T8010:
+-        // case T8015:
+-        // case T8011:
+-        // case T8012:
+-        //     dist_base = DIST_BASE_36_BIT;
+-        //     redist_base = REDIST_BASE_36_BIT;
+-        //     its_base = ITS_BASE_36_BIT;
+-        //     break;
+-        case T6000:
+-            dist_base = DIST_BASE_42_BIT;
+-            redist_base = REDIST_BASE_42_BIT;
+-            its_base = ITS_BASE_42_BIT;
+-            num_cpus = 8; // cannot assume that we have 10 cores for M1 Pro
+-        case T6001:
+-            dist_base = DIST_BASE_42_BIT;
+-            redist_base = REDIST_BASE_42_BIT;
+-            its_base = ITS_BASE_42_BIT;
+-            num_cpus = 10;
+-        case T6002:
+-            dist_base = DIST_BASE_42_BIT;
+-            redist_base = REDIST_BASE_42_BIT;
+-            its_base = ITS_BASE_42_BIT;
+-            num_cpus = 20;
+-        case T6020:
+-            dist_base = DIST_BASE_42_BIT;
+-            redist_base = REDIST_BASE_42_BIT;
+-            its_base = ITS_BASE_42_BIT;
+-            num_cpus = 10;
+-        case T6021:
+-            dist_base = DIST_BASE_42_BIT;
+-            redist_base = REDIST_BASE_42_BIT;
+-            its_base = ITS_BASE_42_BIT;
+-            num_cpus = 12;
+-        case T6022:
+-            dist_base = DIST_BASE_42_BIT;
+-            redist_base = REDIST_BASE_42_BIT;
+-            its_base = ITS_BASE_42_BIT;
+-            num_cpus = 24;
+-        // case T6030:
+-        // case T6031:
+-        // case 0x6032:
+-        // case T6034:
+-        // case 0x6040:
+-        // case 0x6041:
+-        // case T8122:
+-        //     dist_base = DIST_BASE_42_BIT;
+-        //     redist_base = REDIST_BASE_42_BIT;
+-        //     its_base = ITS_BASE_42_BIT;
+-        //     break;
++    if (vaddr_bits > 36) {
++        dist_base = DIST_BASE_42_BIT;
++        redist_base = REDIST_BASE_42_BIT;
++        its_base = ITS_BASE_42_BIT;
++    } else {
++        dist_base = DIST_BASE_36_BIT;
++        redist_base = REDIST_BASE_36_BIT;
++        its_base = ITS_BASE_36_BIT;
+     }
++
++    // One redistributor per CPU, including all efficiency and performance cores.
++    num_cpus = smp_get_cpu_count();
++    if (!num_cpus) {
++        printf("HV vGIC: no CPU nodes found, falling back to 1 CPU\n");
++        num_cpus = 1;
++    }
++
++    printf("HV vGIC: %u CPUs, %lu-bit PA, dist=%#lx redist=%#lx its=%#lx\n", num_cpus,
++           vaddr_bits, dist_base, redist_base, its_base);
+     //
+     // Step 1 - distributor setup.
+     //
+diff --git a/src/smp.c b/src/smp.c
+index e6af2e41..aa3c6f8a 100644
+--- a/src/smp.c
++++ b/src/smp.c
+@@ -527,6 +527,18 @@ int smp_get_id(uint64_t mpidr){
+     return 0;
+ }
+ 
++int smp_get_cpu_count(void)
++{
++    int count = 0;
++
++    for (int cpu = 0; cpu < MAX_CPUS; cpu++) {
++        if (cpu_nodes[cpu])
++            count++;
++    }
++
++    return count;
++}
++
+ u64 smp_get_release_addr(int cpu, bool from_adt)
+ {
+     if(from_adt){
+diff --git a/src/smp.h b/src/smp.h
+index 013efdfd..0170d5ae 100644
+--- a/src/smp.h
++++ b/src/smp.h
+@@ -35,6 +35,7 @@ u64 smp_wait(int cpu);
+ bool smp_is_alive(int cpu);
+ uint64_t smp_get_mpidr(int cpu);
+ int smp_get_id(uint64_t mpidr);
++int smp_get_cpu_count(void);
+ u64 smp_get_release_addr(int cpu, bool from_adt);
+ void smp_set_wfe_mode(bool new_mode);
+ void smp_send_ipi(int cpu);

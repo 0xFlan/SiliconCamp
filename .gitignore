@@ -1,0 +1,16 @@
+# Firmware images are published as GitHub release assets, not committed: the FD
+# is 30 MB and would be permanent in history.  See artifacts/README.md.
+/artifacts/*.fd
+/artifacts/*.bin
+/artifacts/*.macho
+
+# Local build output
+/build/
+__pycache__/
+*.pyc
+
+# Editor and OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,12 @@
+[submodule "third_party/m1n1"]
+	path = third_party/m1n1
+	url = https://github.com/AsahiLinux/m1n1.git
+[submodule "third_party/ntasp-firmware"]
+	path = third_party/ntasp-firmware
+	url = https://github.com/NT-for-ASi/apple_silicon_platforms_mu.git
+[submodule "third_party/ntasp-drivers"]
+	path = third_party/ntasp-drivers
+	url = https://github.com/NT-for-ASi/apple_silicon_nt_drivers.git
+[submodule "third_party/m1n1-windows"]
+	path = third_party/m1n1-windows
+	url = https://github.com/NT-for-ASi/m1n1_windows.git
