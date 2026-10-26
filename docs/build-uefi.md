@@ -119,7 +119,7 @@ an invariant breaks. It parses the tables the build emits and checks:
   each `_UID` matching the MADT order, every CPU `ACPI0007`, and `COM0` an
   `APPL8900` whose `_CRS` is the platform UART base, length and IRQ (parsed from
   the AML, not found by string search);
-- FADT: hardware-reduced, PSCI over SMC;
+- FADT: desktop PM profile, hardware-reduced, PSCI over SMC;
 - DBG2: debug UART at `0x3ad200000`;
 - GTDT: EL1 timer 17, virtual timer 18, no memory-mapped frames;
 - the FD: ARM64 Image header, `text_offset` `0x80000`, and an `image_size` that

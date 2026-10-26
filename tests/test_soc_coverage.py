@@ -78,6 +78,16 @@ class TestCoverage(unittest.TestCase):
         self.assertTrue(machine(report, "Mac16,3")["platform"])
         self.assertFalse(machine(report, "Mac16,2")["platform"])
 
+    def test_m3_ultra_is_its_own_model_identifier(self) -> None:
+        # Asahi's table reuses Mac15,4 here (the iMac M3), so this pins the
+        # correction rather than the source: a wrong identifier attributes
+        # coverage to the wrong machine.
+        report = run(self.tree)
+        studio = [m for m in report["machines"] if m["product"] == "J575dAP"]
+        self.assertEqual(len(studio), 1)
+        self.assertEqual(studio[0]["model"], "Mac15,14")
+        self.assertEqual(studio[0]["soc"], "T6032")
+
     def test_m1_ultra_is_not_covered_by_the_pro_max_family(self) -> None:
         # T600X covers T6000/T6001; the Ultra (T6002) is its own die.
         self.touch_package("Silicon", "Apple", "T600XFamilyPkg")

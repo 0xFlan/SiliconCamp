@@ -13,6 +13,11 @@ inventory is read from `Silicon/Apple/*FamilyPkg` and `Platform/*Pkg`.
 ./scripts/soc-coverage.py --json   # machine-readable
 ```
 
+One Asahi row is deliberately different: Asahi lists the M3 Ultra Mac Studio as
+`Mac15,4`, which is already the iMac M3 2-port. The Studio is `Mac15,14`
+(Apple's model page), and `tests/test_soc_coverage.py` fails on any duplicated
+model identifier.
+
 ## Current state (2026-10-26)
 
 ```

@@ -19,7 +19,7 @@ firmware `18000.161.10`.
 | M4 vGIC topology patch | applied and builds |
 | NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB) |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 20 pass (`python3 -m unittest discover -s tests`) |
+| Checker regression tests | 34 pass (`python3 -m unittest discover -s tests`) |
 | M4 ACPI tables | disassembled and checked (below) |
 
 The `m1n1-windows` build uses `ENABLE_VGIC_MODULE` from `config.h` and produces a
