@@ -84,7 +84,10 @@ The script applies `patches/ntasp-firmware/0001-m4-uefi-platform.patch` and, onc
 
 `./scripts/verify-patches.sh` checks the same patches against the exact commits
 the submodules pin, using throwaway git worktrees, so it passes on a dirty tree
-and fails loudly when a submodule moves under the patches.
+and fails loudly when a submodule moves under the patches. Applying them to a
+clean checkout reproduces the build trees inside this repository exactly (checked
+2026-10-26 by diffing a patched worktree against the working tree), and those
+trees produced the released artifacts.
 
 The validated reference platform is the M2 MacBook Pro package:
 
@@ -131,7 +134,11 @@ tree somewhere else.
 Expectations are per platform, in the `PLATFORMS` table at the top of the
 script, and only `Mac16_3` has validated entries. Any other platform is an
 error, not a pass: the M2 reference package would have failed five of the M4
-assertions, so a generic checker would have been actively misleading. To bring
+assertions, so a generic checker would have been actively misleading.
+`build-uefi-linux.sh` therefore passes `--unvalidated-ok` for every platform
+except `Mac16_3`: the M2 reference build proves the toolchain and finishes with
+a note instead of failing M4 assertions. Use that flag only for reference
+builds, never for the M4. To bring
 up a new SoC (an M4 Pro/Max, say), build it once, then
 
 ```bash

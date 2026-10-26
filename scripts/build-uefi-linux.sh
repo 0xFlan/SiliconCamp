@@ -68,4 +68,11 @@ echo "FD output:"
 find "$ROOT/third_party/ntasp-firmware/Build" -maxdepth 4 -name '*.fd' -print -exec ls -lh {} \;
 
 echo
-"$ROOT/scripts/check-acpi.py" --platform "$PLATFORM"
+if [ "$PLATFORM" = "Mac16_3" ]; then
+    # The M4 package has validated expectations, so a failure here is real.
+    "$ROOT/scripts/check-acpi.py" --platform "$PLATFORM"
+else
+    # The reference build proves the toolchain, not the M4 contract, and the
+    # checker's expectations are written for Mac16_3.
+    "$ROOT/scripts/check-acpi.py" --platform "$PLATFORM" --unvalidated-ok
+fi
