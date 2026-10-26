@@ -17,9 +17,10 @@ firmware `18000.161.10`.
 | upstream m1n1 build | success, `third_party/m1n1/build/m1n1.bin` |
 | NTASP m1n1-windows build | success, `third_party/m1n1-windows/build/m1n1.bin` |
 | M4 vGIC topology patch | applied and builds |
+| Patch integrity | each patch reproduces the submodule's whole working-tree diff (2026-10-26: the trees the artifacts came from) |
 | NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB) |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 34 pass (`python3 -m unittest discover -s tests`) |
+| Checker regression tests | 35 pass (`python3 -m unittest discover -s tests`) |
 | M4 ACPI tables | disassembled and checked (below) |
 
 The `m1n1-windows` build uses `ENABLE_VGIC_MODULE` from `config.h` and produces a

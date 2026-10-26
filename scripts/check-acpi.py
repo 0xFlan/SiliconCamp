@@ -18,8 +18,9 @@ binary data the EDK2 build leaves in the build tree.
 Usage:
     ./scripts/check-acpi.py                     # Mac16_3, newest build
     ./scripts/check-acpi.py --platform Mac16_3
-    ./scripts/check-acpi.py --build-dir <dir>   # any .../DEBUG_CLANGPDB dir
+    ./scripts/check-acpi.py --build-dir <dir>   # <Build>/<plat>-AARCH64/<tag>/AARCH64
     ./scripts/check-acpi.py --print-topology    # dump a Platform entry
+    ./scripts/check-acpi.py --platform X --unvalidated-ok   # reference build
 
 Exit status is 0 only if every check passes.
 """
@@ -698,9 +699,13 @@ def main() -> int:
     parser.add_argument("--platform", default="Mac16_3",
                         help="platform package name (default: Mac16_3)")
     parser.add_argument("--build-dir", default=None,
-                        help="build output directory containing AARCH64/")
+                        help="the AARCH64 build output directory, e.g. "
+                             "Build/<platform>-AARCH64/<tag>/AARCH64")
     parser.add_argument("--print-topology", action="store_true",
                         help="print a PLATFORMS entry for the build tree")
+    parser.add_argument("--unvalidated-ok", action="store_true",
+                        help="exit 0 for a platform with no PLATFORMS entry; "
+                             "for reference builds the checker does not certify")
     args = parser.parse_args()
 
     build_dir = resolve_build_dir(args.platform, args.build_dir)
@@ -714,12 +719,17 @@ def main() -> int:
 
     plat = PLATFORMS.get(args.platform)
     if plat is None:
-        sys.exit(
-            f"error: no validated expectations for platform '{args.platform}'.\n"
+        message = (
+            f"no validated expectations for platform '{args.platform}'.\n"
             f"  validated: {', '.join(sorted(PLATFORMS))}\n"
             f"  run with --print-topology to generate an entry, then check "
             f"every value against the machine before adding it."
         )
+        if not args.unvalidated_ok:
+            sys.exit(f"error: {message}")
+        print(f"note: {message}\n"
+              f"      --unvalidated-ok: the build was not checked.")
+        return 0
 
     print(f"checking {plat.name}: {build_dir}\n")
 

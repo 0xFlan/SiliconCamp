@@ -134,6 +134,16 @@ class TestCheckerRejects(FixtureCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("no validated expectations", result.stderr)
 
+    def test_unvalidated_platform_can_be_skipped_explicitly(self) -> None:
+        # build-uefi-linux.sh uses this for the M2 reference package, whose
+        # tables the M4 expectations do not describe.
+        result = subprocess.run(
+            [sys.executable, CHECKER, "--platform", "MacBookProEarly2023",
+             "--unvalidated-ok", "--build-dir", self.build_dir],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("the build was not checked", result.stdout)
+
     def test_wrong_mpidr(self) -> None:
         madt = self.table("*MADT*")
         with open(madt, "rb") as f:
