@@ -58,10 +58,11 @@ third_party/ntasp-firmware/Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EFI.f
 ## Layout
 
 ```
-docs/                   architecture, status, bring-up plan, safety, M4 platform, hardware values
+docs/                   architecture, status, bring-up plan, safety, M4 platform, hardware values,
+                        Apple Silicon coverage matrix, T604X (M4 Pro/Max) values
 patches/m1n1-windows/   original patches against the NTASP m1n1 fork
 patches/ntasp-firmware/ M4 UEFI platform and build patches
-scripts/                host check, build, patch application, ACPI checker
+scripts/                host check, build, patch application, ACPI checker, SoC coverage
 tests/                  checker regression tests and real M4 ACPI fixtures
 third_party/m1n1/            upstream Asahi m1n1 (reference)
 third_party/m1n1-windows/    NTASP vGIC/PSCI Windows fork (build target)
