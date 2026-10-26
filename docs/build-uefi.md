@@ -82,6 +82,10 @@ If you started from a clean NTASP checkout, apply the project's M4 patch first:
 The script applies `patches/ntasp-firmware/0001-m4-uefi-platform.patch` and, once
 `MU_BASECORE` is initialized, `0002-nasm-scope.patch`. It is idempotent.
 
+`./scripts/verify-patches.sh` checks the same patches against the exact commits
+the submodules pin, using throwaway git worktrees, so it passes on a dirty tree
+and fails loudly when a submodule moves under the patches.
+
 The validated reference platform is the M2 MacBook Pro package:
 
 ```bash
