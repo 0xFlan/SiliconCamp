@@ -95,8 +95,12 @@ jobs:
 
       - name: Build the raw hypervisor image
         run: |
+          # GNU objcopy is multiarch and emits the same elf64-littleaarch64
+          # object the Makefile asks llvm-objcopy for; the runner does not
+          # install the LLVM binutils.
           make -C third_party/m1n1-windows -j"$(nproc)" \
-            USE_CLANG=1 ARCH=aarch64-linux-gnu build/m1n1.bin
+            USE_CLANG=1 ARCH=aarch64-linux-gnu OBJCOPY=objcopy \
+            build/m1n1.bin
 
       # A build that produces no image is not a build.  The Mach-O form is
       # deliberately not requested here: it needs ld64.lld and is only used on
