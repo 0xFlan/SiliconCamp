@@ -6,10 +6,10 @@ This is a research and bring-up repository, not a working product. As of **2026-
 
 - `m1n1` upstream builds on this M4 host.
 - NTASP's `m1n1-windows` fork builds with the vGIC enabled, and its tree already contains T8132 NVMe, PCIe, and SMP support.
-- Original M4 fixes are applied in three patches: `0001-vgic-m4-topology.patch` (vGIC window and redistributor count from the ADT), `0002-psci-t8132.patch` (T8132 PSCI power-domain tree, 6E+4P), and `0003-pcie-guest-handoff.patch` (stage-2 mappings for the APCIE ECAM/BAR windows, DART bypass with per-stream read-back verification, ADT topology reporting). See `patches/m1n1-windows/README.md`.
-- The NTASP Project Mu UEFI firmware has an original M4 platform package and **builds successfully** in the Linux build VM. The 2026-10-27 image adds an MCFG table and a `PCI0` root bridge with a `_CRS` from the captured J624 windows, so Windows can find the APCIE ECAM and enumerate the first root complex. The generated image (`MAC16_3_EFI.fd`, 30 MB) is attached to GitHub release **v0.7.0** with its SHA-256, not committed to git.
+- Original M4 fixes are applied in three patches: `0001-vgic-m4-topology.patch` (vGIC window and redistributor count from the ADT), `0002-psci-t8132.patch` (T8132 PSCI power-domain tree, 6E+4P), and `0003-pcie-guest-handoff.patch` (stage-2 mappings for the APCIE ECAM/BAR windows, DART bypass with per-stream read-back, ADT topology reporting, and a guest MSI path that programs the APCIE port MSI maps and translates AIC interrupts into SPIs 512–767). See `patches/m1n1-windows/README.md`.
+- The NTASP Project Mu UEFI firmware has an original M4 platform package and **builds successfully** in the Linux build VM. The 2026-10-27 image adds an MCFG table and a `PCI0` root bridge with a `_CRS` from the captured J624 windows, so Windows can find the APCIE ECAM and enumerate the first root complex, plus a MADT GIC MSI Frame that gives the guest an interrupt path to devices behind it. The generated image (`MAC16_3_EFI.fd`, 30 MB) is attached to GitHub release **v0.8.0** with its SHA-256, not committed to git.
 - The M4 values are derived from this exact `Mac16,3`/`J624` machine and Asahi's T8132 device tree: 6 E-cores + 4 P-cores, 24 GB DRAM at the 1 TB alias, UART `0x3ad200000` IRQ 1046, four USB DWC3 controllers, and the APCIE host windows decoded from `ioreg` (ECAM `0x1cb0000000`, bus `0x80000000` → host `0xb80000000`).
-- The generated M4 ACPI tables were checked: 10 GICC entries with the correct MPIDRs, GICD at `0x5000000000`, GICR at `0x5100000000` with a `0x140000` range, a 2-cluster/6E+4P PPTT, a matching 10-device DSDT, an MCFG entry for ECAM `0x1cb0000000` with buses 0–8, and a `PCI0` `_CRS` that pins the bus and host windows plus the 256 MB ECAM reservation. `scripts/check-acpi.py` enforces all of this — including each CPU's `_UID`, its cluster, `COM0`'s `_CRS`, and the *sign* of the PCIe translation (the PCD carries `host - bus`, the DSDT `_TRA` carries the same value, and the host bridge library negates it) — on every build, so the values cannot drift silently.
+- The generated M4 ACPI tables were checked: 10 GICC entries with the correct MPIDRs, GICD at `0x5000000000`, GICR at `0x5100000000` with a `0x140000` range, a 2-cluster/6E+4P PPTT, a matching 10-device DSDT, an MCFG entry for ECAM `0x1cb0000000` with buses 0–8, a `PCI0` `_CRS` that pins the bus and host windows plus the 256 MB ECAM reservation, and a GIC MSI Frame at the APCIE doorbell (`0xfffff000`) covering SPIs 512–767. `scripts/check-acpi.py` enforces all of this — including each CPU's `_UID`, its cluster, `COM0`'s `_CRS`, the *sign* of the PCIe translation (the PCD carries `host - bus`, the DSDT `_TRA` carries the same value, and the host bridge library negates it), and agreement between the MSI frame and the hypervisor's `src/guest_msi.h` — on every build, so the values cannot drift silently.
 - The NTASP Windows driver repository is still a README-only skeleton.
 - No Windows kernel has been booted on this M4. The existing project still hangs at the Windows loader-to-kernel handoff even on M1/M2.
 - There is no Windows GPU driver for Apple AGX, and no path to kernel anti-cheat yet.
@@ -102,30 +102,33 @@ third_party/ntasp-drivers/   Windows drivers/HAL extensions (currently empty)
 ## What is still missing
 
 1. Hardware validation: the firmware builds and its CPU/RAM/UART/ACPI topology matches the machine, but m1n1 and the UEFI image have not run on the M4 yet.
-2. PCIe and storage: the host bridge, page tables, MCFG and `PCI0` `_CRS` now use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus `0x80000000` → host `0xb80000000`) and prefetch window (`0xbc0000000`), and the m1n1 hand-off maps them into the guest and bypasses the APCIE DARTs. MSI is the open PCIe problem: the guest has no way to be told about Apple's `0xfffff000` doorbell, and the vGIC's ITS window handles only `GITS_CTLR`/`GITS_BASER*`. The four `apciec` complexes are not described, and the internal ANS2 SSD has no driver. USB storage is the current install path. See `docs/pcie.md`.
-3. A working Windows loader-to-kernel handoff (the central unsolved bug, even on M1/M2).
-4. Windows drivers: ANS NVMe (the UEFI driver is the reference now), DART, PCIe, DCP display, SPI input, SMC, USB, Wi-Fi/Bluetooth.
-5. A Windows AGX GPU driver.
-6. Platform trust: Secure Boot, TPM 2.0, VBS/HVCI, IOMMU, driver signing, anti-cheat certification.
+2. PCIe and storage: the host bridge, page tables, MCFG and `PCI0` `_CRS` use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus `0x80000000` → host `0xb80000000`) and prefetch window (`0xbc0000000`); the m1n1 hand-off maps them into the guest and bypasses the APCIE DARTs; and MSI is wired from the MADT GIC MSI Frame through the APCIE port maps to the guest's INTID window. None of that has run on hardware. The four `apciec` complexes are not described, `_PRT`/IORT are absent, and the internal ANS2 SSD's UEFI driver has not run. USB storage is the current install path. See `docs/pcie.md`.
+3. Validation of the MSI window on hardware: the port map offset, the meaning of `msi-vector-offset`, the AIC target CPU, and whether Windows accepts a MSI frame without an IORT are all unproven (`docs/pcie.md` lists them in the order a first boot will expose them).
+4. A working Windows loader-to-kernel handoff (the central unsolved bug, even on M1/M2).
+5. Windows drivers: ANS NVMe (the UEFI driver is the reference now), DART, PCIe, DCP display, SPI input, SMC, USB, Wi-Fi/Bluetooth.
+6. A Windows AGX GPU driver.
+7. Platform trust: Secure Boot, TPM 2.0, VBS/HVCI, IOMMU, driver signing, anti-cheat certification.
 
 See `docs/status.md` and `docs/bringup-plan.md` for the details.
 
 ## Releases
 
-Images are published as GitHub releases. The current build is **v0.7.0**:
+Images are published as GitHub releases. The current build is **v0.8.0**:
 
 ```bash
-mkdir -p /tmp/siliconcamp-v0.7.0
-gh release download v0.7.0 --dir /tmp/siliconcamp-v0.7.0
-(cd /tmp/siliconcamp-v0.7.0 && shasum -a 256 -c SHA256SUMS)
+mkdir -p /tmp/siliconcamp-v0.8.0
+gh release download v0.8.0 --dir /tmp/siliconcamp-v0.8.0
+(cd /tmp/siliconcamp-v0.8.0 && shasum -a 256 -c SHA256SUMS)
 ```
 
-`v0.7.0` adds the internal SSD driver to the UEFI image and leaves both
-hypervisor images unchanged. `v0.6.0` carries the fix for the PCIe translation
-sign and the first hypervisor-side PCIe hand-off (`pcie_guest.c`, patch 0003).
-The earlier `v0.5.0` / `v0.4.0` images carry the M4 PSCI topology fix and the
-superseded `bus - host` translation value. Do not install any of them until
-`docs/safety.md` is satisfied.
+`v0.8.0` adds the guest MSI path to both halves: the UEFI image carries the MADT
+GIC MSI Frame, and the hypervisor programs the APCIE port MSI maps, unmasks the
+AIC vectors and translates them into the guest's SPI window. `v0.7.0` added the
+internal SSD driver to the UEFI image. `v0.6.0` carries the fix for the PCIe
+translation sign and the first hypervisor-side PCIe hand-off (`pcie_guest.c`,
+patch 0003). The earlier `v0.5.0` / `v0.4.0` images carry the M4 PSCI topology
+fix and the superseded `bus - host` translation value. Do not install any of
+them until `docs/safety.md` is satisfied.
 
 ## Safety
 

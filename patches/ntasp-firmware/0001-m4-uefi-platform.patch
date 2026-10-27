@@ -5141,10 +5141,10 @@ index 0000000..7e9b530
 +VOID* CONST ReferenceAcpiTable = &Gtdt;
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc
 new file mode 100644
-index 0000000..7d13e7f
+index 0000000..e3cfd7b
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/AcpiTables/MADT_Static.aslc
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,160 @@
 +/**
 + * Copyright (c) 2025 NTASP authors.
 + *
@@ -5186,6 +5186,47 @@ index 0000000..7d13e7f
 +   0x20000 * FixedPcdGet32(PcdCoreCount)     /* DiscoveryRangeLength */        \
 +   }
 +
++//
++// GIC MSI frame: how MSI/MSI-X reaches an OS that has no APCIE driver.
++//
++// Apple does not route PCIe MSIs through the GIC's ITS.  A device writes a
++// vector index to the controller's doorbell (the ADT's `msi-address`), the port
++// translates that through its own MSI map, and the AIC raises interrupt
++// `msi-vector-offset + index` -- 1506 on J624 (docs/pcie.md).  The AIC is not a
++// GIC, so m1n1 translates those interrupts into the SPI window below and the
++// GIC MSI Frame entry is what tells the OS the window exists and that messages
++// for it go to the doorbell.
++//
++// All three numbers are a contract with src/guest_msi.h in the hypervisor:
++// an OS that allocates SPIs outside this window sends its MSIs to a doorbell
++// entry m1n1 does not translate, and the interrupts are dropped.  They are a
++// contract with this SoC's ADT as well.  scripts/check-acpi.py compares the
++// built table against the hypervisor's constants and fails the build when they
++// disagree; the values are not settable from the platform DSC on purpose,
++// because a second APCIE generation would need its own measured doorbell and
++// AIC base, not a default.
++//
++//   SPIBase     guest SPI that stands for doorbell index 0 (512, from
++//               guest_msi.h: it has to be above the SGI/PPI range and the
++//               window has to end at or below SPI 1019)
++//   SPICount    256 vectors, doorbell indices 0..255 (AIC 1506..1761)
++//   Address     0xFFFFF000, the captured `msi-address` of apcie@B0000000
++//
++#define GUEST_MSI_SPI_BASE   512
++#define GUEST_MSI_VECTORS    256
++#define GUEST_MSI_DOORBELL   0xFFFFF000ULL
++
++#define MADT_GIC_MSI_FRAME_INIT()  {                                  \
++   EFI_ACPI_6_3_GIC_MSI_FRAME,               /* Type */              \
++   sizeof (EFI_ACPI_6_3_GIC_MSI_FRAME_STRUCTURE), /* Length */       \
++   EFI_ACPI_RESERVED_WORD,                   /* Reserved1 */         \
++   0,                                        /* GicMsiFrameId */     \
++   GUEST_MSI_DOORBELL,                       /* PhysicalBaseAddress */ \
++   0,                                        /* Flags */             \
++   GUEST_MSI_VECTORS,                        /* SPICount */          \
++   GUEST_MSI_SPI_BASE                        /* SPIBase */           \
++   }
++
 +#pragma pack (1)
 +
 +typedef struct {
@@ -5193,6 +5234,7 @@ index 0000000..7d13e7f
 +  EFI_ACPI_6_3_GIC_STRUCTURE                         GicInterfaces[FixedPcdGet32 (PcdCoreCount)];
 +  EFI_ACPI_6_0_GIC_DISTRIBUTOR_STRUCTURE             GicDistributor;
 +  EFI_ACPI_6_4_GICR_STRUCTURE                        GicRedistributor;
++  EFI_ACPI_6_3_GIC_MSI_FRAME_STRUCTURE               GicMsiFrame;
 +} MULTIPLE_APIC_DESCRIPTION_TABLE;
 +
 +#pragma pack ()
@@ -5255,6 +5297,7 @@ index 0000000..7d13e7f
 +  },
 +  EFI_ACPI_6_0_GIC_DISTRIBUTOR_INIT(0, FixedPcdGet64 (PcdGicDistributorBase), 0, 3),
 +  MADT_GICR_INIT(),
++  MADT_GIC_MSI_FRAME_INIT(),
 +};
 +
 +//

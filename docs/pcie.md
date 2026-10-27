@@ -176,48 +176,101 @@ The one thing the ADT does not describe is the host side of the BAR windows, so
 those are the captured values above, keyed by SoC; a SoC without an entry gets
 its ECAM mapped and a warning naming the missing values.
 
+## MSI (2026-10-27, patch 0003)
+
+Enumeration and DMA were never the last blocker: interrupts were. A guest with
+no MSI path programs no MSI-X table, and Apple's controllers have no INTx, so a
+device behind `PCI0` had no way to signal anything at all.
+
+Neither of the two obvious mechanisms is usable on its own:
+
+- **Apple's doorbell** (device writes an index to `0xfffff000`, AIC raises
+  `msi-vector-offset` + index = 1506 + index) is what the hardware does, but it
+  lands on the AIC, and 1506 is not a GIC INTID. m1n1's EL2 handler used to
+  forward the AIC number verbatim, so a guest would have received INTID 1506,
+  four banks past the end of the emulated distributor — its interrupt controller
+  would index state that does not exist, and `hv_vgic3_get_priority()` read past
+  the priority banks for anything above 1023.
+- **A GIC ITS** is what Windows knows how to drive, but a real ITS translates
+  device writes to `GITS_TRANSLATER`. Apple's hardware ignores that address and
+  writes its own doorbell, so an emulated ITS behind this controller is a
+  promise the hardware does not keep.
+
+What both have in common is a *write an index to an address* MSI. That is also
+what an ACPI **GIC MSI Frame** is, so the firmware publishes one and the
+hypervisor translates the other end:
+
+| Piece | Value | Where |
+|---|---|---|
+| Doorbell | `0xfffff000` | MADT GIC MSI Frame (`MADT_Static.aslc`) |
+| MSI-frame SPIs | 512–767 (256 vectors) | MADT GIC MSI Frame |
+| AIC interrupts | 1506–1761 | ADT `msi-vector-offset` |
+| Guest INTID | 512 + index | `src/guest_msi.h` |
+
+The guest allocates an SPI from the frame, writes `data = INTID - 512` into the
+device's MSI-X table, and the device's write to `0xfffff000` raises AIC
+`1506 + data`; m1n1 maps that to INTID `512 + data` and injects it through a
+list register. Nothing in the guest needs an APCIE or AIC driver.
+
+The hypervisor side is `src/guest_msi.c` (patch 0003):
+
+1. walk `/arm-io` children for `compatible = "apcie,*"`, read `#ports`, `reg`,
+   `msi-address` and `msi-vector-offset`;
+2. derive each port's register block the way `pcie.c` does (shared registers
+   first, then `port_reg_cnt` entries per port) and program MSIMAP entry *i* to
+   `0x80000000 | i` — valid, vector *i* — then read all 256 back, because iBoot
+   hands over with the map cleared and a silently-zero map looks exactly like
+   "MSI works and no device ever fires";
+3. unmask AIC 1506–1761 (the AIC comes out of iBoot masked for everything it did
+   not need);
+4. publish the window, or say why it could not.
+
+`hv_vgic3_guest_vintid()` is the translation the old handler was missing. It
+returns the MSI INTID, passes AIC interrupts up to SPI 1019 through unchanged
+(which is what the old one-for-one forwarding did), and for anything else masks
+the source and logs it once — the UART (1046) and the APCIE root complexes
+(1231-1249) are in that last group, and delivering them was never going to work.
+
+`scripts/check-acpi.py` compares the built MADT's frame against
+`src/guest_msi.h` and against the captured doorbell, because a mismatch has no
+symptom in the guest: it allocates SPIs the hypervisor does not translate, and
+every interrupt is dropped. It also rejects a window that ends past SPI 1019 or
+past the emulated distributor's last INTID (1023).
+
+### What the first boot has to prove
+
+None of this has run on hardware. The specific unknowns, in the order they will
+show up in a log:
+
+1. **Does the port MSI map live at `0x3800` on T8132?** `pcie.c` uses that offset
+   for T602X and clears it when `compatible` is `apcie,t8122`, which covers
+   T8132; the identity write follows. The log prints each port's derived base and
+   how many entries failed to read back, so a wrong offset shows up as a number
+   rather than as silent breakage.
+2. **Is `msi-vector-offset` really the AIC interrupt of vector 0?** The log prints
+   it per controller, and the AIC unmask loop prints the range. If MSIs never
+   arrive, that number is the first thing to re-derive from the ADT.
+3. **Which CPU does the AIC target for those interrupts?** m1n1 unmasks but does
+   not set the target; an MSI routed to a core that is not running would hang
+   rather than drop.
+4. **Does Windows accept the GIC MSI Frame and ignore the absence of an IORT?**
+   Microsoft's own OpenVMM emits a GICv2m MSI frame for its aarch64 Windows
+   guests, which is why this path was chosen over an emulated ITS, but no IORT is
+   published yet and Windows' PCI stack may want one.
+
 ## What is still missing
 
-1. **MSI.** Devices behind `PCI0` can enumerate and DMA, but their MSI/MSI-X
-   messages have nowhere useful to land yet. Two mechanisms exist and neither is
-   wired to the guest:
-
-   - Apple's own doorbell: a device writes `msi-vector-offset + vector` to
-     `msi-address` (`0xfffff000` on this machine, offset 1506/`0x5e2`), the
-     controller turns that into an AIC interrupt, and m1n1's vGIC forwards AIC
-     interrupts to the guest one-for-one. This works from the hardware's point
-     of view today — it is only Windows that has no way to be told about it.
-   - A guest-visible GIC ITS. m1n1's vGIC maps an ITS window
-     (`0x5200000000` on a 40-bit guest) and `hv_vgic.c` handles `GITS_CTLR` and
-     `GITS_BASER*`, but the command queue is not decoded, so an OS that
-     discovers an ITS through IORT would program it into a black hole.
-
-   The shortest path to MSI for Windows is the first mechanism plus a small
-   kernel driver (or an ACPI-described mailbox, which no ACPI binding covers
-   yet); the second is a vITS project that has to trap the command queue by
-   mapping it read-only in stage 2.
+1. **`_PRT` and IORT.** The DSDT has no `_PRT`, so nothing describes INTx
+   routing, and no IORT describes the root complex or its ID mappings. Devices
+   with MSI capability should not need `_PRT`, but a device that falls back to
+   INTx has nothing to fall back to, and the IORT question above is unresolved.
 2. **The `apciec` root complexes.** Their ECAMs, bus ranges (0–128) and
    apertures need the same capture-then-wire treatment before Thunderbolt or
    USB4 devices can appear. `PCI0` describes only `apcie@B0000000`; the m1n1
    hand-off reports all of them, so the next capture session can fill in the
    rest. Their DARTs are already bypassed (`dart-apciec0`-`dart-apciec3`), so
    DMA is not the blocker there — the tables are.
-
-## Storage
-
-Two different problems, often conflated:
-
-- **UEFI storage.** The in-box NVMe driver cannot talk to the internal SSD: it
-  is an Apple ANS controller, not a PCIe NVMe device.  `AppleNANDStorageDxe` is
-  now a real driver rather than a stub: it boots the coprocessor through the ASC
-  mailbox and the RTKit handshake, programs the SART and the NVMMU/NVMe queues,
-  runs `Identify` and publishes the disk as `EFI_BLOCK_IO_PROTOCOL`.  It builds,
-  links into the FD, and its 110 hardware constants are checked against m1n1 on
-  every CI run — but it has **not run on hardware yet**.  See `docs/ans2.md`.
-- **Windows storage.** A Windows driver for ANS2 has to implement the same
-  protocol in kernel mode.  The UEFI driver is the reference implementation now,
-  and it leaves the controller enabled at `ExitBootServices` so that a future
-  Windows driver can adopt it instead of reproducing the mailbox handshake.
-
-Until one of them has run on the machine, USB is the install path, and
-`docs/status.md` keeps saying so.
+3. **One MSI window.** All APCIE controllers have to share one AIC base for the
+   single MADT frame to be correct; `guest_msi.c` reports and refuses a
+   controller whose `msi-vector-offset` differs instead of silently mapping it
+   onto the wrong interrupts.

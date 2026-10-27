@@ -1,8 +1,16 @@
 diff --git a/Makefile b/Makefile
-index e3ab4d15..75b57db6 100644
+index e3ab4d15..4b0c5a8f 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -158,6 +158,7 @@ OBJECTS := \
+@@ -142,6 +142,7 @@ OBJECTS := \
+ 	exception.o exception_asm.o \
+ 	fb.o font.o font_retina.o \
+ 	firmware.o \
++	guest_msi.o \
+ 	gxf.o gxf_asm.o \
+ 	heapblock.o \
+ 	hv.o hv_vm.o hv_exc.o hv_vuart.o hv_wdt.o hv_asm.o hv_aic.o hv_virtio.o hv_psci.o hv_vgic.o \
+@@ -158,6 +159,7 @@ OBJECTS := \
  	nvme.o \
  	payload.o \
  	pcie.o \
@@ -348,19 +356,463 @@ index cc91f142..7eee590e 100644
 +int dart_bypass_adt(const char *path);
 +
  #endif
+diff --git a/src/guest_msi.c b/src/guest_msi.c
+new file mode 100644
+index 00000000..7446e4c7
+--- /dev/null
++++ b/src/guest_msi.c
+@@ -0,0 +1,358 @@
++/* SPDX-License-Identifier: MIT */
++
++/*
++ * Guest MSI for a guest that has no APCIE driver.
++ *
++ * See guest_msi.h for the shape of the problem.  This file does the two halves
++ * that belong to m1n1:
++ *
++ *  1. Program each controller port's MSI map so that doorbell entry N is a
++ *     valid vector N.  iBoot hands over with the map disabled (m1n1's own
++ *     pcie_init() clears it, and the macOS driver programs it at runtime), so a
++ *     device that writes the doorbell before this runs raises nothing at all.
++ *     Every entry is read back, because a map that silently stayed zero is
++ *     indistinguishable from "MSI works but no device ever fires".
++ *
++ *  2. Unmask the AIC interrupts those vectors raise.  The AIC is reset masked
++ *     for everything iBoot did not need, and an interrupt that is never acked
++ *     at EL2 is an interrupt the guest never sees.
++ *
++ * The guest-visible side -- which INTID stands for which AIC interrupt -- is in
++ * guest_msi_intid(), which the EL2 IRQ path calls for every physical interrupt.
++ */
++
++#include "adt.h"
++#include "aic.h"
++#include "guest_msi.h"
++#include "string.h"
++#include "types.h"
++#include "utils.h"
++
++/*
++ * Port registers, copied from the layout table in pcie.c (regs_t*).  Only the
++ * count of shared registers before the per-port ones matters here, and it has
++ * to agree with pcie.c or the port base is wrong.  The value is not trusted on
++ * its own: guest_msi_port() checks that the derived window reads back as a
++ * plausible MSI map before it writes anything.
++ *
++ * A table rather than a single number because a future SoC is a new row, not a
++ * new formula.
++ */
++struct msi_port_layout {
++    const char *compatible;
++    u32 shared_regs;
++};
++
++static const struct msi_port_layout msi_port_layouts[] = {
++    {"apcie,t8103", 6},
++    {"apcie,t6000", 6},
++    {"apcie,t8112", 6},
++    {"apcie,t6020", 8},
++    {"apcie,t6030", 7},
++    {"apcie,t6031", 8},
++    {"apcie,t8122", 7},
++    {"apcie,t8132", 7},
++};
++
++/* Port MSI map, from pcie.c: APCIE_T602X_PORT_MSIMAP.  Bit 31 is the valid bit. */
++#define APCIE_PORT_MSIMAP   0x3800
++#define APCIE_MSIMAP_VALID  BIT(31)
++
++/* The ADT describes up to 512 entries; m1n1's pcie_init() clears all of them. */
++#define APCIE_MSIMAP_ENTRIES 512
++
++#define GUEST_MSI_MAX_DEPTH 6
++#define GUEST_MSI_PATH_LEN  128
++
++struct guest_msi_window guest_msi;
++
++/*
++ * Pick the shared-register count for a controller.  Returns -1 for an unknown
++ * compatible string: the APCIE generations do not all describe their registers
++ * the same way, and a wrong count would make the port base point at another
++ * block entirely.
++ */
++static int msi_shared_regs(int node)
++{
++    u32 len = 0;
++    const char *list = adt_getprop(adt, node, "compatible", &len);
++
++    if (!list)
++        return -1;
++
++    for (u32 offset = 0; offset < len;) {
++        const char *entry = list + offset;
++        size_t entry_len = strlen(entry);
++
++        for (size_t i = 0; i < ARRAY_SIZE(msi_port_layouts); i++) {
++            if (!strcmp(entry, msi_port_layouts[i].compatible))
++                return msi_port_layouts[i].shared_regs;
++        }
++
++        offset += entry_len + 1;
++    }
++
++    return -1;
++}
++
++static bool prop_u32(int node, const char *name, u32 *out)
++{
++    u32 len = 0;
++    const void *prop = adt_getprop(adt, node, name, &len);
++
++    if (!prop || len != sizeof(u32))
++        return false;
++
++    memcpy(out, prop, sizeof(*out));
++
++    return true;
++}
++
++/*
++ * Base of one port's register block.
++ *
++ * The `reg` property lists the shared blocks first and then `port_reg_cnt`
++ * entries per port, so port P's block is entry shared + P * port_reg_cnt.  A
++ * controller whose property does not divide evenly is reported rather than
++ * rounded, for the same reason as above.
++ */
++static bool msi_port_base(int node, const int *path, u32 shared, u32 port, u32 port_reg_cnt,
++                          u64 *base)
++{
++    u32 reg_len = 0;
++
++    if (!adt_getprop(adt, node, "reg", &reg_len) || reg_len < 16)
++        return false;
++
++    if ((reg_len / 16) <= shared)
++        return false;
++
++    return adt_get_reg(adt, (int *)path, "reg", shared + port * port_reg_cnt, base, NULL) == 0;
++}
++
++/*
++ * Program the MSI map of one controller and unmask the AIC interrupts of its
++ * vectors.
++ */
++static void guest_msi_controller(int node, const char *path, const int *offsets)
++{
++    static const u32 vector = GUEST_MSI_VECTORS;
++    u32 ports = 1, aic_base, address;
++    u32 shared, reg_len, port_regs, port_reg_cnt;
++    int per_port = 0;
++
++    if (prop_u32(node, "#ports", &ports) && ports == 0) {
++        printf("msi: %s has #ports = 0, skipping\n", path);
++        guest_msi.failed++;
++        return;
++    }
++
++    if (!prop_u32(node, "msi-vector-offset", &aic_base)) {
++        printf("msi: %s has no msi-vector-offset; cannot map its MSI vectors\n", path);
++        guest_msi.failed++;
++        return;
++    }
++
++    if (prop_u32(node, "msi-address", &address))
++        printf("msi: %s: doorbell 0x%x, AIC base %u, %u vector(s)\n", path, address, aic_base,
++               vector);
++    else
++        printf("msi: %s: AIC base %u, %u vector(s), no msi-address property\n", path, aic_base,
++               vector);
++
++    if (guest_msi.valid && guest_msi.aic_base != aic_base) {
++        /*
++         * One window means one translation rule.  Two controllers with
++         * different AIC bases would need a second window in the MADT, and
++         * silently using the first one would drop every MSI from the second.
++         */
++        printf("msi: %s: AIC base %u differs from %u; only the first is mapped\n", path, aic_base,
++               guest_msi.aic_base);
++        guest_msi.failed++;
++        return;
++    }
++
++    shared = (u32)msi_shared_regs(node);
++
++    if ((int)shared < 0) {
++        printf("msi: %s: unknown APCIE layout, cannot find its port registers\n", path);
++        guest_msi.failed++;
++        return;
++    }
++
++    if (!adt_getprop(adt, node, "reg", &reg_len) || (reg_len / 16) <= shared) {
++        printf("msi: %s: reg property too short for %u shared entries\n", path, shared);
++        guest_msi.failed++;
++        return;
++    }
++
++    port_regs = (reg_len / 16) - shared;
++
++    if (!port_regs || (port_regs % ports)) {
++        printf("msi: %s: %u port registers do not divide into %u port(s)\n", path, port_regs, ports);
++        guest_msi.failed++;
++        return;
++    }
++
++    port_reg_cnt = port_regs / ports;
++
++    for (u32 port = 0; port < ports; port++) {
++        u64 port_base = 0;
++        u32 stale = 0;
++
++        if (!msi_port_base(node, offsets, shared, port, port_reg_cnt, &port_base)) {
++            printf("msi: %s: no register block for port %u\n", path, port);
++            guest_msi.failed++;
++            continue;
++        }
++
++        /*
++         * The map is written unconditionally rather than only when it reads
++         * back as disabled: a half-programmed map left by iBoot is a state in
++         * which some vectors work and others do not, which is worse to debug
++         * than one that is uniformly wrong.
++         */
++        for (u32 i = 0; i < vector; i++)
++            write32(port_base + APCIE_PORT_MSIMAP + 4 * i, APCIE_MSIMAP_VALID | i);
++
++        for (u32 i = 0; i < vector; i++) {
++            if (read32(port_base + APCIE_PORT_MSIMAP + 4 * i) != (APCIE_MSIMAP_VALID | i))
++                stale++;
++        }
++
++        printf("msi: %s port %u at 0x%lx: %u vector(s) programmed, %u did not read back\n", path,
++               port, port_base, vector, stale);
++
++        if (stale) {
++            guest_msi.failed++;
++            continue;
++        }
++
++        guest_msi.programmed += vector;
++        per_port = 1;
++    }
++
++    if (!per_port)
++        return;
++
++    /*
++     * Unmask the AIC interrupts.  aic_set_mask() indexes per die, so an
++     * interrupt past the end of the AIC would corrupt the next die's mask;
++     * nothing above the last die is unmasked here, and the window is reported
++     * instead.
++     */
++    if (!aic) {
++        printf("msi: AIC is not initialized, MSI vectors stay masked\n");
++        guest_msi.failed++;
++        return;
++    }
++
++    for (u32 i = 0; i < vector; i++) {
++        u32 irq = aic_base + i;
++
++        if (irq >= aic->nr_die * aic->max_irq) {
++            if (i == 0)
++                printf("msi: AIC base %u is past the end of the AIC (%u dies x %u IRQs)\n",
++                       aic_base, aic->nr_die, aic->max_irq);
++            guest_msi.failed++;
++            return;
++        }
++
++        aic_set_mask(irq, false);
++    }
++
++    if (!guest_msi.valid) {
++        guest_msi.aic_base = aic_base;
++        guest_msi.valid = true;
++    }
++
++    guest_msi.controllers++;
++}
++
++void guest_msi_prepare(void)
++{
++    int offsets[GUEST_MSI_MAX_DEPTH + 2];
++    char path[GUEST_MSI_PATH_LEN] = "";
++    u32 len;
++
++    memset(&guest_msi, 0, sizeof(guest_msi));
++
++    /*
++     * Only the controllers m1n1 leaves running for the guest have MSI here.
++     * Walking the children of /arm-io and checking `compatible` is cheaper to
++     * keep correct than a list of paths, and it covers the apciec0-3 complexes
++     * the hand-off does not describe yet.
++     */
++    int node = adt_path_offset(adt, "/arm-io");
++
++    if (node < 0) {
++        printf("msi: no /arm-io in the ADT, no guest MSI window\n");
++        return;
++    }
++
++    ADT_FOREACH_CHILD(adt, node)
++    {
++        const char *name = adt_get_name(adt, node);
++        const char *compat;
++        int path_len;
++        bool apcie = false;
++
++        if (!name)
++            continue;
++
++        for (u32 offset = 0;
++             (compat = adt_getprop(adt, node, "compatible", &len)) && offset < len;) {
++            const char *entry = compat + offset;
++            size_t entry_len = strlen(entry);
++
++            /*
++             * "apcie,t8132" is a controller; "apcie-ge,t6020" is a GE
++             * (Thunderbolt/USB4) complex with a different register layout and
++             * no MSI window of its own in the guest's tables yet.
++             */
++            if (entry_len >= 6 && !strncmp(entry, "apcie,", 6))
++                apcie = true;
++
++            offset += entry_len + 1;
++        }
++
++        if (!apcie)
++            continue;
++
++        path_len = snprintf(path, sizeof(path), "/arm-io/%s", name);
++
++        if (path_len <= 0 || (size_t)path_len >= sizeof(path))
++            continue;
++
++        if (adt_path_offset_trace(adt, path, offsets) < 0) {
++            printf("msi: cannot trace %s\n", path);
++            guest_msi.failed++;
++            continue;
++        }
++
++        guest_msi_controller(node, path, offsets);
++    }
++
++    if (!guest_msi.valid || !guest_msi.programmed) {
++        printf("msi: no guest MSI window; devices behind APCIE raise no interrupts\n");
++        return;
++    }
++
++    printf("msi: guest window: AIC %u-%u -> INTID %u-%u (%u vector(s) programmed)\n",
++           guest_msi.aic_base, guest_msi.aic_base + GUEST_MSI_VECTORS - 1, GUEST_MSI_SPI_BASE,
++           GUEST_MSI_SPI_END, guest_msi.programmed);
++
++    if (guest_msi.failed)
++        printf("msi: %d step(s) failed; see the lines above\n", guest_msi.failed);
++}
++
++u32 guest_msi_intid(u32 aic_irq)
++{
++    if (!guest_msi.valid || aic_irq < guest_msi.aic_base)
++        return 0;
++
++    if (aic_irq - guest_msi.aic_base >= GUEST_MSI_VECTORS)
++        return 0;
++
++    return GUEST_MSI_SPI_BASE + (aic_irq - guest_msi.aic_base);
++}
+diff --git a/src/guest_msi.h b/src/guest_msi.h
+new file mode 100644
+index 00000000..96ed3e8b
+--- /dev/null
++++ b/src/guest_msi.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef GUEST_MSI_H
++#define GUEST_MSI_H
++
++#include "types.h"
++
++/*
++ * Guest-visible MSI window.
++ *
++ * Apple's APCIE controllers do not route MSIs through the GIC's ITS.  A device
++ * writes a vector index to the controller's MSI doorbell (`msi-address` in the
++ * ADT, 0xfffff000 on J624), the port translates it through its own MSI map and
++ * the AIC raises interrupt `msi-vector-offset + index` (1506 on J624).  m1n1's
++ * EL2 IRQ handler already receives AIC interrupts and forwards them to the
++ * guest through a list register, but it forwards the AIC number verbatim, and
++ * 1506 is not a GIC INTID: INTIDs above 1019 are reserved, and the emulated
++ * distributor (GICD_TYPER reports 1024 INTIDs) has no state for them.
++ *
++ * So the guest is given a normal SPI window instead, and the two things that
++ * have to agree are these constants and the firmware's MADT GIC MSI Frame
++ * entry: the frame tells the OS that SPIs [base, base + count) are MSI vectors
++ * whose messages go to `msi-address`, and this code maps AIC
++ * `offset + (spi - base)` back to `spi`.  scripts/check-acpi.py compares the
++ * two, because a mismatch is silent: the OS allocates SPIs the hypervisor does
++ * not translate, and every interrupt is dropped with a line in the log.
++ *
++ * The window is 256 vectors rather than the 512 the port's map can hold, and it
++ * stops at SPI 767, because the emulated distributor's enable and priority
++ * banks only cover INTIDs up to 1023 and the architectural SPI range ends at
++ * 1019.
++ */
++#define GUEST_MSI_SPI_BASE 512
++#define GUEST_MSI_VECTORS  256
++
++#define GUEST_MSI_SPI_END (GUEST_MSI_SPI_BASE + GUEST_MSI_VECTORS - 1)
++
++/* Highest INTID the emulated distributor (GICD_TYPER ITLines = 31) describes. */
++#define GUEST_GIC_MAX_INTID 1023
++
++/* Highest architectural SPI.  INTIDs 1020-8191 are reserved. */
++#define GIC_LAST_SPI 1019
++
++struct guest_msi_window {
++    /* AIC interrupt number of MSI vector 0, or 0 when the guest has no MSI. */
++    u32 aic_base;
++    bool valid;
++    /* Controllers and doorbell entries programmed, for the log. */
++    int controllers;
++    int programmed;
++    int failed;
++};
++
++extern struct guest_msi_window guest_msi;
++
++/*
++ * Program the APCIE MSI maps for the guest and unmask the AIC interrupts they
++ * raise.  Best effort: a controller without an `msi-vector-offset` is reported
++ * and skipped, because guessing an AIC base would send every MSI to an
++ * unrelated interrupt.
++ */
++void guest_msi_prepare(void);
++
++/*
++ * Translate an AIC interrupt number into the guest INTID that represents it, or
++ * return 0 when the guest has no way to receive it.  Called from the EL2 IRQ
++ * handler for every physical interrupt.
++ */
++u32 guest_msi_intid(u32 aic_irq);
++
++#endif
 diff --git a/src/hv.c b/src/hv.c
-index 77d5dbbf..783d04b2 100644
+index 77d5dbbf..386d8ed8 100644
 --- a/src/hv.c
 +++ b/src/hv.c
-@@ -7,6 +7,7 @@
+@@ -5,8 +5,10 @@
+ #include "cpu_regs.h"
+ #include "display.h"
  #include "gxf.h"
++#include "guest_msi.h"
  #include "memory.h"
  #include "pcie.h"
 +#include "pcie_guest.h"
  #include "smp.h"
  #include "string.h"
  #include "usb.h"
-@@ -57,7 +58,6 @@ static struct hv_secondary_info_t hv_secondary_info;
+@@ -57,7 +59,6 @@ static struct hv_secondary_info_t hv_secondary_info;
  
  void hv_init(void)
  {
@@ -368,7 +820,7 @@ index 77d5dbbf..783d04b2 100644
      // Make sure we wake up DCP if we put it to sleep, just quiesce it to match ADT
      if (display_is_external && display_start_dcp() >= 0)
          display_shutdown(DCP_QUIESCED);
-@@ -69,6 +69,34 @@ void hv_init(void)
+@@ -69,6 +70,44 @@ void hv_init(void)
  
      hv_pt_init();
  
@@ -398,11 +850,156 @@ index 77d5dbbf..783d04b2 100644
 +    pcie_shutdown();
 +#else
 +    pcie_guest_prepare();
++
++    /*
++     * MSI.  The controllers' doorbells and the AIC interrupts they raise are
++     * m1n1's to program, because the guest has no APCIE driver and the AIC is
++     * not a GIC: guest_msi.c programs the port MSI maps, unmasks the AIC and
++     * publishes the INTID window the firmware advertises in its MADT.  This has
++     * to run after pcie_guest_prepare(), which maps the controllers, and before
++     * the guest starts.  See src/guest_msi.h.
++     */
++    guest_msi_prepare();
 +#endif
 +
      // Configure hypervisor defaults
  
      //
+diff --git a/src/hv_exc.c b/src/hv_exc.c
+index 81382561..b67e555e 100644
+--- a/src/hv_exc.c
++++ b/src/hv_exc.c
+@@ -12,6 +12,7 @@
+ #include "aic.h"
+ #include "aic_regs.h"
+ #include "adt.h"
++#include "guest_msi.h"
+ 
+ #define TIME_ACCOUNTING
+ //
+@@ -1284,10 +1285,22 @@ void hv_exc_irq(struct exc_info *ctx)
+         return;
+     }
+ 
++    /*
++     * An AIC interrupt number is not a GIC INTID.  The guest's interrupt
++     * controller only describes INTIDs the emulated distributor models, and the
++     * APCIE MSI window starts at 1506; hv_vgic3_guest_vintid() maps the MSI
++     * window onto the SPI range the firmware advertises and reports 0 for an
++     * interrupt the guest has no number for.
++     */
++    u32 vintid = hv_vgic3_guest_vintid(irq);
++
++    if (!vintid)
++        return;
++
+     if(hv_vgic3_get_free_lr() != -1){
+         hv_vgic3_inject_irq(
+-            irq,                         //vintid
+-            hv_vgic3_get_priority(irq),  //priority
++            vintid,                      //vintid
++            hv_vgic3_get_priority(vintid),  //priority
+             false,                       //active
+             true,                        //pending
+             false,                       //hw_status
+@@ -1296,11 +1309,11 @@ void hv_exc_irq(struct exc_info *ctx)
+     }
+     else{
+         virq_t pending = { 
+-            .vintid = irq, 
++            .vintid = vintid, 
+             .priority = 0x40, 
+             .active = false, 
+-            .pending = true,
+-            .hw_status = false,
++            .pending = true, 
++            .hw_status = false, 
+             .hw_irq = 0,
+         };
+         virq_queue_push(&PERCPU(irq_queue), &pending);
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+index 2952c6ed..ef99c820 100644
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -36,6 +36,7 @@
+ #include "string.h"
+ #include "types.h"
+ #include "uartproxy.h"
++#include "guest_msi.h"
+ 
+ /**
+  * General idea of how this should work:
+@@ -1613,11 +1614,48 @@ int hv_vgicv3_enable_virtual_interrupts(void)
+     return 0;
+ }
+ 
++u32 hv_vgic3_guest_vintid(u32 aic_irq)
++{
++    static u32 dropped;
++    u32 vintid = guest_msi_intid(aic_irq);
++
++    if (vintid)
++        return vintid;
++
++    if (aic_irq <= GIC_LAST_SPI)
++        return aic_irq;
++
++    /*
++     * No guest INTID: the AIC numbers its interrupts past the end of the GIC's
++     * SPI range (the UART is 1046, the APCIE root complexes are 1231-1249).  A
++     * level-triggered source would be re-delivered forever, so it is masked.
++     */
++    if (dropped < 16)
++        vgic_log("HV vGIC: AIC interrupt %u has no guest INTID; masked\n", aic_irq);
++    else if (dropped == 16)
++        vgic_log("HV vGIC: further unmapped AIC interrupts are not logged\n");
++
++    dropped++;
++
++    if (aic)
++        aic_set_mask(aic_irq, true);
++
++    return 0;
++}
++
+ u8 hv_vgic3_get_priority(u64 intd){
+     u64 reg_num = 0;
+     u64 reg_offset = 0;
+     u8 *reg_val = NULL;
+-    
++
++    /*
++     * The priority banks end with the last INTID GICD_TYPER describes.  An INTID
++     * past that has no entry, and reading one anyway would take a byte from the
++     * target-register banks that follow in the same struct.
++     */
++    if(intd > GUEST_GIC_MAX_INTID)
++        return 0xff;
++
+     if(intd <= 15){
+         reg_num = intd / 4;
+         reg_offset = intd % 4;
+diff --git a/src/hv_vgic.h b/src/hv_vgic.h
+index 97130b44..45e514e0 100644
+--- a/src/hv_vgic.h
++++ b/src/hv_vgic.h
+@@ -594,6 +594,16 @@ void hv_vgicv3_init_list_registers(void);
+ 
+ int hv_vgicv3_enable_virtual_interrupts(void);
+ 
++/*
++ * Guest INTID for a physical AIC interrupt, or 0 when the guest has no INTID
++ * for it.  The MSI window is translated (see guest_msi.h); AIC interrupts up to
++ * the last SPI keep their number, which is what the earlier one-for-one
++ * forwarding did.  An interrupt the guest cannot represent is masked and
++ * reported once, because delivering it would make the guest's interrupt
++ * controller index state the emulated distributor does not describe.
++ */
++u32 hv_vgic3_guest_vintid(u32 aic_irq);
++
+ u8 hv_vgic3_get_priority(u64 intd);
+ 
+ int hv_vgic3_get_free_lr(void);
 diff --git a/src/pcie_guest.c b/src/pcie_guest.c
 new file mode 100644
 index 00000000..376abdc7

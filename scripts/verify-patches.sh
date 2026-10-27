@@ -57,7 +57,7 @@ verify "$ROOT/third_party/m1n1-windows" \
 
 verify "$ROOT/third_party/m1n1-windows" \
        "$ROOT/patches/m1n1-windows/0003-pcie-guest-handoff.patch" \
-       "m1n1-windows 0003 (PCIe guest hand-off)"
+       "m1n1-windows 0003 (PCIe and MSI hand-off)"
 
 verify "$ROOT/third_party/ntasp-firmware" \
        "$ROOT/patches/ntasp-firmware/0001-m4-uefi-platform.patch" \

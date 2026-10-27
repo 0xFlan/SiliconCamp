@@ -97,8 +97,9 @@ node's ECAM as:
 | `apcie` bus range | 0–8 |
 | PCIe 32-bit window | bus `0x80000000` → host `0xb80000000`, 1 GB |
 | PCIe host offset | `0xb00000000` (`PcdPciMmio32Translation` = `0xb00000000` = host − bus, same value as the DSDT `_TRA`) |
-| PCIe prefetch window | `0xbc0000000` → `0xbc0000000`, 512 MB |
-| PCIe MSI doorbell | `0xfffff000`, vector offset 1506 |
+| PCIe prefetch window | `0xbc0000000` → `0xbdfffffff`, 512 MB |
+| PCIe MSI doorbell | `0xfffff000`, vector offset 1506 (AIC 1506–1761) |
+| Guest MSI window | SPIs 512–767, MADT GIC MSI Frame + `src/guest_msi.h` |
 | ANS mailbox | `0x81600000` |
 | `dart-apcie0` / `dart-apcie2` | `0x90000000` / `0x92000000` |
 | Ethernet | Broadcom `14e4:1682` (`lan0`), BARs `0xb80000000`/`0xb80010000` |
@@ -119,14 +120,17 @@ The DSDT now carries `PCI0` and the MCFG table: `_CRS` exposes buses 0–8, the
 window (`0xbc0000000`+512 MB), and `RES0` reserves the 256 MB ECAM at
 `0x1cb0000000`. The APCIE DARTs are put into bypass by the m1n1 hand-off (patch
 0003, all streams with read-back verification), so a guest that gets past m1n1
-has an identity-mapped, untranslated DMA path. What is still missing for PCIe is
-MSI (`docs/pcie.md`), and the four `apciec` root complexes: the single
-host-bridge descriptor does not describe them.
+has an identity-mapped, untranslated DMA path. MSI is described by a GIC MSI
+Frame at the captured doorbell and translated by `guest_msi.c`, with the two ends
+checked against each other (`docs/pcie.md`); it has not run on hardware. What is
+still missing for PCIe is `_PRT`/IORT and the four `apciec` root complexes: the
+single host-bridge descriptor does not describe them.
 
 The internal SSD is an **Apple ANS2** controller, not a standard PCIe NVMe device.
-`AppleNANDStorageDxe` is a 22-line stub and no DSC includes it, so there is no
-ANS2 driver yet; USB storage is the intended installer path for the first
-Windows attempt.
+`AppleNANDStorageDxe` is a real driver in the UEFI image (ASC mailbox, RTKit,
+SART, NVMMU/NVMe queues, `EFI_BLOCK_IO_PROTOCOL`), but it has never run on
+hardware, so USB storage remains the intended installer path for the first
+Windows attempt (`docs/ans2.md`).
 
 ## Re-checking on this machine
 
