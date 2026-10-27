@@ -1,18 +1,21 @@
 # Build artifacts
 
 These are the outputs of the 2026-10-27 build on the `Mac16,3` / `J624` M4 iMac,
-published as release **v0.6.0**.
+published as release **v0.7.0**.
 
-Both images changed since v0.5.0:
+The UEFI image changed since v0.6.0; the two hypervisor images are byte-identical
+to v0.6.0 because no m1n1 source changed.
 
-- the hypervisor now carries a third patch, `0003-pcie-guest-handoff.patch`
-  (`src/pcie_guest.c`): it maps the APCIE ECAM and BAR windows into the guest's
-  stage 2 and puts every APCIE DART into bypass, verifying each stream by
-  read-back, so a guest with no APCIE driver still gets a root complex whose
-  devices can DMA;
-- the UEFI image fixes the sign of `PcdPciMmio32Translation` (`0xb00000000` =
-  host − bus, not bus − host). The previous value builds, boots and enumerates
-  and then places every BAR at a host address no device decodes.
+- the UEFI image now contains `AppleNANDStorageDxe`, a real driver for the
+  internal ANS/ANS2 SSD: ASC mailboxes, SART windows, RTKit handshake,
+  NVMMU/NVMe queues, `Identify`, and `EFI_BLOCK_IO_PROTOCOL`. It replaces a
+  comment-only stub and is the first firmware in this project that attempts to
+  address the internal disk. It has never run on hardware, so USB storage remains the
+  install target until the first boot log says otherwise (`../docs/ans2.md`).
+- the v0.6.0 changes remain: the hypervisor's `0003-pcie-guest-handoff.patch`
+  maps the APCIE ECAM and BAR windows into the guest's stage 2 and bypasses every
+  APCIE DART with per-stream read-back, and the UEFI image carries the corrected
+  `PcdPciMmio32Translation` sign (`0xb00000000` = host − bus).
 
 They are provided for review and for a hardware experiment that has **not** been
 run yet. Read `../docs/safety.md` before installing anything on the machine.
@@ -67,6 +70,10 @@ a dirty tree.
   and all three regions are mapped. `PCI0` is in the DSDT with `_HID`
   `PNP0A08`, `_CID` `PNP0A03`, an `_CRS` matching those windows, and `RES0`
   reserving the 256 MB ECAM aperture.
+- The internal SSD driver, `AppleNANDStorageDxe` (36 KB in the FV): it boots the
+  ANS coprocessor, programs the SART and NVMMU/NVMe queues and publishes the
+  disk as `EFI_BLOCK_IO_PROTOCOL`. It has not run on hardware; `docs/ans2.md`
+  maps the serial log to its bring-up steps.
 
 The final FD stores the ACPI tables compressed inside the Project Mu FV; the
 values above were checked from the build-tree `.aml`/`.acpi` files and the
@@ -100,7 +107,8 @@ larger than the whole image.
 - No description of the four `apciec0`–`apciec3` root complexes; `PCI0`
   describes only the first `apcie` node. Their DARTs are bypassed by the m1n1
   hand-off, and the hand-off prints their ECAMs at boot for the next capture.
-- No ANS2/SART driver for the internal SSD.
+- No *proven* ANS2 path: the driver is in the image, but the first hardware boot
+  decides whether the controller actually comes up.
 - No Windows drivers repository content; `third_party/ntasp-drivers` is still a
   skeleton.
 - No Secure Boot, TPM, or anti-cheat path.
@@ -112,7 +120,7 @@ larger than the whole image.
 ./scripts/build-uefi-linux.sh Mac16_3
 ```
 
-Then copy the two outputs into this directory and regenerate `SHA256SUMS`:
+Then copy the three outputs into this directory and regenerate `SHA256SUMS`:
 
 ```bash
 cp third_party/m1n1-windows/build/m1n1.bin artifacts/m1n1-windows.bin

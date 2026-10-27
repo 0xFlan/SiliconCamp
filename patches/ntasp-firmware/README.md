@@ -18,6 +18,17 @@ vendored NTASP tree at the commit recorded by the top-level repository:
   enumerates but leaves every device BAR decoding nowhere; the derivation is in
   the file's comment block and `scripts/check-acpi.py` now fails the build if the
   PCD, the DSDT `_CRS` and the captured values disagree.
+- `Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe` — the internal
+  SSD driver: ASC mailboxes, SART window table (all four register layouts),
+  RTKit handshake, NVMMU/NVMe queues, `Identify` and `EFI_BLOCK_IO_PROTOCOL`.
+  This replaces the 22-line comment-only stub that shipped in the tree. The
+  register-level sequence is a port of m1n1's `nvme.c`, `asc.c`, `sart.c` and
+  `rtkit.c`, and `scripts/check-ans2-constants.py` compares 110 constants
+  against those files so the port cannot drift. `docs/ans2.md` explains the
+  design and the parts that are deliberately left to the OS.
+- `Silicon/Apple/AppleSiliconPkg/AppleSiliconPkg.dsc.inc` and
+  `Platform/Mac16_3Pkg/Mac16_3.fdf` — build the ANS driver and place it in the
+  DXE FV, replacing the commented-out `AppleANS2Dxe` TODO.
 - `Platform/MacBookProEarly2023Pkg/PlatformBuild.py` — drop `cibuild` from the
   reference platform so AArch64 builds do not require the unreachable NuGet
   feeds.

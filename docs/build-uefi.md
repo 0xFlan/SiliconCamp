@@ -131,6 +131,17 @@ an invariant breaks. It parses the tables the build emits and checks:
 - the FD: ARM64 Image header, `text_offset` `0x80000`, and an `image_size` that
   covers the payload.
 
+The tables live inside a compressed FV, which is why the checker reads the
+build-tree `.aml`/`.acpi` output and not the FD.  Two things cannot be seen that
+way, so the build script checks them separately:
+
+- `AppleNANDStorageDxe` must be in `FV/Ffs`; a platform build that silently drops
+  the internal-storage driver would still pass every ACPI check.
+- The driver's hardware constants are compared against m1n1 by
+  `scripts/check-ans2-constants.py` (110 checks: register offsets, opcodes, DMA
+  flags, all four SART layouts, every RTKit field position).  It runs in CI
+  rather than in the build, so it also fails on a submodule bump.
+
 Run it on its own with `./scripts/check-acpi.py`; pass `--build-dir` for a build
 tree somewhere else.
 

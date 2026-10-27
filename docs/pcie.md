@@ -208,13 +208,16 @@ its ECAM mapped and a warning naming the missing values.
 Two different problems, often conflated:
 
 - **UEFI storage.** The in-box NVMe driver cannot talk to the internal SSD: it
-  is an Apple ANS controller, not a PCIe NVMe device. `AppleNANDStorageDxe`
-  exists in the tree but is a **22-line stub** with no DSC entry, so the
-  firmware has no driver for the internal disk and the first install must
-  target USB storage.
-- **Windows storage.** A Windows driver for ANS2 has to implement the ANS
-  mailbox, SART, and Apple's NVMe quirks (m1n1's `nvme.c` does this for the
-  bootloader). That is a kernel-mode driver project, not a firmware change, and
-  it needs the machine.
+  is an Apple ANS controller, not a PCIe NVMe device.  `AppleNANDStorageDxe` is
+  now a real driver rather than a stub: it boots the coprocessor through the ASC
+  mailbox and the RTKit handshake, programs the SART and the NVMMU/NVMe queues,
+  runs `Identify` and publishes the disk as `EFI_BLOCK_IO_PROTOCOL`.  It builds,
+  links into the FD, and its 110 hardware constants are checked against m1n1 on
+  every CI run — but it has **not run on hardware yet**.  See `docs/ans2.md`.
+- **Windows storage.** A Windows driver for ANS2 has to implement the same
+  protocol in kernel mode.  The UEFI driver is the reference implementation now,
+  and it leaves the controller enabled at `ExitBootServices` so that a future
+  Windows driver can adopt it instead of reproducing the mailbox handshake.
 
-Until both exist, USB is the install path, and `docs/status.md` keeps saying so.
+Until one of them has run on the machine, USB is the install path, and
+`docs/status.md` keeps saying so.

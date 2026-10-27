@@ -20,11 +20,13 @@ firmware `18000.161.10`.
 | M4 PSCI topology | T8132 tree is 2 clusters (6E+4P); ADT core count checked at init |
 | m1n1 PCIe hand-off | `src/pcie_guest.c` maps ECAM + BAR windows into stage 2 and bypasses every APCIE DART, verifying each stream by read-back |
 | Patch integrity | all five patches apply to their pinned commits (checked 2026-10-27); the m1n1-windows patches reproduce the submodule's whole working-tree diff, and a clean-tree + patches build reproduces the artifact hash bit-for-bit |
-| NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB), published as release `v0.6.0` |
+| NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB), published as release `v0.7.0` |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 47 pass (`python3 -m unittest discover -s tests`) |
+| Checker regression tests | 60 pass (`python3 -m unittest discover -s tests`) |
 | M4 ACPI tables | disassembled and checked (below) |
 | MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
+| ANS2 driver constants | 110 checks against m1n1's `nvme.c`/`asc.c`/`sart.c`/`rtkit.c` (`scripts/check-ans2-constants.py`) |
+| ANS2 driver in the image | `AppleNANDStorageDxe` (36 KB) linked into the DXE FV; absence fails the build script |
 | PCIe translation sign | `PcdPciMmio32Translation` = `0xb00000000` = host − bus == DSDT `_TRA`; checked in both directions, and a wrong sign fails the build |
 
 The `m1n1-windows` build uses `ENABLE_VGIC_MODULE` from `config.h` and produces a
@@ -93,7 +95,7 @@ them compressed inside the Project Mu FV), and enforced by
 | M4 USB path | Prepared, untested | Four DWC3 controllers are described by `PcdAppleNumDwc3Controllers`; the low 1 GB MMIO window (USB and USB DARTs) is mapped. The DWC3/XHCI stack still needs hardware validation. |
 | NTASP AIC DXE | Partial | AICv1/v2; AICv3 is an explicit TODO. The M4 package uses the vGIC path. |
 | NTASP Windows drivers | Empty | Repository is README-only. |
-| Internal NVMe/ANS2 | Missing | The internal SSD is an Apple ANS2 device, not a standard PCIe NVMe device. `AppleNANDStorageDxe` is a 22-line stub with no DSC entry; a USB disk is the current install path. |
+| Internal NVMe/ANS2 | Driver written, untested | `AppleNANDStorageDxe` boots the ANS coprocessor (ASC mailbox, RTKit handshake, SART windows), programs the NVMMU/NVMe queues, runs Identify and publishes `EFI_BLOCK_IO_PROTOCOL`. 36 KB DXE module, linked into the FV, 110 hardware constants checked against m1n1 on every CI run. Never executed on hardware; see `docs/ans2.md`. |
 | Windows kernel boot | Not achieved | Existing project hangs at loader-to-kernel handoff even on M1/M2. |
 | AGX GPU driver | None | No WDDM/D3D driver for any Apple Silicon GPU. |
 | Anti-cheat/trust | None | No Secure Boot/TPM/VBS/HVCI/IOMMU certification path. |
@@ -106,8 +108,8 @@ them compressed inside the Project Mu FV), and enforced by
    use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus
    `0x80000000` → host `0xb80000000`, offset `0xb00000000`), and the m1n1 side
    maps the windows and bypasses the APCIE DARTs. What remains is code, not
-   capture: MSI for the guest (below), the four `apciec` complexes, and an ANS2
-   driver (`AppleNANDStorageDxe` is a stub). Until the driver exists, USB
+   capture: MSI for the guest (below), the four `apciec` complexes, and the
+   first hardware run of the ANS storage driver. Until that run succeeds, USB
    storage is the only installer target.
 3. **MSI.** A device behind `PCI0` can enumerate and DMA but has no way to
    interrupt the guest: Apple's doorbell delivers an AIC interrupt that the
@@ -128,7 +130,7 @@ Every item below is blocked on the machine, not on code:
 | Epic | First action | Needs |
 |---|---|---|
 | Windows handoff | Boot m1n1 + UEFI once and capture the serial log. `exception.c` already prints ESR/ELR/FAR and "Unhandled exception, rebooting...", which localises the fault to a trap class. | the Mac, a data-capable USB-C cable, a serial capture |
-| ANS2 storage | Port m1n1's `nvme.c` (581 lines: ANS mailbox, SART, Apple NVMe quirks) to a UEFI `BlockIo` driver, then to a Windows KMDF driver. | the machine to test against; the two drivers are separate projects |
+| ANS2 storage | The UEFI `BlockIo` driver is written and in the image; boot it and read the first serial log (`docs/ans2.md` has the log-to-step map). | the machine; then a Windows KMDF driver, which is a separate project |
 | PCIe | MSI for the guest, then `apciec0`–`apciec3`. MCFG, `PCI0`/`_CRS`, the stage-2 windows and DART bypass are in place. | the machine to validate BAR assignment, DMA and interrupt delivery |
 | Drivers (DCP, SPI, SMC, USB, Wi-Fi) | One KMDF driver per block; each needs the hardware. | the machine plus a Windows test-signing setup |
 | GPU | No public WDDM driver for AGX exists; this is research, not a port. | GPU documentation/reverse engineering plus a machine |
