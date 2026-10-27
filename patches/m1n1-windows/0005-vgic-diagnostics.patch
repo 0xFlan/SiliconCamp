@@ -1,0 +1,473 @@
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+index 477d5333..42ecbe4c 100644
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -82,7 +82,41 @@
+ #define ITS_BASE_36_BIT 0xF20000000
+ #define ITS_BASE_42_BIT 0x5200000000
+ 
+-#define ENABLE_VGIC_LOGGING 1
++/*
++ * Diagnostic policy
++ * =================
++ *
++ * A guest that programs the GIC performs tens of thousands of register
++ * accesses.  Windows' HAL walks roughly 1020 SPIs at three registers each, one
++ * redistributor frame per CPU, and the GICR_*_BASER walk.  m1n1's console is a
++ * UART, so a printf() per access is not slow logging: at 115200 baud a 60-byte
++ * line is about 5 ms, and 30000 accesses is two and a half minutes of nothing
++ * but output, during which the guest quite reasonably concludes that the
++ * interrupt controller is wedged.  That failure mode is indistinguishable from
++ * the bug the logging was meant to find, which is why a build with
++ * ENABLE_VGIC_LOGGING set could not have booted an operating system.
++ *
++ * So the hot path never touches the UART.  It records into a ring buffer and a
++ * small set of counters (vgic_diag_record()), which is a handful of stores and
++ * is safe to call from an exception handler on any CPU.  Genuinely exceptional
++ * events -- an unknown register, a write to a read-only or RES0 field, a
++ * pending/active register the emulation does not model -- still print, but
++ * through a global budget (vgic_note()), so a guest that spins on a bug
++ * produces a bounded amount of output plus a count of what was suppressed.
++ *
++ * ENABLE_VGIC_LOGGING re-enables the full per-access trace for a targeted
++ * investigation.  It must stay 0 in any build that boots an OS.
++ *
++ * The ring and the counters live in `vgic_diag`, a global, so they can be read
++ * over the proxy after a hang -- which is exactly when there is no log to read,
++ * because the guest stopped talking.  From Python, with an existing HV session:
++ *
++ *     base = hv.resolve_symbol("vgic_diag")
++ *     accesses = iface.read64(base + 0)      # u64, see vgic_diag_t
++ *
++ * docs/vgic-diagnostics.md has the field offsets and what each one answers.
++ */
++#define ENABLE_VGIC_LOGGING 0
+ 
+ #if ENABLE_VGIC_LOGGING
+ #define vgic_log(...) printf(__VA_ARGS__)
+@@ -92,6 +126,136 @@
+     } while (0)
+ #endif
+ 
++/* Lines vgic_note() may emit before it goes quiet.  The hot path never uses it. */
++#define VGIC_WARN_BUDGET 32
++/* Accesses kept for post-mortem inspection. */
++#define VGIC_RING_SIZE 64
++
++/* What an exceptional event means, so the counters can be read without a log. */
++#define VGIC_NOTE_UNKNOWN    0 /* register the emulation does not know at all */
++#define VGIC_NOTE_RO         1 /* write to a read-only or RES0 field */
++#define VGIC_NOTE_UNMODELLED 2 /* register exists architecturally but has no model */
++#define VGIC_NOTE_KINDS      3
++
++/*
++ * One recorded access.  `space` is 'D' (distributor), 'R' (redistributor) or
++ * 'I' (ITS); `off` is the offset within that space, and within the frame for a
++ * redistributor, so a trace line reads the same way as the architectural
++ * register map.  `frame` is the redistributor frame index, or 0 elsewhere.
++ */
++typedef struct {
++    u64 val;
++    u32 off;
++    u8 space;
++    u8 frame;
++    u8 write;
++    u8 handled;
++    u8 width;
++} vgic_trace_entry;
++
++typedef struct {
++    u64 accesses;              /* every emulated access, handled or not */
++    u64 unknown;               /* VGIC_NOTE_UNKNOWN */
++    u64 ro_violation;          /* VGIC_NOTE_RO */
++    u64 unmodelled;            /* VGIC_NOTE_UNMODELLED */
++    u64 warnings;              /* lines vgic_note() actually printed */
++    u64 suppressed;            /* lines it refused to print */
++    u32 count;                 /* valid entries in ring, saturating */
++    u32 next;                  /* next ring slot */
++    vgic_trace_entry ring[VGIC_RING_SIZE];
++    /*
++     * One bit per 8 bytes of each space: did software ever touch it?  This is
++     * the question a hang asks and a trace cannot answer -- "did the guest wake
++     * redistributor 3 at all?" is one bit, not the last 64 accesses.  The
++     * redistributor bitmap is shared by all frames, so it answers "was this
++     * register ever accessed"; the ring says by which frame.
++     */
++    u64 dist_touched[0x10000 / 8 / 64];        /* distributor space is 64 KiB */
++    u64 redist_touched[GICR_FRAME_SIZE / 8 / 64]; /* one redistributor frame */
++} vgic_diag_t;
++
++vgic_diag_t vgic_diag;
++static u32 vgic_warned;
++
++/*
++ * Record one access.  Deliberately unsynchronised: a torn ring entry costs one
++ * confusing line in a post-mortem, while a lock here would cost the very thing
++ * this exists to avoid.  The two bitmaps use an atomic OR because a lost bit
++ * would be a false negative in the diagnostic that matters most.
++ */
++static void vgic_diag_touch(u64 *bitmap, u64 relative_addr)
++{
++    u64 bit = relative_addr >> 3;
++
++    __atomic_fetch_or(&bitmap[bit / 64], 1UL << (bit % 64), __ATOMIC_RELAXED);
++}
++
++static void vgic_diag_record(u8 space, u8 frame, u64 relative_addr, u64 val, bool write,
++                      bool handled, int width)
++{
++    vgic_trace_entry *entry;
++
++    vgic_diag.accesses++;
++
++    if (space == 'D' && relative_addr < 0x10000)
++        vgic_diag_touch(vgic_diag.dist_touched, relative_addr);
++    else if (space == 'R' && relative_addr < GICR_FRAME_SIZE)
++        vgic_diag_touch(vgic_diag.redist_touched, relative_addr);
++
++    entry = &vgic_diag.ring[vgic_diag.next];
++    entry->val = val;
++    entry->off = (u32)relative_addr;
++    entry->space = space;
++    entry->frame = frame;
++    entry->write = write ? 1 : 0;
++    entry->handled = handled ? 1 : 0;
++    entry->width = (u8)width;
++
++    vgic_diag.next = (vgic_diag.next + 1) % VGIC_RING_SIZE;
++    if (vgic_diag.count < VGIC_RING_SIZE)
++        vgic_diag.count++;
++}
++
++/*
++ * Account for one exceptional event, and decide whether to print it.  The
++ * budget is per boot, not per register, because the failure it guards against
++ * is a guest that loops on one register forever; the suppressed count is what
++ * tells a reader that the log was truncated.  Under SMP contention the
++ * increment can race, so the budget may over-run by at most num_cpus lines.
++ */
++static void vgic_diag_account(u8 kind)
++{
++    switch (kind) {
++    case VGIC_NOTE_UNKNOWN:
++        vgic_diag.unknown++;
++        break;
++    case VGIC_NOTE_RO:
++        vgic_diag.ro_violation++;
++        break;
++    case VGIC_NOTE_UNMODELLED:
++        vgic_diag.unmodelled++;
++        break;
++    }
++}
++
++static bool vgic_diag_wants_output(void)
++{
++    if (vgic_warned >= VGIC_WARN_BUDGET) {
++        vgic_diag.suppressed++;
++        return false;
++    }
++
++    vgic_diag.warnings = ++vgic_warned;
++    return true;
++}
++
++#define vgic_note(kind, ...)                                                                        \
++    do {                                                                                           \
++        vgic_diag_account(kind);                                                                   \
++        if (vgic_diag_wants_output())                                                              \
++            printf(__VA_ARGS__);                                                                   \
++    } while (0)
++
+ 
+ vgicv3_dist *distributor;
+ vgicv3_vcpu_redist *redistributors;
+@@ -152,19 +316,8 @@ static bool handle_vgic_its_access(struct exc_info *ctx, u64 addr, u64 *val, boo
+         }
+     }
+ 
+-    vgic_log("HV vGIC DEBUG [INFO] [ITS]: 0x%llx = 0x%llx ", relative_addr, *val);
+-    if(write) {
+-        vgic_log("[Written]");
+-    }
+-    else {
+-        vgic_log("[Read]");
+-    }
+-    if(unimplemented_reg_accessed) {
+-        vgic_log("[Unimplemented]\n");
+-    }
+-    else {
+-        vgic_log("\n");
+-    }
++    vgic_diag_record('I', 0, relative_addr, *val, write,
++                     register_handled && !unimplemented_reg_accessed, width);
+     return register_handled;
+ }
+ 
+@@ -211,7 +364,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     gicd_ctlr_new_val &= ~(GENMASK(30, 8));
+                     gicd_ctlr_new_val &= ~(GENMASK(3, 2));
+                     gicd_ctlr_new_val &= ~(BIT(5));
+-                    vgic_log("HV vGIC DEBUG [WARN]: guest attempted to write RES0 bits in GICD_CTLR, discarding\n");
++                    vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to write RES0 bits in GICD_CTLR, discarding\n");
+                 }
+                 
+                 if((gicd_ctlr_new_val & BIT(6)) == 0) {
+@@ -220,7 +373,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     // however we need to emit a warning because this means that our GIC configuration is wrong.
+                     //
+                     gicd_ctlr_new_val |= BIT(6);
+-                    vgic_log("HV vGIC DEBUG [WARN]: guest attempted to set DS = 0, discarding\n");
++                    vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to set DS = 0, discarding\n");
+                 }
+                 if((gicd_ctlr_new_val & BIT(4)) == 0) {
+                     //
+@@ -228,7 +381,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     // however we need to emit a warning because this means that our GIC configuration is wrong.
+                     //
+                     gicd_ctlr_new_val |= BIT(4);
+-                    vgic_log("HV vGIC DEBUG [WARN]: guest attempted to set ARE = 0, discarding\n");
++                    vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to set ARE = 0, discarding\n");
+                 }
+                 if((((gicd_ctlr_new_val & BIT(7)) != 0) && ((distributor->gicd_ctl_reg & BIT(7)) == 0)) 
+                 || (((gicd_ctlr_new_val & BIT(7)) == 0) && ((distributor->gicd_ctl_reg & BIT(7)) != 0))) {
+@@ -267,7 +420,8 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                 //
+                 // these registers are totally RO, so leave their values unchanged.
+                 //
+-                vgic_log("HV vGIC DEBUG [WARN]: guest attempted to change a read-only register (0x%x), discarding\n", relative_addr);
++                vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to change a read-only register (0x%x), discarding\n",
++                             (u32)relative_addr);
+                 register_handled = true;
+                 break;
+             case GIC_DIST_STATUSR:
+@@ -279,7 +433,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                 u32 gicd_statusr_current_val = distributor->gicd_err_sts;
+                 if((gicd_statusr_new_val & GENMASK(31, 4)) != 0) {
+                     gicd_statusr_new_val &= ~(GENMASK(31, 4));
+-                    vgic_log("HV vGIC DEBUG [WARN]: guest attempted to write RES0 bits in GICD_STATUSR, discarding\n");
++                    vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to write RES0 bits in GICD_STATUSR, discarding\n");
+                 }
+                 if(((gicd_statusr_new_val & BIT(3)) != 0) & ((gicd_statusr_current_val & BIT(3)) != 0)) {
+                     gicd_statusr_current_val &= ~(BIT(3));
+@@ -495,7 +649,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     //
+                     // TODO: do this
+                     //
+-                    vgic_log("HV vGIC DEBUG [ERROR]: ISPENDR not implemented for irq %d\n", irq_num);
++                    vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [ERROR]: ISPENDR not implemented for irq %d\n", irq_num);
+                 }
+             }
+             if(reg_num == 0) {
+@@ -535,7 +689,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     //
+                     // TODO: do this
+                     //
+-                    vgic_log("HV vGIC DEBUG [ERROR]: ICPENDR not implemented for irq %d\n", irq_num);
++                    vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [ERROR]: ICPENDR not implemented for irq %d\n", irq_num);
+                 }  
+             }
+             if(reg_num == 0) {
+@@ -573,7 +727,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     //
+                     // TODO: do this
+                     //
+-                    vgic_log("HV vGIC DEBUG [ERROR]: ISACTIVER not implemented for irq %d\n", irq_num);
++                    vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [ERROR]: ISACTIVER not implemented for irq %d\n", irq_num);
+                 }  
+             }
+             if(reg_num == 0) {
+@@ -610,7 +764,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     //
+                     // TODO: do this
+                     //
+-                    vgic_log("HV vGIC DEBUG [ERROR]: ICACTIVER not implemented for irq %d\n", irq_num);
++                    vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [ERROR]: ICACTIVER not implemented for irq %d\n", irq_num);
+                 }  
+             }
+             if(reg_num == 0) {
+@@ -634,7 +788,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+             //
+             // These are RES0 - since affinity routing is always enabled on Apple platforms.
+             //
+-            vgic_log("HV vGIC DEBUG [WARN]: GICD_ITARGETS registers are RES0 - discarding write\n");
++            vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: GICD_ITARGETS registers are RES0 - discarding write\n");
+             register_handled = true;
+ 
+         }
+@@ -653,7 +807,8 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+             //
+             // the register is unknown (or unimplemented) - print a warning.
+             //
+-            vgic_log("HV vGIC DEBUG [ERR] - guest attempted to access unknown register 0x%llx\n", relative_addr);
++            vgic_note(VGIC_NOTE_UNKNOWN, "HV vGIC [ERR] - guest attempted to access unknown register 0x%llx\n",
++                         (unsigned long long)relative_addr);
+             register_handled = true;
+             unimplemented_reg_accessed = true;
+         }
+@@ -814,24 +969,14 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+             //
+             // the register is unknown (or unimplemented) - print a warning.
+             //
+-            vgic_log("HV vGIC DEBUG [ERR] - guest attempted to access unknown register 0x%llx\n", relative_addr);
++            vgic_note(VGIC_NOTE_UNKNOWN, "HV vGIC [ERR] - guest attempted to access unknown register 0x%llx\n",
++                         (unsigned long long)relative_addr);
+             register_handled = true;
+             unimplemented_reg_accessed = true;
+         }
+     }
+-    vgic_log("HV vGIC DEBUG [INFO] [Distributor]: 0x%llx = 0x%llx ", relative_addr, *val);
+-    if(write) {
+-        vgic_log("[Written]");
+-    }
+-    else {
+-        vgic_log("[Read]");
+-    }
+-    if(unimplemented_reg_accessed) {
+-        vgic_log("[Unimplemented]\n");
+-    }
+-    else {
+-        vgic_log("\n");
+-    }
++    vgic_diag_record('D', 0, relative_addr, *val, write,
++                     register_handled && !unimplemented_reg_accessed, width);
+     return register_handled;
+ }
+ 
+@@ -879,6 +1024,12 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+     irq_num = 0;
+     reg_num = 0;
+     reg_offset = 0;
++    /*
++     * irq_num exists for the per-access trace below, which vgic_log() compiles
++     * out by default.  Reference it so enabling the trace later cannot silently
++     * break the build, and so this does not warn today.
++     */
++    (void)irq_num;
+ 
+     cpu_num = (u8)frame;
+     if(write) {
+@@ -912,7 +1063,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                     //
+                     gicr_ctlr_new_val &= ~(GENMASK(30, 27));
+                     gicr_ctlr_new_val &= ~(GENMASK(23, 4));
+-                    vgic_log("HV vGIC DEBUG [WARN]: guest attempted to write RES0 bits in GICR_CTLR, discarding\n");
++                    vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to write RES0 bits in GICR_CTLR, discarding\n");
+                 }
+ 
+                 //
+@@ -930,7 +1081,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                     // guest is attempting to clear these RO bits - discard the write.
+                     //
+                     gicr_ctlr_new_val |= (BIT(2) | BIT(1));
+-                    vgic_log("HV vGIC DEBUG [WARN]: guest attempted to write read-only bits in GICR_CTLR, discarding\n");
++                    vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to write read-only bits in GICR_CTLR, discarding\n");
+                 }
+ 
+                 //
+@@ -950,7 +1101,8 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 //
+                 // these are simple - the registers are read only so discard any write attempts.
+                 //
+-                vgic_log("HV vGIC DEBUG [WARN]: guest attempted to change a read-only register (0x%x), discarding\n", relative_addr);
++                vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to change a read-only register (0x%x), discarding\n",
++                             (u32)relative_addr);
+                 register_handled = true;
+                 break;
+             case GIC_REDIST_STATUSR:
+@@ -962,23 +1114,23 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 u32 gicr_statusr_current_val = redistributors[cpu_num].rd_region.gicr_status_reg;
+                 if((gicr_statusr_new_val & GENMASK(31, 4)) != 0) {
+                     gicr_statusr_new_val &= ~(GENMASK(31, 4));
+-                    vgic_log("HV vGIC DEBUG [WARN]: guest attempted to write RES0 bits in GICD_STATUSR, discarding\n");
++                    vgic_note(VGIC_NOTE_RO, "HV vGIC [WARN]: guest attempted to write RES0 bits in GICR_STATUSR, discarding\n");
+                 }
+                 if(((gicr_statusr_new_val & BIT(3)) != 0) & ((gicr_statusr_current_val & BIT(3)) != 0)) {
+                     gicr_statusr_current_val &= ~(BIT(3));
+-                    vgic_log("HV vGIC DEBUG [INFO]: clearing WROD bit in GICD_STATUSR\n");
++                    vgic_log("HV vGIC DEBUG [INFO]: clearing WROD bit in GICR_STATUSR\n");
+                 }
+                 if(((gicr_statusr_new_val & BIT(2)) != 0) & ((gicr_statusr_current_val & BIT(2)) != 0)) {
+                     gicr_statusr_current_val &= ~(BIT(2));
+-                    vgic_log("HV vGIC DEBUG [INFO]: clearing RWOD bit in GICD_STATUSR\n");
++                    vgic_log("HV vGIC DEBUG [INFO]: clearing RWOD bit in GICR_STATUSR\n");
+                 }
+                 if(((gicr_statusr_new_val & BIT(1)) != 0) & ((gicr_statusr_current_val & BIT(1)) != 0)) {
+                     gicr_statusr_current_val &= ~(BIT(1));
+-                    vgic_log("HV vGIC DEBUG [INFO]: clearing WRD bit in GICD_STATUSR\n");
++                    vgic_log("HV vGIC DEBUG [INFO]: clearing WRD bit in GICR_STATUSR\n");
+                 }
+                 if(((gicr_statusr_new_val & BIT(0)) != 0) & ((gicr_statusr_current_val & BIT(0)) != 0)) {
+                     gicr_statusr_current_val &= ~(BIT(0));
+-                    vgic_log("HV vGIC DEBUG [INFO]: clearing RRD bit in GICD_STATUSR\n");
++                    vgic_log("HV vGIC DEBUG [INFO]: clearing RRD bit in GICR_STATUSR\n");
+                 }
+                 redistributors[cpu_num].rd_region.gicr_status_reg = gicr_statusr_current_val;
+                 register_handled = true;
+@@ -1009,7 +1161,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 //
+                 // TODO: actually do the action here.
+                 //
+-                vgic_log("HV vGIC DEBUG [WARN]: GICR_SETLPIR is currently unimplemented!\n");
++                vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [WARN]: GICR_SETLPIR is currently unimplemented!\n");
+                 unimplemented_reg_accessed = true;
+                 register_handled = true;
+                 break;
+@@ -1018,7 +1170,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 //
+                 // TODO: actually do the action here.
+                 //
+-                vgic_log("HV vGIC DEBUG [WARN]: GICR_CLRLPIR is currently unimplemented!\n");
++                vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [WARN]: GICR_CLRLPIR is currently unimplemented!\n");
+                 unimplemented_reg_accessed = true;
+                 register_handled = true;
+                 break;
+@@ -1035,7 +1187,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 //
+                 // TODO: implement this. note that for INTID bits, bits 31:16 are unused since IDbits = 16 for us.
+                 //
+-                vgic_log("HV vGIC DEBUG [WARN]: GICR_INVLPIR is currently unimplemented!\n");
++                vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [WARN]: GICR_INVLPIR is currently unimplemented!\n");
+                 unimplemented_reg_accessed = true;
+                 register_handled = true;
+                 break;
+@@ -1045,7 +1197,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 // TODO: implement this.
+                 //
+                 redistributors[cpu_num].rd_region.gicr_invallr = 0;
+-                vgic_log("HV vGIC DEBUG [WARN]: GICR_INVALLR is currently unimplemented!\n");
++                vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [WARN]: GICR_INVALLR is currently unimplemented!\n");
+                 unimplemented_reg_accessed = true;
+                 register_handled = true;
+                 break;
+@@ -1053,7 +1205,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 //
+                 // this register is read only - but has special handling. currently unimplemented.
+                 //
+-                vgic_log("HV vGIC DEBUG [WARN]: GICR_SYNCR is currently unimplemented!\n");
++                vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [WARN]: GICR_SYNCR is currently unimplemented!\n");
+                 unimplemented_reg_accessed = true;
+                 register_handled = true;
+                 break;
+@@ -1432,19 +1584,8 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+         }
+         
+     }
+-    vgic_log("HV vGIC DEBUG [INFO] [Redistributor]: 0x%llx = 0x%llx ", relative_addr, *val);
+-    if(write) {
+-        vgic_log("[Written]");
+-    }
+-    else {
+-        vgic_log("[Read]");
+-    }
+-    if(unimplemented_reg_accessed) {
+-        vgic_log("[Unimplemented]\n");
+-    }
+-    else {
+-        vgic_log("\n");
+-    }
++    vgic_diag_record('R', (u8)frame, relative_addr, *val, write,
++                     register_handled && !unimplemented_reg_accessed, width);
+     return register_handled;
+ }
+ 

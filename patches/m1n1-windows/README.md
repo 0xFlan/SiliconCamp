@@ -1,9 +1,9 @@
 # m1n1-windows patches
 
-Four patches apply to the NTASP `m1n1_windows` commit pinned by this
-repository. They are cumulative (0002 assumes 0001, 0003 assumes both, 0004
-assumes all three), so the order below is part of the contract, and
-`verify-patches.sh` applies the whole series, in order, to one pristine worktree:
+Five patches apply to the NTASP `m1n1_windows` commit pinned by this
+repository. They are cumulative (each assumes every earlier one), so the order
+below is part of the contract, and `verify-patches.sh` applies the whole series,
+in order, to one pristine worktree:
 
 | Patch | Files | What it fixes |
 |---|---|---|
@@ -11,6 +11,7 @@ assumes all three), so the order below is part of the contract, and
 | `0002-psci-t8132.patch` | `src/hv_psci.c`, `src/hv_psci.h`, `src/hv_exc.c` | Adds the M4 power-domain tree (two clusters: six E-cores, four P-cores), the T8132 PMGR CPU-start offset, ADT bounds/count checks, per-CPU PSCI state, and Aff1:Aff0 MPIDR normalisation. Without the first part, `hv_psci_init()` had no `T8132` case and read an unset `topology_tree` pointer. |
 | `0003-pcie-guest-handoff.patch` | `src/pcie_guest.c`, `src/pcie_guest.h`, `src/guest_msi.c`, `src/guest_msi.h` (new), `src/dart.c`, `src/dart.h`, `src/hv.c`, `src/hv_exc.c`, `src/hv_vgic.c`, `src/hv_vgic.h`, `src/proxy.c`, `src/proxy.h`, `proxyclient/m1n1/proxy.py`, `Makefile`, `config.h` | Hands PCIe and MSI to a guest that has no APCIE driver: maps the controllers' ECAM and BAR windows into the guest's stage 2, puts every APCIE DART into bypass (all streams, verified by read-back), programs each port's MSI map and unmasks the AIC vectors it raises, and translates AIC interrupt numbers into the guest's INTID window. Replaces the unconditional `pcie_shutdown()` in `hv_init()`, which left a Windows guest with no root complex at all. |
 | `0004-vgic-guest-contract.patch` | `src/hv_vgic.c`, `src/hv_vgic.h`, `src/hv_exc.c`, `src/guest_msi.c`, `src/guest_msi.h` | Makes the emulated distributor and redistributors behave the way a GICv3 guest is entitled to assume: decode each redistributor frame from its address instead of the faulting CPU, complete `GICR_WAKER` wake sequences, never leave `RWP` set, stop advertising LPI capabilities nothing implements, and translate every guest INTID into an AIC number before masking it, unmasking it, or routing it. |
+| `0005-vgic-diagnostics.patch` | `src/hv_vgic.c` | Takes the UART write off the interrupt-controller hot path: the per-access trace becomes a 64-entry ring buffer plus counters in a global, and only genuinely exceptional events print, through a 32-line budget. Without this, a guest that programs ~1020 SPIs stalls for minutes in `printf()`, which looks exactly like a hang in the vGIC. |
 
 ## Why 0002 is not optional on M4
 
@@ -177,6 +178,49 @@ contract against the patches (no submodule needed) and against patched sources,
 and `tests/test_check_vgic.py` mutates the series to prove each assertion fails
 when the defect is put back.
 
+## Why 0005 exists
+
+0004 made the emulated GIC correct. 0005 makes it *observable* without making it
+slow, and it is a boot hazard in its own right rather than a nicety.
+
+`hv_vgic.c` built with `ENABLE_VGIC_LOGGING 1`, so the last three lines of every
+emulated register access were three `printf()` calls. m1n1's console is a UART:
+at 115200 baud a 60-byte line costs about 5 ms. A guest that programs the GIC
+performs tens of thousands of accesses — Windows' HAL walks roughly 1020 SPIs at
+three registers each, plus one redistributor frame per PE — so the first thing a
+real operating system would do is spend minutes inside the debug console while
+its watchdog concludes the interrupt controller is dead. The most likely first
+boot failure was therefore going to be the logging, and it would have presented
+as a hang in the code the logging was added to debug.
+
+Deleting the trace would have made the next hang silent, so it was replaced:
+
+| Question | Mechanism |
+|---|---|
+| What did the guest do just before it stopped? | a 64-entry ring of `(space, frame, offset, value, write, handled, width)` |
+| Did the guest ever touch this register? | one bit per 8 bytes, per space, updated with an atomic OR |
+| Something is wrong and I want to know now | `vgic_note()`, capped at 32 lines per boot |
+
+The rings and counters live in `vgic_diag`, a global, so they are readable over
+the proxy *after* a hang — which is the case that matters, because a hung guest
+prints nothing at all. `docs/vgic-diagnostics.md` documents the field offsets and
+walks a Python reader through them.
+
+The severity split is not new: the source already tagged its messages `[INFO]`,
+`[WARN]` and `[ERROR]`. 0005 makes the behaviour match the tag — `[INFO]` traces
+go to the ring, `[WARN]`/`[ERROR]` go through the budget, because an exceptional
+event must print but must not be trusted to be rare.
+
+The budget is what makes this safe against the failure mode it exists for. A
+guest that spins on an unknown register would otherwise reprint that line
+forever; with the budget the first 32 appear, `vgic_diag.suppressed` counts the
+rest, and the difference between "32 lines" and "thirty thousand lines" is the
+difference between a readable log and a stall.
+
+`scripts/check-vgic.py` fails if any patch sets `ENABLE_VGIC_LOGGING` back to 1,
+if a handler prints instead of recording, or if an exceptional site bypasses the
+budget.
+
 ## The SMC trace
 
 `hv_handle_smc()` used to print the PSCI function ID on every guest SMC. That is
@@ -189,7 +233,7 @@ bring-up. It is now behind `DEBUG_PSCI_SMC` (off by default); define it in
 
 ```bash
 ./scripts/apply-patches.sh          # the whole series, idempotent
-./scripts/verify-patches.sh         # applies 0001-0004 in order to a clean worktree of the pin
+./scripts/verify-patches.sh         # applies 0001-0005 in order to a clean worktree of the pin
 ./scripts/check-vgic.py             # asserts the vGIC contract against the series
 ```
 
@@ -208,7 +252,8 @@ diff against the commit:
 ```bash
 TMP=$(mktemp -d)
 git -C third_party/m1n1-windows worktree add --detach "$TMP/tree" HEAD
-for p in 0001-vgic-m4-topology 0002-psci-t8132 0003-pcie-guest-handoff; do
+for p in 0001-vgic-m4-topology 0002-psci-t8132 0003-pcie-guest-handoff \
+         0004-vgic-guest-contract; do
     git -C "$TMP/tree" apply "$PWD/patches/m1n1-windows/$p.patch"
 done
 # make the base a commit, so the diff below contains only this patch
@@ -217,11 +262,11 @@ git -C "$TMP/tree" -c user.email=build@local -c user.name=build commit -qm base
 
 # copy the files this patch owns out of the working tree, then:
 git -C "$TMP/tree" add -A
-git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0004-vgic-guest-contract.patch
+git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0005-vgic-diagnostics.patch
 ```
 
 Skipping the base commit is the mistake that silently produces a 1000-line patch
-containing 0001-0003 as well. Verify the result by applying the whole series to
+containing the whole earlier series as well. Verify the result by applying the whole series to
 a fresh worktree and confirming it reproduces the working tree:
 
 ```bash
@@ -232,6 +277,6 @@ diff -r --exclude=.git --exclude=build --exclude='*.o' \
 Then run `./scripts/verify-patches.sh`, `./scripts/check-vgic.py --tree
 third_party/m1n1-windows`, and rebuild with `./scripts/build-m1n1.sh`. As a
 reproducibility check, the series as committed builds
-`m1n1.macho` = `7559eb588df7…` and `m1n1.bin` = `355a19b2b5be…` (SHA-256), the
-same bytes as the working tree it was generated from.
+`m1n1.macho` = `667cd3ce09f7…` and `m1n1.bin` = `20f98b1638603c9a…` (SHA-256),
+the same bytes as the working tree it was generated from.
 

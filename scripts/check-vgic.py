@@ -104,7 +104,17 @@ def strip_c(text: str) -> str:
             end = n if end < 0 else end
             blank(i, end)
             i = end
-        elif c in "\"'":
+        elif c == '"':
+            #
+            # String literals are blanked: prose in them ("guest attempted to
+            # write RES0 bits") must never satisfy a code check.  Character
+            # literals are deliberately *not* blanked, because this file's code
+            # uses them to name things -- vgic_diag_record('D', ...) -- and a
+            # checker that cannot see the 'D' cannot tell which address space a
+            # trace call belongs to.  A char literal cannot contain a brace or a
+            # comment delimiter, so leaving it intact cannot unbalance the
+            # brace matching below.
+            #
             quote = c
             j = i + 1
             while j < n:
@@ -344,6 +354,54 @@ def check_tree(ck: Checker, tree: str) -> None:
              "hv_vgic.c: every aic_set_affinity() call passes a translated AIC number "
              f"(found {sorted(set(affinity_args)) or 'none'})")
 
+    ck.section("Diagnostics: the hot path never writes to the UART")
+    ck.check(re.search(r"#define\s+ENABLE_VGIC_LOGGING\s+0\b", vgic) is not None,
+             "hv_vgic.c: ENABLE_VGIC_LOGGING is 0, so vgic_log() is compiled out")
+    ck.check(re.search(r"\[Written\]", vgic) is None,
+             "hv_vgic.c: the per-access '[Written]' trace is gone, not merely disabled")
+    ck.check(re.search(r"\bstatic\s+void\s+vgic_diag_record\s*\(", vgic) is not None,
+             "hv_vgic.c: the hot path records into vgic_diag_record()")
+    for name, space in (("handle_vgic_dist_access", "D"),
+                        ("handle_vgic_redist_access", "R"),
+                        ("handle_vgic_its_access", "I")):
+        body = function_body(vgic, name)
+        ck.check(re.search(r"vgic_diag_record\s*\(\s*'%s'\s*," % space, body) is not None,
+                 f"{name}(): records into the ring as space '{space}'")
+        ck.check(re.search(r"\bprintf\s*\(", body) is None,
+                 f"{name}(): no raw printf() in the per-access path "
+                 f"(vgic_log() expands to nothing when ENABLE_VGIC_LOGGING is 0)")
+    ck.check(re.search(r"vgic_diag_record\s*\(\s*'R'\s*,\s*\(\s*u8\s*\)\s*frame", redist) is not None,
+             "handle_vgic_redist_access(): the trace carries the frame, so a hang names the vCPU")
+
+    ck.section("Diagnostics: exceptional events are counted and budgeted")
+    ck.check(re.search(r"#define\s+VGIC_WARN_BUDGET\s+[1-9]\d*", vgic) is not None,
+             "hv_vgic.c: VGIC_WARN_BUDGET bounds how much a broken guest can print")
+    wants = function_body(vgic, "vgic_diag_wants_output")
+    ck.check("VGIC_WARN_BUDGET" in wants and "suppressed" in wants,
+             "vgic_diag_wants_output(): past the budget it counts the line and stays quiet")
+    for kind in ("UNKNOWN", "RO", "UNMODELLED"):
+        ck.check(re.search(r"vgic_note\s*\(\s*VGIC_NOTE_%s\s*," % kind, vgic) is not None,
+                 f"hv_vgic.c: VGIC_NOTE_{kind} is reachable from a call site")
+    loud = [m.group(0) for m in re.finditer(r"vgic_log\s*\([^;]*", vgic)
+            if re.search(r"\[WARN\]|\[ERROR\]|\[ERR\]", m.group(0))]
+    ck.check(not loud,
+             "hv_vgic.c: every [WARN]/[ERROR] site is a budgeted vgic_note(), not a vgic_log()"
+             + (f" (found {len(loud)} unbudgeted)" if loud else ""))
+
+    ck.section("Diagnostics: the state survives a hang and can be read over the proxy")
+    ck.check(re.search(r"^vgic_diag_t\s+vgic_diag\s*;", vgic, re.M) is not None,
+             "hv_vgic.c: vgic_diag is a global, so its address is a symbol the proxy can resolve")
+    record = function_body(vgic, "vgic_diag_record")
+    ck.check("VGIC_RING_SIZE" in record,
+             "vgic_diag_record(): the ring is a fixed-size array, not an allocation")
+    ck.check(re.search(r"count\s*<\s*VGIC_RING_SIZE", record) is not None,
+             "vgic_diag_record(): count saturates, so a full ring is not mistaken for a wrap")
+    ck.check("__atomic_fetch_or" in function_body(vgic, "vgic_diag_touch"),
+             "vgic_diag_touch(): the touched bitmaps use an atomic OR, so no CPU loses a bit")
+    ck.check(re.search(r"redist_touched\s*\[\s*GICR_FRAME_SIZE", vgic) is not None,
+             "vgic_diag: the redistributor bitmap is sized from GICR_FRAME_SIZE, "
+             "so it cannot drift from the frame decode")
+
 
 # --------------------------------------------------------------------------
 # The same contract, expressed against the shipped patch series.
@@ -397,6 +455,21 @@ MUST_ADD = (
      "guest_msi_aic_irq() is the inverse of guest_msi_intid()"),
     ("src/guest_msi.h", r"u32\s+guest_msi_aic_irq\s*\(\s*u32\s+intid\s*\)\s*;",
      "guest_msi_aic_irq() is declared for the vGIC and exception paths"),
+    # --- 0005: diagnostics ---------------------------------------------------
+    ("src/hv_vgic.c", r"#define\s+ENABLE_VGIC_LOGGING\s+0\b",
+     "the per-access trace is compiled out, so no UART write sits on the hot path"),
+    ("src/hv_vgic.c", r"#define\s+VGIC_WARN_BUDGET\s+[1-9]\d*",
+     "exception output is bounded by a budget"),
+    ("src/hv_vgic.c", r"^vgic_diag_t\s+vgic_diag\s*;",
+     "vgic_diag is a global symbol, readable over the proxy after a hang"),
+    ("src/hv_vgic.c", r"vgic_diag_record\s*\(\s*'D'\s*,",
+     "distributor accesses are recorded instead of printed"),
+    ("src/hv_vgic.c", r"vgic_diag_record\s*\(\s*'R'\s*,\s*\(\s*u8\s*\)\s*frame\s*,",
+     "redistributor accesses are recorded with their frame index"),
+    ("src/hv_vgic.c", r"__atomic_fetch_or",
+     "the 'was this register ever touched' bitmaps are updated atomically"),
+    ("src/hv_vgic.c", r"vgic_note\s*\(\s*VGIC_NOTE_UNKNOWN\s*,",
+     "an unknown register is counted and reported through the budget"),
 )
 
 MUST_REMOVE = (
@@ -424,6 +497,11 @@ MUST_REMOVE = (
      "GICD_TYPER no longer advertises LPIs"),
     ("src/hv_exc.c", r"aic_set_mask\s*\(\s*intd\s*,\s*false\s*\)",
      "the LR-EOI path no longer passes a guest INTID to the AIC"),
+    # --- 0005: diagnostics ---------------------------------------------------
+    ("src/hv_vgic.c", r"#define\s+ENABLE_VGIC_LOGGING\s+1\b",
+     "the per-access trace is no longer enabled by default"),
+    ("src/hv_vgic.c", r"\[Written\]",
+     "the per-access '[Written]' trace lines are gone"),
 )
 
 MUST_NOT_ADD = (
@@ -445,6 +523,10 @@ MUST_NOT_ADD = (
      "aic_set_affinity() takes an AIC number, never a raw guest INTID"),
     ("src/hv_exc.c", r"aic_set_mask\s*\(\s*intd\b",
      "aic_set_mask() takes an AIC number, never a raw guest INTID"),
+    ("src/hv_vgic.c", r"#define\s+ENABLE_VGIC_LOGGING\s+1\b",
+     "no patch may turn the per-access UART trace back on"),
+    ("src/hv_vgic.c", r'vgic_log\s*\(\s*"HV vGIC \[(WARN|ERR)',
+     "an exceptional event must go through the budgeted vgic_note()"),
 )
 
 

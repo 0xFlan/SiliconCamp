@@ -233,21 +233,34 @@ reserve as a bisection tool.
 
 ### Offline, no hardware
 
-1. **Ship `0004` and the vGIC contract checker.** *(done in this change)*
+1. **Ship `0004` and the vGIC contract checker.** *(done)*
    `scripts/check-vgic.py` asserts the contract against the patch series (no
    submodule) and against patched sources; `tests/test_check_vgic.py` puts each
    defect back and requires the checker to fail.
 
-2. **Turn vGIC logging into an opt-in diagnostic.**
-   `hv_vgic.c` currently defines `ENABLE_VGIC_LOGGING 1`, so `vgic_log()` is a
-   `printf()` on **every emulated register access**. **Verified.** A Windows HAL
-   programming ~1020 INTIDs, plus a redistributor walk per CPU, is tens of
-   thousands of UART writes before the kernel prints anything; at any realistic
-   console speed that is not a slow boot, it is a hang that looks like a hang for
-   a different reason. This wants its own patch: compile the logging out by
-   default, and replace the hot-path prints with a small set of one-shot
-   diagnostics (first N accesses per register class, plus counters readable over
-   the proxy).
+2. **Turn vGIC logging into an opt-in diagnostic.** *(done in this change)*
+   `hv_vgic.c` defined `ENABLE_VGIC_LOGGING 1`, so `vgic_log()` was a `printf()`
+   on **every emulated register access**. **Verified.** At 115200 baud a 60-byte
+   line costs about 5 ms, so a Windows HAL programming ~1020 INTIDs plus a
+   redistributor walk per CPU spent minutes inside the console; that is not a
+   slow boot, it is a stall indistinguishable from the bug the logging existed to
+   find.
+
+   `0005-vgic-diagnostics.patch` compiles the trace out and replaces it with
+   three mechanisms, chosen because they answer three different questions:
+   a 64-entry ring of recent accesses (*what did the guest do just before it
+   stopped?*), one-bit-per-8-bytes touched bitmaps per space (*did it ever touch
+   this register?*), and a 32-line budget for genuinely exceptional events
+   (*something is wrong, tell me now, but do not let a spinning guest flood the
+   UART*). Everything lives in the global `vgic_diag`, so it is readable over the
+   proxy **after** a hang — the case that matters, because a hung guest prints
+   nothing. Field offsets and a Python reader are in `docs/vgic-diagnostics.md`.
+
+   The severity rule is not new invention: the source already tagged messages
+   `[INFO]`, `[WARN]`, `[ERROR]`. 0005 makes behaviour match the tag, and
+   `scripts/check-vgic.py` fails if a later patch restores the per-access
+   printing, prints instead of recording, or lets an exceptional site bypass the
+   budget. **machine-checked.**
 
 3. **Decide the `IROUTER` question honestly.** `aic_set_affinity()` is a no-op on
    AICv3. Either find the AICv3 redirection mechanism, or report
@@ -282,9 +295,10 @@ reserve as a bisection tool.
 |---|---|---|
 | The contract fixes are right but incomplete | Windows hangs in the vGIC anyway, with a different bug | The self-test (step 4) enumerates the whole surface, not just the fixed registers |
 | Apple's CPU interface diverges from the architecture in ways only a real guest finds | Guest `ICC_*` behaviour differs from what the emulated distributor implies | Nothing offline can detect this; it is what hardware is for |
-| `ENABLE_VGIC_LOGGING` stays on | First boot looks like a hang at the first interrupt | Step 2 |
+| `ENABLE_VGIC_LOGGING` is turned back on | First boot looks like a hang at the first interrupt | Step 2 shipped `0005`; the checker fails if any patch restores it |
 | The ACPI tables describe the vGIC accurately but Windows ignores the MSI frame | MSI never works | `check-acpi.py` already pins the frame against `guest_msi.h`; the self-test should read the doorbell back |
-| Deterministic-build claim is mistaken | Patches and artifacts drift | The series reproduces the working tree and rebuilds to `m1n1.macho = 7559eb58…`, `m1n1.bin = 355a19b2…` (**verified** on 2026-10-27) |
+| Deterministic-build claim is mistaken | Patches and artifacts drift | The series reproduces the working tree and rebuilds to `m1n1.macho = 667cd3ce…`, `m1n1.bin = 20f98b16…` (**verified** on 2026-10-27) |
+| The diagnostics are mistaken for a conformance test | A green log is read as "the vGIC is correct" | The ring records what the guest *did*, not whether it was correct; the conformance question is the UEFI self-test (step 4) |
 
 ---
 
