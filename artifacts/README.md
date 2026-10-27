@@ -1,12 +1,12 @@
 # Build artifacts
 
-These are the outputs of the 2026-10-26 build on the `Mac16,3` / `J624` M4 iMac.
-They replace the v0.3.1 m1n1 images: the hypervisor now carries the M4 PSCI
-topology patch (`patches/m1n1-windows/0002-psci-t8132.patch`), without which
-`hv_psci_init()` had no `T8132` case and read an unset topology pointer. The
-UEFI image is unchanged from v0.3.1 and still has the corrected PCIe windows
-(the v0.3.0 images were one hex digit short: `0xb8000000` instead of
-`0xb80000000`).
+These are the outputs of the 2026-10-27 build on the `Mac16,3` / `J624` M4 iMac.
+The hypervisor is unchanged from v0.4.0 and still carries the M4 vGIC and PSCI
+topology patches (`0001-vgic-m4-topology.patch`, `0002-psci-t8132.patch`). The
+UEFI image is new: it adds an MCFG table and a `PCI0` root bridge whose `_CRS`
+is derived from the captured J624 windows, so Windows can find the APCIE ECAM
+and enumerate the first root complex. The APCIE DARTs are still not programmed,
+so devices can enumerate but cannot DMA yet.
 They are provided for review and for a hardware experiment that has **not** been
 run yet. Read `../docs/safety.md` before installing anything on the machine.
 
@@ -26,7 +26,7 @@ checked against.
 ## SHA-256
 
 ```
-8b966b02fb9418b449d21209625265c7dae1edec4f25c768193020ba510c7c00  MAC16_3_EFI.fd
+fad14536dc21528c78bf406a60fe703712302982426dacf7eec28b434e4e2870  MAC16_3_EFI.fd
 82f5372f8aa8f1c88806be1e36b62797954d2cb5d65fe000586e2f028c3f0258  m1n1-windows.bin
 cb13046385fb274188c10c00e38e800542669c526910a23f441181b39fd4ce38  m1n1-windows.macho
 ```
@@ -49,11 +49,15 @@ clean-checkout + patches, not a dirty tree.
 - FADT: desktop profile, hardware-reduced ACPI, PSCI compliant, SMC conduit.
 - DBG2: `_SB.COM0` at `0x3ad200000`.
 - The low 1 GB MMIO window is mapped for the four DWC3 controllers and their
-  DARTs; the DSDT intentionally does not describe PCIe yet.
+  DARTs.
+- MCFG: one ECAM entry at `0x1cb0000000`, segment 0, buses 0–8.
 - PCIe: the first APCIE root complex (`apcie@B0000000`) is configured from the
   captured J624 values — ECAM `0x1cb0000000`+256 MB, bus range 0–8, host window
   `0xb80000000`+1 GB (offset `0xb00000000`), prefetch `0xbc0000000`+512 MB —
-  and all three regions are mapped. `PCI0` is not in the DSDT.
+  and all three regions are mapped. `PCI0` is now in the DSDT with `_HID`
+  `PNP0A08`, `_CID` `PNP0A03`, `_CRS` matching those windows, and `RES0`
+  reserving the 256 MB ECAM aperture. Devices can enumerate, but the APCIE
+  DARTs are not programmed, so they cannot DMA.
 
 The final FD stores the ACPI tables compressed inside the Project Mu FV; the
 values above were checked from the build-tree `.aml`/`.acpi` files and the
@@ -64,8 +68,9 @@ upstream's value (`0x100E0000`) was larger than the whole image.
 
 ## What is not in this image
 
-- No `PCI0` root bridge in the DSDT, no APCIE DART driver, and no description
-  of the four `apciec0`–`apciec3` root complexes.
+- No APCIE DART programming or driver, so PCIe devices cannot DMA yet.
+- No description of the four `apciec0`–`apciec3` root complexes; `PCI0`
+  describes only the first `apcie` node.
 - No ANS2/SART driver for the internal SSD.
 - No Windows drivers repository content; `third_party/ntasp-drivers` is still a
   skeleton.

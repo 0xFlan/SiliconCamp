@@ -50,6 +50,17 @@ class Platform:
     uart_base: int
     uart_irq: int
     fd_size: int
+    #: PCIe root complex contract.  All zero when the platform has no MCFG or
+    #: PCI0; otherwise MCFG and the DSDT _CRS are checked against these.
+    pcie_ecam: int = 0
+    pcie_ecam_size: int = 0
+    pcie_bus_min: int = 0
+    pcie_bus_max: int = 0
+    pcie_mmio32_bus: int = 0
+    pcie_mmio32_host: int = 0
+    pcie_mmio32_size: int = 0
+    pcie_prefetch: int = 0
+    pcie_prefetch_size: int = 0
 
 
 # Sources for every value are recorded in docs/hardware-values.md.
@@ -67,6 +78,16 @@ PLATFORMS: dict[str, Platform] = {
         uart_base=0x3AD200000,
         uart_irq=1046,
         fd_size=0x1E00000,
+        # Captured from apcie@B0000000; see docs/pcie.md for the raw cells.
+        pcie_ecam=0x1CB0000000,
+        pcie_ecam_size=0x10000000,
+        pcie_bus_min=0,
+        pcie_bus_max=8,
+        pcie_mmio32_bus=0x80000000,
+        pcie_mmio32_host=0xB80000000,
+        pcie_mmio32_size=0x40000000,
+        pcie_prefetch=0xBC0000000,
+        pcie_prefetch_size=0x20000000,
     ),
 }
 
@@ -301,26 +322,61 @@ def aml_string(data: bytes, device: dict, name: str) -> str | None:
     return data[start:end].decode("ascii", "replace")
 
 
+def aml_method_return(data: bytes, device: dict, name: str) -> int | None:
+    """Return the integer from ``Method(name) { Return (<integer>) }``."""
+    off = device["name_end"]
+    while True:
+        off = data.find(b"\x14", off, device["end"])
+        if off < 0:
+            return None
+        try:
+            length, length_bytes = aml_pkg_length(data, off + 1)
+            method_name, name_bytes = aml_name(data, off + 1 + length_bytes)
+        except (IndexError, ValueError):
+            off += 1
+            continue
+        if method_name != name:
+            off += 1
+            continue
+        body_start = off + 1 + length_bytes + name_bytes + 1  # skip flags
+        end = min(off + 1 + length, device["end"])
+        returned = data.find(b"\xA4", body_start, end)      # ReturnOp
+        if returned < 0:
+            return None
+        try:
+            return aml_integer(data, returned + 1)[0]
+        except (IndexError, ValueError):
+            return None
+
+
 def aml_resources(data: bytes, device: dict, name: str):
-    """Parse ``Name(name, ResourceTemplate)`` into (QWordMemory, GSIVs)."""
+    """Parse ``Name(name, ResourceTemplate)`` into its address descriptors.
+
+    Returns (memories, gsivs, buses).  A memory descriptor is
+    (minimum, maximum, translation, length); a bus descriptor is the same
+    shape.  The translation matters for PCI0: the J624 32-bit window is a
+    bus address plus a host offset, and a checker that only looks at the
+    minimum cannot tell the two address spaces apart.
+    """
     marker = b"\x08" + name.encode("ascii")
     off = data.find(marker, device["name_end"], device["end"])
     if off < 0:
-        return [], []
+        return [], [], []
     off += len(marker)
     if data[off:off + 1] != b"\x11":            # BufferOp
-        return [], []
+        return [], [], []
     try:
         length, length_bytes = aml_pkg_length(data, off + 1)
         end = off + 1 + length
         size, size_bytes = aml_integer(data, off + 1 + length_bytes)
     except (IndexError, ValueError):
-        return [], []
+        return [], [], []
     start = off + 1 + length_bytes + size_bytes
     buf = data[start:min(end, start + size)]
 
-    memories: list[tuple[int, int, int]] = []
+    memories: list[tuple[int, int, int, int]] = []
     gsivs: list[int] = []
+    buses: list[tuple[int, int, int, int]] = []
     pos = 0
     while pos + 3 <= len(buf):
         tag = buf[pos]
@@ -329,13 +385,23 @@ def aml_resources(data: bytes, device: dict, name: str):
         count = buf[pos + 1] | (buf[pos + 2] << 8)
         body = buf[pos + 3:pos + 3 + count]
         if tag == 0x8A and len(body) >= 43:      # QWordMemory
-            _, minimum, maximum, _, length64 = struct.unpack_from("<QQQQQ", body, 3)
-            memories.append((minimum, maximum, length64))
+            _, minimum, maximum, translation, length64 = \
+                struct.unpack_from("<QQQQQ", body, 3)
+            memories.append((minimum, maximum, translation, length64))
+        elif tag == 0x87 and len(body) >= 23:    # DWordMemory
+            _, minimum, maximum, translation, length32 = \
+                struct.unpack_from("<IIIII", body, 3)
+            memories.append((minimum, maximum, translation, length32))
+        elif tag == 0x88 and len(body) >= 13 and body[0] == 0x02:
+            # WordBusNumber: address space descriptor, resource type 2.
+            minimum, maximum, translation, length16 = \
+                struct.unpack_from("<HHHH", body, 5)
+            buses.append((minimum, maximum, translation, length16))
         elif tag == 0x89 and len(body) >= 2:     # extended interrupt
             for index in range(body[1]):
                 gsivs.append(struct.unpack_from("<I", body, 2 + 4 * index)[0])
         pos += 3 + count
-    return memories, gsivs
+    return memories, gsivs, buses
 
 
 def acpi_header(data: bytes, name: str, ck: Checker) -> bool:
@@ -557,6 +623,29 @@ def check_dbg2(data: bytes, ck: Checker, plat: Platform) -> None:
              f"DBG2: debug UART at 0x{base:x} == 0x{plat.uart_base:x}")
 
 
+def check_mcfg(data: bytes, ck: Checker, plat: Platform) -> None:
+    """Check the ECAM base and bus range Windows will use for PCIe."""
+    if not ck.check(plat.pcie_ecam != 0,
+                    "MCFG: platform has a PCIe contract"):
+        return
+    if not ck.check(len(data) >= 60,
+                    f"MCFG: {len(data)} bytes hold the header and one entry"):
+        return
+    reserved = struct.unpack_from("<Q", data, 36)[0]
+    ck.check(reserved == 0, "MCFG: reserved header field is zero")
+    count = (len(data) - 44) // 16
+    if not ck.check(count == 1,
+                    f"MCFG: one allocation entry (found {count})"):
+        return
+    base, segment, start, end, _ = struct.unpack_from("<QHBBI", data, 44)
+    ck.check(base == plat.pcie_ecam,
+             f"MCFG: ECAM base 0x{base:x} == 0x{plat.pcie_ecam:x}")
+    ck.check(segment == 0, f"MCFG: segment 0 (got {segment})")
+    ck.check((start, end) == (plat.pcie_bus_min, plat.pcie_bus_max),
+             f"MCFG: buses {start}-{end} == "
+             f"{plat.pcie_bus_min}-{plat.pcie_bus_max}")
+
+
 def check_dsdt(data: bytes, ck: Checker, plat: Platform) -> None:
     count = len(plat.cores)
     runs = cluster_runs(plat.cores)
@@ -567,7 +656,7 @@ def check_dsdt(data: bytes, ck: Checker, plat: Platform) -> None:
 
     names = [f"CPU{i}" for i in range(count)]
     names += [f"CLU{i}" for i in range(len(runs))]
-    names += ["DIE0", "COM0"]
+    names += ["DIE0", "COM0", "PCI0", "RES0"]
     present = [ck.check(name in found, f"DSDT: {name} device present")
                for name in names]
     if not all(present):
@@ -599,13 +688,74 @@ def check_dsdt(data: bytes, ck: Checker, plat: Platform) -> None:
 
     hid = aml_string(body, found["COM0"], "_HID")
     ck.check(hid == "APPL8900", f"DSDT: COM0 _HID {hid!r} == 'APPL8900'")
-    memories, gsivs = aml_resources(body, found["COM0"], "_CRS")
-    want_memory = (plat.uart_base, plat.uart_base + 0xFFF, 0x1000)
+    memories, gsivs, _ = aml_resources(body, found["COM0"], "_CRS")
+    want_memory = (plat.uart_base, plat.uart_base + 0xFFF, 0, 0x1000)
     ck.check(memories == [want_memory],
              f"DSDT: COM0 _CRS is 0x{plat.uart_base:x}+0x1000 "
-             f"(got {[(hex(a), hex(b), hex(c)) for a, b, c in memories]})")
+             f"(got {[(hex(a), hex(b), hex(c), hex(d)) for a, b, c, d in memories]})")
     ck.check(gsivs == [plat.uart_irq],
              f"DSDT: COM0 _CRS interrupt {gsivs} == [{plat.uart_irq}]")
+
+    #
+    # PCI0 is the root bridge for the first APCIE node.  MCFG and the _CRS
+    # have to agree with each other and with the captured bus/host windows;
+    # a device BAR assigned on the wrong side of the translation decodes
+    # nowhere, which is exactly the failure mode this project already hit.
+    #
+    pci = found["PCI0"]
+    ck.check(aml_string(body, pci, "_HID") == "PNP0A08",
+             f"DSDT: PCI0 _HID {aml_string(body, pci, '_HID')!r} == 'PNP0A08'")
+    ck.check(aml_string(body, pci, "_CID") == "PNP0A03",
+             f"DSDT: PCI0 _CID {aml_string(body, pci, '_CID')!r} == 'PNP0A03'")
+    ck.check(aml_string(body, pci, "_UID") == "PCI0",
+             f"DSDT: PCI0 _UID {aml_string(body, pci, '_UID')!r} == 'PCI0'")
+    ck.check(aml_property(body, pci, "_SEG") == 0,
+             f"DSDT: PCI0 _SEG {aml_property(body, pci, '_SEG')} == 0")
+    ck.check(aml_property(body, pci, "_BBN") == 0,
+             f"DSDT: PCI0 _BBN {aml_property(body, pci, '_BBN')} == 0")
+    ck.check(aml_property(body, pci, "_CCA") == 1,
+             f"DSDT: PCI0 _CCA is DMA coherent")
+    cba = aml_method_return(body, pci, "_CBA")
+    ck.check(cba == plat.pcie_ecam,
+             f"DSDT: PCI0 _CBA 0x{cba:x} == 0x{plat.pcie_ecam:x}" if cba is not None
+             else "DSDT: PCI0 _CBA present")
+
+    pci_memories, _, pci_buses = aml_resources(body, pci, "_CRS")
+    want_bus = (plat.pcie_bus_min, plat.pcie_bus_max, 0,
+                plat.pcie_bus_max - plat.pcie_bus_min + 1)
+    ck.check(pci_buses == [want_bus],
+             f"DSDT: PCI0 _CRS bus range {pci_buses} == "
+             f"{[want_bus]}")
+    want_32 = (
+        plat.pcie_mmio32_bus,
+        plat.pcie_mmio32_bus + plat.pcie_mmio32_size - 1,
+        plat.pcie_mmio32_host - plat.pcie_mmio32_bus,
+        plat.pcie_mmio32_size,
+    )
+    want_prefetch = (
+        plat.pcie_prefetch,
+        plat.pcie_prefetch + plat.pcie_prefetch_size - 1,
+        0,
+        plat.pcie_prefetch_size,
+    )
+    ck.check(pci_memories == [want_32, want_prefetch],
+             f"DSDT: PCI0 _CRS windows {[(hex(a), hex(b), hex(c), hex(d)) for a, b, c, d in pci_memories]} "
+             f"== {[(hex(a), hex(b), hex(c), hex(d)) for a, b, c, d in [want_32, want_prefetch]]}")
+
+    res = found["RES0"]
+    ck.check(aml_string(body, res, "_HID") == "PNP0C02",
+             f"DSDT: RES0 _HID {aml_string(body, res, '_HID')!r} == 'PNP0C02'")
+    res_memories, _, _ = aml_resources(body, res, "_CRS")
+    want_ecam = (
+        plat.pcie_ecam,
+        plat.pcie_ecam + plat.pcie_ecam_size - 1,
+        0,
+        plat.pcie_ecam_size,
+    )
+    ck.check(res_memories == [want_ecam],
+             f"DSDT: RES0 _CRS ECAM "
+             f"{[(hex(a), hex(b), hex(c), hex(d)) for a, b, c, d in res_memories]} "
+             f"== {[(hex(a), hex(b), hex(c), hex(d)) for a, b, c, d in [want_ecam]]}")
 
 
 def check_image(build_dir: str, ck: Checker, plat: Platform) -> None:
@@ -735,7 +885,8 @@ def main() -> int:
 
     ck = Checker()
     order = [("MADT", "APIC"), ("PPTT", "PPTT"), ("FADT", "FACP"),
-             ("DSDT", "DSDT"), ("DBG2", "DBG2"), ("GTDT", "GTDT")]
+             ("DSDT", "DSDT"), ("MCFG", "MCFG"), ("DBG2", "DBG2"),
+             ("GTDT", "GTDT")]
     for label, sig in order:
         path = tables.get(sig)
         if path is None:
@@ -754,6 +905,8 @@ def main() -> int:
             check_fadt(data, ck)
         elif sig == "DSDT":
             check_dsdt(data, ck, plat)
+        elif sig == "MCFG":
+            check_mcfg(data, ck, plat)
         elif sig == "DBG2":
             check_dbg2(data, ck, plat)
         elif sig == "GTDT":

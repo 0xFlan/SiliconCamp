@@ -8,8 +8,8 @@ hardware validation.
 
 - `Silicon/Apple/T8132FamilyPkg` — T8132 PCDs, 10-core MADT, 6E+4P PPTT,
   M4 virtual memory map, `MemoryInitPeiLib`, `MsPlatformDevicesLib`.
-- `Platform/Mac16_3Pkg` — `Mac16,3`/J624 DSC/FDF, DSDT, FADT, DBG2, device ACPI
-  tables, SMBIOS strings, vGIC build.
+- `Platform/Mac16_3Pkg` — `Mac16,3`/J624 DSC/FDF, DSDT with `PCI0`, FADT,
+  MCFG, DBG2, device ACPI tables, SMBIOS strings, vGIC build.
 
 The firmware builds successfully:
 
@@ -34,6 +34,10 @@ every build:
   device has `_UID` 0–9. `COM0` is `APPL8900` at `0x3ad200000`, interrupt 1046.
 - **FADT** — desktop profile, hardware-reduced ACPI, PSCI compliant, SMC conduit.
 - **DBG2** — `_SB.COM0` at `PcdAppleUartBase`.
+- **MCFG** — one ECAM entry at `0x1cb0000000`, segment 0, buses 0–8.
+- **DSDT `PCI0`** — `PNP0A08`/`PNP0A03`, `_CRS` bus 0–8, 32-bit window
+  bus `0x80000000`+1 GB (translation `0xb00000000`), prefetch
+  `0xbc0000000`+512 MB, and `RES0` reserving the 256 MB ECAM.
 
 The DRAM alias is 1 TB, the size is 24 GB, the FD is based at 1 TB + 3 GB, and the
 boot args/ADT copies are at 1 TB + 8.5 GB. Those values are documented with their
@@ -78,10 +82,10 @@ DSC values are fallbacks, not hard limits.
 ## USB and storage
 
 The M4 has four DWC3 controllers and four USB DARTs. `PcdAppleNumDwc3Controllers`
-is 4; `AppleUsbTypeCBringupDxe` skips the two DFU controllers (0 and 2) and brings
-up the host controllers (1 and 3). The low 1 GB MMIO window (which contains both
-the DWC3 blocks and the USB DARTs) is mapped as device memory in
-`BuildVirtualMemoryMap`.
+and `PcdAppleNumDwc3Darts` are both 4; `AppleUsbTypeCBringupDxe` skips the two DFU
+controllers (0 and 2) and brings up the host controllers (1 and 3). The low 1 GB
+MMIO window (which contains both the DWC3 blocks and the USB DARTs) is mapped as
+device memory in `BuildVirtualMemoryMap`.
 
 The internal SSD is an Apple ANS2 device, not a standard PCIe NVMe controller.
 `AppleNANDStorageDxe` is a 22-line stub with no DSC entry, so the first Windows
@@ -111,15 +115,20 @@ Only the first root complex (`apcie@B0000000`) is described. `apciec0`–`apciec
 are separate complexes with their own ECAMs (starting at `0x1c50000000`), bus
 ranges and apertures; a single host-bridge descriptor cannot represent them.
 
-PCIe is still omitted from the DSDT, so Windows sees no root bridge yet.
-Finishing it requires:
+`MCFG` and `PCI0` are now in the firmware. MCFG declares one ECAM entry at
+`0x1cb0000000` for buses 0–8. `PCI0` is `PNP0A08`/`PNP0A03` with a `_CRS`
+matching the captured windows: bus 0–8, the 32-bit window bus `0x80000000`+1 GB
+translated by `0xb00000000` to host `0xb80000000`, the prefetch window
+`0xbc0000000`+512 MB, and `RES0` reserving the 256 MB ECAM. `PcdPciExpressBarSize`
+and `PcdPciExpressBarLimit` are now set for T8132 (`0x10000000` and
+`0x1CBFFFFFFF`) so the reservation cannot drift.
 
-1. writing `PCI0` and its `_CRS` from the captured windows —
-   `PcdPciExpressBarSize`/`PcdPciExpressBarLimit` are not defined for T8132, so
-   the resource template has to be derived here rather than copied;
-2. enabling the APCIE DARTs (`0x90000000`, `0x92000000`) so devices can DMA;
-3. deciding how to describe the four `apciec` complexes (one host bridge each);
-4. validating BAR assignment and the guest MSI path on hardware. In the vGIC
+The APCIE DARTs are still not programmed, so a device can enumerate but cannot
+DMA. What remains:
+
+1. programming the APCIE DARTs (`0x90000000`, `0x92000000`) and validating DMA;
+2. describing the four `apciec` complexes (one host bridge each);
+3. validating BAR assignment and the guest MSI path on hardware. In the vGIC
    build MSIs go through the emulated ITS at `0x5200000000`; Apple's
    `0xfffff000` doorbell is only used by a bare-metal AIC build.
 

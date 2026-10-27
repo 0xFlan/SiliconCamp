@@ -99,7 +99,7 @@ class TestCheckerPasses(FixtureCase):
 
     def test_reports_which_tables_it_read(self) -> None:
         result = run_checker(self.build_dir)
-        for label in ("MADT", "PPTT", "FADT", "DSDT", "DBG2", "GTDT"):
+        for label in ("MADT", "PPTT", "FADT", "DSDT", "MCFG", "DBG2", "GTDT"):
             self.assertIn(label, result.stdout)
 
     def test_image_checks_run(self) -> None:
@@ -184,6 +184,66 @@ class TestCheckerRejects(FixtureCase):
         result = run_checker(self.build_dir)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("GTDT: table present", result.stdout)
+
+    def test_missing_mcfg(self) -> None:
+        # PCI0 without an MCFG entry still boots, but Windows has no way to
+        # find configuration space; the build must not quietly omit it.
+        os.remove(self.table("MCFG*"))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("MCFG: table present", result.stdout)
+
+    def test_wrong_mcfg_bus_range(self) -> None:
+        # Header is 44 bytes; EndBusNumber is the last byte of the entry.
+        self.patch_bytes(self.table("MCFG*"), 55, b"\x07")
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("MCFG: buses", result.stdout)
+
+    def test_wrong_pci0_window(self) -> None:
+        # The DSDT 32-bit window carries host - bus = 0xb00000000.  A wrong
+        # translation is the exact failure the project already hit once, and
+        # it leaves every device BAR decoding nowhere.
+        dsdt = self.table("DSDT.aml")
+        with open(dsdt, "rb") as f:
+            data = f.read()
+        needle = struct.pack("<Q", 0xB00000000)
+        offset = data.find(needle)
+        self.assertGreater(offset, 0, "fixture lost PCI0's translation")
+        self.patch_bytes(dsdt, offset, struct.pack("<Q", 0xB00001000))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("PCI0 _CRS windows", result.stdout)
+
+    def test_wrong_pci0_cba(self) -> None:
+        # _CBA is what Windows uses to map ECAM; MCFG and RES0 can be right
+        # while this method returns a different window.
+        dsdt = self.table("DSDT.aml")
+        with open(dsdt, "rb") as f:
+            data = f.read()
+        cba = data.find(b"_CBA")
+        self.assertGreater(cba, 0, "fixture lost PCI0's _CBA")
+        offset = data.find(struct.pack("<Q", 0x1CB0000000), cba)
+        self.assertGreater(offset, 0, "fixture lost _CBA's return value")
+        self.patch_bytes(dsdt, offset, struct.pack("<Q", 0x1CB1000000))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("PCI0 _CBA", result.stdout)
+
+    def test_wrong_res0_ecam(self) -> None:
+        # RES0 has to reserve the whole 256 MB ECAM aperture, not just the
+        # first window the compiler happened to see.
+        dsdt = self.table("DSDT.aml")
+        with open(dsdt, "rb") as f:
+            data = f.read()
+        res0 = data.find(b"RES0")
+        self.assertGreater(res0, 0, "fixture lost RES0")
+        offset = data.find(struct.pack("<Q", 0x1CB0000000), res0)
+        self.assertGreater(offset, 0, "fixture lost RES0's ECAM base")
+        self.patch_bytes(dsdt, offset, struct.pack("<Q", 0x1CB1000000))
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("RES0 _CRS ECAM", result.stdout)
 
     def test_truncated_table(self) -> None:
         dsdt = self.table("DSDT.aml")

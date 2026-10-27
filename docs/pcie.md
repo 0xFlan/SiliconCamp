@@ -108,20 +108,38 @@ The iMac has four more: `apciec0`–`apciec3` at `0x50000000`, `0x60000000`,
 `0x1c60000000` were decoded from `apciec0`/`apciec1`) and its own apertures; a
 single `PCI_ROOT_BRIDGE` cannot represent them.
 
+## MCFG and PCI0 (2026-10-27)
+
+`DeviceAcpiTables.inf` now emits `MCFG.aslc`, and `DSDT.asl` describes `PCI0`.
+Both are pinned by `scripts/check-acpi.py`:
+
+- **MCFG**: ECAM `0x1cb0000000`, segment 0, buses 0–8.
+- **PCI0**: `_HID` `PNP0A08`, `_CID` `PNP0A03`, `_SEG`/`_BBN` 0, `_CCA` 1,
+  and `_CBA` returning `0x1cb0000000`.
+- **`_CRS`**: bus 0–8; the 32-bit window is bus `0x80000000`–`0xbfffffff`
+  with translation `0xb00000000` (host `0xb80000000`–`0xbbfffffff`); the
+  prefetchable window is `0xbc0000000`–`0xbdfffffff`.
+- **`RES0`**: reserves the 256 MB ECAM, `0x1cb0000000`–`0x1cbfffffff`.
+
+The `_CRS` translation is **host - bus** (`+0xb00000000`), while
+`PcdPciMmio32Translation` is **bus - host** (`0xFFFFFFF500000000`). The host
+bridge library flips the sign when it builds the root-bridge descriptor; the
+checker pins both representations so a future edit cannot silently use the
+wrong direction.
+
+Devices behind `PCI0` can enumerate, but the APCIE DARTs are still not
+programmed, so DMA will fault until the DART driver handles them.
+
 ## What is still missing
 
-1. **`PCI0` in the DSDT.** Still absent on purpose. `PcdPciExpressBarSize` and
-   `PcdPciExpressBarLimit` are not defined anywhere for T8132 (only T600X and
-   T810X define them), so a `_CRS` has to be written from the windows captured
-   above and checked against them, not copied from another package.
-2. **DART enablement.** `dart-apcie0` (`0x90000000`) and `dart-apcie2`
+1. **DART enablement.** `dart-apcie0` (`0x90000000`) and `dart-apcie2`
    (`0x92000000`) have to be mapped and either bypassed or programmed before
    devices can DMA. `AppleDartIoMmuDxe` exists in the tree but has not run on
    this machine.
-3. **The `apciec` root complexes.** Their ECAMs, bus ranges (0–128) and
+2. **The `apciec` root complexes.** Their ECAMs, bus ranges (0–128) and
    apertures need the same capture-then-wire treatment before Thunderbolt or
-   USB4 devices can appear.
-4. **MSI wiring.** In the vGIC build the guest's MSI path is the emulated GIC
+   USB4 devices can appear. `PCI0` describes only `apcie@B0000000`.
+3. **MSI wiring.** In the vGIC build the guest's MSI path is the emulated GIC
    ITS at `0x5200000000`, so Apple's `0xfffff000` doorbell is not used. It only
    matters for a bare-metal `AIC_BUILD=TRUE` build, and then the doorbell range
    must be mapped and programmed into the AIC.
