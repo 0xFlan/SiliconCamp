@@ -152,6 +152,12 @@ class MissingTreeIsNotAnError(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
         self.assertIn("skip", result.stdout)
 
+    # Reaching the m1n1 sources with a driver header present is exactly the
+    # state the repository describes, so without the firmware submodule this
+    # test would only re-test the "header not found" path.  The checks job runs
+    # without submodules; the patch-applicability job runs this suite with the
+    # patched firmware tree and exercises it.
+    @unittest.skipUnless(DRIVER.exists(), "ntasp-firmware submodule not checked out")
     def test_missing_sources_in_a_present_tree_is_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = subprocess.run(
