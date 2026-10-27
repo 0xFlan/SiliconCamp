@@ -42,6 +42,11 @@ Windows bootmgr -> winload -> Windows kernel  (EL1 guest)
 ./scripts/build-uefi-linux.sh Mac16_3   # requires the Lima VM; see docs/build-uefi.md
 ```
 
+The patch steps leave `third_party/m1n1-windows` and `third_party/ntasp-firmware`
+dirty. That is expected: the patches, not submodule pointer commits, are the
+source of truth, and `verify-patches.sh` is what proves they still apply to the
+pinned commits.
+
 `python3 -m unittest discover -s tests` runs the checker's regression tests
 against the M4 tables an earlier build produced and against mutated copies of
 them. It needs no hardware, no firmware build, and nothing beyond Python 3, and
