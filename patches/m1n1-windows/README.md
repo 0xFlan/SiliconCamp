@@ -1,6 +1,6 @@
 # m1n1-windows patches
 
-Five patches apply to the NTASP `m1n1_windows` commit pinned by this
+Six patches apply to the NTASP `m1n1_windows` commit pinned by this
 repository. They are cumulative (each assumes every earlier one), so the order
 below is part of the contract, and `verify-patches.sh` applies the whole series,
 in order, to one pristine worktree:
@@ -12,6 +12,7 @@ in order, to one pristine worktree:
 | `0003-pcie-guest-handoff.patch` | `src/pcie_guest.c`, `src/pcie_guest.h`, `src/guest_msi.c`, `src/guest_msi.h` (new), `src/dart.c`, `src/dart.h`, `src/hv.c`, `src/hv_exc.c`, `src/hv_vgic.c`, `src/hv_vgic.h`, `src/proxy.c`, `src/proxy.h`, `proxyclient/m1n1/proxy.py`, `Makefile`, `config.h` | Hands PCIe and MSI to a guest that has no APCIE driver: maps the controllers' ECAM and BAR windows into the guest's stage 2, puts every APCIE DART into bypass (all streams, verified by read-back), programs each port's MSI map and unmasks the AIC vectors it raises, and translates AIC interrupt numbers into the guest's INTID window. Replaces the unconditional `pcie_shutdown()` in `hv_init()`, which left a Windows guest with no root complex at all. |
 | `0004-vgic-guest-contract.patch` | `src/hv_vgic.c`, `src/hv_vgic.h`, `src/hv_exc.c`, `src/guest_msi.c`, `src/guest_msi.h` | Makes the emulated distributor and redistributors behave the way a GICv3 guest is entitled to assume: decode each redistributor frame from its address instead of the faulting CPU, complete `GICR_WAKER` wake sequences, never leave `RWP` set, stop advertising LPI capabilities nothing implements, and translate every guest INTID into an AIC number before masking it, unmasking it, or routing it. |
 | `0005-vgic-diagnostics.patch` | `src/hv_vgic.c` | Takes the UART write off the interrupt-controller hot path: the per-access trace becomes a 64-entry ring buffer plus counters in a global, and only genuinely exceptional events print, through a 32-line budget. Without this, a guest that programs ~1020 SPIs stalls for minutes in `printf()`, which looks exactly like a hang in the vGIC. |
+| `0006-vgic-honest-spi-routing.patch` | `src/hv_vgic.c`, `src/hv_vgic.h` | Sets `GICD_TYPER.No1N` so the distributor does not claim 1-of-N SPI selection it never performs, treats a `GICD_IROUTER.IRM` write of 1 as 0 (the behaviour the architecture permits when `No1N` is set), and keeps bit 31 out of the stored routing value so read-back cannot report a mode that never runs. |
 
 ## Why 0002 is not optional on M4
 
@@ -221,6 +222,39 @@ difference between a readable log and a stall.
 if a handler prints instead of recording, or if an exceptional site bypasses the
 budget.
 
+## Why 0006 exists
+
+`GICD_TYPER.No1N` was 0, which tells a guest that the distributor supports
+1-of-N SPI routing: the guest may set `GICD_IROUTER.IRM` and let the distributor
+pick a participating PE. This vGIC has no such selection — `hv_exc_irq()`
+injects the virtual interrupt into whichever physical CPU took the AIC line —
+and it does not model the `GICR_CTLR.DPG0`/`DPG1S`/`DPG1NS` bits through which a
+PE opts out of that distribution (`0004` already had to clear `DPGS` in
+`GICR_TYPER` for the same reason). Advertising the mode invited a guest to rely
+on a selection that never happens.
+
+The architecture gives a way out. When `No1N` is 1, 1-of-N is not supported and
+a write of 1 to `GICD_IROUTER.IRM` is CONSTRAINED UNPREDICTABLE; one permitted
+behaviour is that the field acts as if it were 0 for all purposes. 0006 takes
+that behaviour, clears bit 31 before storing the routing value, and reports the
+normalised value on read-back. The guest's original write is still what the
+diagnostic ring records, because that is the useful half of the event.
+
+`No1N` is a capability bit about the emulated device. It does not make Apple's
+AIC able to move an SPI: `aic_set_affinity()` returns early unless the AIC is
+version 1, and AICv2/v3 have no software-programmable per-SPI CPU target.
+Linux's `aic2_chip`/`aic3_chip` has no `irq_set_affinity` at all, and the
+`IRQ_CFG.TARGET` field m1n1 programs at boot comes from the ADT's
+`aic-ext-intr-cfg` and selects a die. So `GICD_IROUTER` writes are decoded,
+translated and stored, but on the M4 the AIC still decides which PE takes the
+interrupt. That gap is documented in `docs/architecture.md`; closing it would
+mean forwarding an acknowledged physical interrupt to another CPU's software
+queue, which is not attempted before the conformance self-test can measure
+where interrupts actually land.
+
+`scripts/check-vgic.py` fails if a later patch drops `No1N`, accepts `IRM`
+without normalising it, or stores the raw routing value.
+
 ## The SMC trace
 
 `hv_handle_smc()` used to print the PSCI function ID on every guest SMC. That is
@@ -233,7 +267,7 @@ bring-up. It is now behind `DEBUG_PSCI_SMC` (off by default); define it in
 
 ```bash
 ./scripts/apply-patches.sh          # the whole series, idempotent
-./scripts/verify-patches.sh         # applies 0001-0005 in order to a clean worktree of the pin
+./scripts/verify-patches.sh         # applies 0001-0006 in order to a clean worktree of the pin
 ./scripts/check-vgic.py             # asserts the vGIC contract against the series
 ```
 
@@ -253,7 +287,7 @@ diff against the commit:
 TMP=$(mktemp -d)
 git -C third_party/m1n1-windows worktree add --detach "$TMP/tree" HEAD
 for p in 0001-vgic-m4-topology 0002-psci-t8132 0003-pcie-guest-handoff \
-         0004-vgic-guest-contract; do
+         0004-vgic-guest-contract 0005-vgic-diagnostics; do
     git -C "$TMP/tree" apply "$PWD/patches/m1n1-windows/$p.patch"
 done
 # make the base a commit, so the diff below contains only this patch
@@ -262,7 +296,7 @@ git -C "$TMP/tree" -c user.email=build@local -c user.name=build commit -qm base
 
 # copy the files this patch owns out of the working tree, then:
 git -C "$TMP/tree" add -A
-git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0005-vgic-diagnostics.patch
+git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0006-vgic-honest-spi-routing.patch
 ```
 
 Skipping the base commit is the mistake that silently produces a 1000-line patch
@@ -277,6 +311,6 @@ diff -r --exclude=.git --exclude=build --exclude='*.o' \
 Then run `./scripts/verify-patches.sh`, `./scripts/check-vgic.py --tree
 third_party/m1n1-windows`, and rebuild with `./scripts/build-m1n1.sh`. As a
 reproducibility check, the series as committed builds
-`m1n1.macho` = `667cd3ce09f7…` and `m1n1.bin` = `20f98b1638603c9a…` (SHA-256),
+`m1n1.macho` = `222b6f9bf8e8…` and `m1n1.bin` = `c59b4f143f48…` (SHA-256),
 the same bytes as the working tree it was generated from.
 

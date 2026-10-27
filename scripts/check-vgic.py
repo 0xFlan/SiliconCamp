@@ -301,6 +301,9 @@ def check_tree(ck: Checker, tree: str) -> None:
     if typer_line:
         ck.check("BIT(17)" not in typer_line.group(1),
                  "GICD_TYPER: LPIS (bit 17) is 0; there is no ITS behind it")
+        ck.check("BIT(25)" in typer_line.group(1),
+                 "GICD_TYPER: No1N (bit 25) is 1; the distributor does not perform "
+                 "1-of-N selection, so the guest must not ask for it")
     ck.check(re.search(r"gicr_typer\s*\|=\s*BIT\(0\)", vgic) is None,
              "GICR_TYPER: PLPIS (bit 0) is 0; physical LPIs are not implemented")
     ck.check(re.search(r"gicr_typer\s*\|=\s*BIT\(3\)", vgic) is None,
@@ -353,6 +356,17 @@ def check_tree(ck: Checker, tree: str) -> None:
     ck.check(bool(affinity_args) and all(arg == "aic_irq" for arg in affinity_args),
              "hv_vgic.c: every aic_set_affinity() call passes a translated AIC number "
              f"(found {sorted(set(affinity_args)) or 'none'})")
+    ck.check(re.search(r"#define\s+GICD_IROUTER_IRM\s+BIT\(31\)", vgic_h) is not None,
+             "hv_vgic.h: GICD_IROUTER_IRM names bit 31, the bit No1N makes meaningless")
+    ck.check(re.search(r"route\s*&=\s*~\s*GICD_IROUTER_IRM", router) is not None,
+             "GICD_IROUTER: IRM=1 is treated as 0, a behaviour No1N explicitly permits")
+    ck.check(re.search(r"gicd_interrupt_router_regs\s*\[\s*reg_num\s*\]\s*=\s*route\s*;",
+                       router) is not None,
+             "GICD_IROUTER: the stored value never contains IRM, so read-back "
+             "cannot report a mode the distributor will not perform")
+    ck.check(re.search(r"MPIDR_AFF[0-3]\s*\(\s*route\s*\)", router) is not None,
+             "GICD_IROUTER: the affinity is decoded from the normalised value, "
+             "not the raw write")
 
     ck.section("Diagnostics: the hot path never writes to the UART")
     ck.check(re.search(r"#define\s+ENABLE_VGIC_LOGGING\s+0\b", vgic) is not None,
@@ -470,6 +484,15 @@ MUST_ADD = (
      "the 'was this register ever touched' bitmaps are updated atomically"),
     ("src/hv_vgic.c", r"vgic_note\s*\(\s*VGIC_NOTE_UNKNOWN\s*,",
      "an unknown register is counted and reported through the budget"),
+    # --- 0006: honest SPI routing --------------------------------------------
+    ("src/hv_vgic.h", r"#define\s+GICD_IROUTER_IRM\s+BIT\(31\)",
+     "GICD_IROUTER_IRM names the routing-mode bit No1N makes meaningless"),
+    ("src/hv_vgic.c", r"gicd_type_reg\s*=\s*[^;]*BIT\(25\)",
+     "GICD_TYPER.No1N is set, so the guest is not invited to use 1-of-N routing"),
+    ("src/hv_vgic.c", r"route\s*&=\s*~\s*GICD_IROUTER_IRM",
+     "GICD_IROUTER.IRM=1 is treated as 0, consistent with No1N"),
+    ("src/hv_vgic.c", r"gicd_interrupt_router_regs\s*\[\s*reg_num\s*\]\s*=\s*route\s*;",
+     "the stored routing value never contains IRM, so read-back agrees with the model"),
 )
 
 MUST_REMOVE = (
