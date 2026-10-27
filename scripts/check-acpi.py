@@ -627,6 +627,13 @@ def m1n1_root() -> str:
         "third_party", "m1n1-windows")
 
 
+#: Architectural limits for a GIC MSI frame.  INTIDs 0-31 are SGI/PPI, SPIs run
+#: 32-1019, and INTIDs 1020-8191 are reserved.  The emulated distributor m1n1
+#: models describes 32 banks, so its last INTID is 1023.
+GIC_FIRST_SPI = 32
+GIC_LAST_SPI = 1019
+GIC_MAX_INTID = 1023
+
 #: Values in src/guest_msi.h that the firmware's MADT has to agree with.
 GUEST_MSI_DEFINES = ("GUEST_MSI_SPI_BASE", "GUEST_MSI_VECTORS",
                      "GUEST_GIC_MAX_INTID", "GIC_LAST_SPI")
@@ -676,6 +683,20 @@ def check_msi_frame(data: bytes, ck: Checker, plat: Platform,
              f"MADT: MSI SPIs 0x{base:x}+{count} == "
              f"0x{plat.msi_spi_base:x}+{plat.msi_vectors}")
 
+    # The window has to be architecturally addressable: SPIs start at 32, the
+    # architectural SPI range ends at 1019, and the emulated distributor only
+    # describes 1024 INTIDs (GICD_TYPER ITLines = 31).  These are facts about
+    # ACPI and the GIC, so they are checked even when the hypervisor tree is not
+    # checked out; only the agreement with m1n1's constants needs that tree.
+    ck.check(base >= GIC_FIRST_SPI,
+             f"MSI: SPI base {base} is in the SPI range (>= {GIC_FIRST_SPI})")
+    ck.check(count > 0, f"MSI: vector count {count} is non-zero")
+    ck.check(base + count - 1 <= GIC_LAST_SPI,
+             f"MSI: window ends at SPI {base + count - 1} (<= {GIC_LAST_SPI})")
+    ck.check(base + count - 1 <= GIC_MAX_INTID,
+             f"MSI: window ends at INTID {base + count - 1} "
+             f"(<= emulated distributor's {GIC_MAX_INTID})")
+
     # ACPI 6.3 leaves GicMsiFrameId to the firmware; it only has to be unique,
     # and there is one frame.
     ck.note(f"      GIC MSI frame id {frame_id}")
@@ -696,14 +717,6 @@ def check_msi_frame(data: bytes, ck: Checker, plat: Platform,
     ck.check(m1n1["GUEST_MSI_VECTORS"] == count,
              f"MSI: hypervisor vector count {m1n1['GUEST_MSI_VECTORS']} == MADT {count}")
 
-    # The window has to be architecturally addressable: SPIs start at 32, end at
-    # 1019, and the emulated distributor only has state for INTIDs up to the
-    # GICD_TYPER limit, which is 1023 for the 32-bank distributor m1n1 models.
-    ck.check(base >= 32, f"MSI: SPI base {base} is in the SPI range (>= 32)")
-    if "GIC_LAST_SPI" in m1n1:
-        ck.check(base + count - 1 <= m1n1["GIC_LAST_SPI"],
-                 f"MSI: window ends at SPI {base + count - 1} "
-                 f"(<= {m1n1['GIC_LAST_SPI']})")
     if "GUEST_GIC_MAX_INTID" in m1n1:
         ck.check(base + count - 1 <= m1n1["GUEST_GIC_MAX_INTID"],
                  f"MSI: window ends at INTID {base + count - 1} "
