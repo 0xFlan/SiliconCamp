@@ -771,10 +771,10 @@ index 0000000..5408a55
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/Mac16_3.fdf b/Platform/Mac16_3Pkg/Mac16_3.fdf
 new file mode 100644
-index 0000000..93f5dae
+index 0000000..88934cd
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/Mac16_3.fdf
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,315 @@
 +#UEFI Flash Description File for the iMac M4 (Mac16,3, T8132)
 +#based on OnePlus6TPkg/OnePlus6TPkg.fdf
 +#
@@ -934,10 +934,17 @@ index 0000000..93f5dae
 +  INF MdeModulePkg/Bus/Pci/PciBusDxe/PciBusDxe.inf
 +  INF MdeModulePkg/Bus/Pci/NonDiscoverablePciDeviceDxe/NonDiscoverablePciDeviceDxe.inf
 +
-+  #NVMe Support
-+  #TODO: ANS2/SART driver
-+  #INF AppleSiliconPkg/Drivers/AppleANS2Dxe/AppleANS2Dxe.inf
-+  #INF MdeModulePkg/Bus/Pci/NvmExpressDxe/NvmExpressDxe.inf
++  #
++  # Internal storage (NVMe Support)
++  #
++  # The internal SSD is an Apple ANS/ANS2 controller: an NVMe engine behind a
++  # coprocessor, reached through an ASC mailbox, a SART window table and an
++  # RTKit handshake.  MdeModulePkg's NvmExpressDxe cannot drive it (there is no
++  # PCIe function to bind to), so the vendor driver publishes it as a block
++  # device instead.  Ported from m1n1's nvme.c; see the driver's header for what
++  # is deliberately left to the OS.
++  #
++  INF AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.inf
 +
 +  #
 +  # Virtual Keyboard
@@ -951,8 +958,9 @@ index 0000000..93f5dae
 +  INF AppleSiliconPkg/Drivers/AppleEmbeddedGpioControllerDxe/AppleEmbeddedGpioControllerDxe.inf
 +  #
 +  # Apple's PCI platform DXE (MSI doorbell/AIC hooks) is disabled for now; the
-+  # generic host bridge is in the FV.  The APCIE DARTs are not enabled yet, so
-+  # a device can be enumerated but cannot DMA.  See docs/pcie.md.
++  # generic host bridge is in the FV.  Device DMA works because the m1n1
++  # hand-off puts the APCIE DARTs into bypass before this firmware runs; MSI is
++  # the part that has no path to the guest yet.  See docs/pcie.md.
 +  #
 +  #INF AppleSiliconPkg/Drivers/AppleSiliconPciPlatformDxe/AppleSiliconPciPlatformDxe.inf
 +  #INF AppleSiliconPkg/Drivers/AppleBootTimeEmbeddedFirmwareHelperDxe/AppleBootTimeEmbeddedFirmwareHelperDxe.inf
@@ -1501,6 +1509,3341 @@ index e00f700..e431565 100644
      WorkspaceRoot = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
      PackagesPath = ("Platform", "MU_BASECORE", "Common/MU", "Common/TIANO", "Common/MU_OEM_SAMPLE", "Silicon/ARM/TIANO", "Silicon/Apple", "Common/MU_DFCI", "mu_feature_debugger")
  
+diff --git a/Silicon/Apple/AppleSiliconPkg/AppleSiliconPkg.dsc.inc b/Silicon/Apple/AppleSiliconPkg/AppleSiliconPkg.dsc.inc
+index 86c9a9e..234bd39 100644
+--- a/Silicon/Apple/AppleSiliconPkg/AppleSiliconPkg.dsc.inc
++++ b/Silicon/Apple/AppleSiliconPkg/AppleSiliconPkg.dsc.inc
+@@ -604,6 +604,14 @@
+   }
+   EmbeddedPkg/MetronomeDxe/MetronomeDxe.inf
+   AppleSiliconPkg/Drivers/AppleDartIoMmuDxe/AppleDartIoMmuDxe.inf
++  #
++  # Internal SSD.  The ANS/ANS2 controller is not a PCIe device: it is a
++  # coprocessor with an NVMe engine behind an NVMMU.  The driver is built for
++  # every Apple Silicon platform but only placed in a platform's FV where the
++  # device tree describes /arm-io/ans; on other platforms it returns success
++  # without installing anything.
++  #
++  AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.inf
+ 
+   # Fake Variable Services
+   MdeModulePkg/Universal/Variable/RuntimeDxe/VariableRuntimeDxe.inf
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleAsc.c b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleAsc.c
+new file mode 100644
+index 0000000..24647ea
+--- /dev/null
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleAsc.c
+@@ -0,0 +1,234 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors). All rights reserved.
++ *
++ * Module Name:
++ *   AppleAsc.c
++ *
++ * Abstract:
++ *   Apple Storage Coprocessor (ASC) mailbox access for the ANS/ANS2 storage
++ *   controller.  Ported from m1n1's src/asc.c.
++ *
++ * Environment:
++ *   UEFI DXE (Driver Execution Environment).
++ *
++ * License:
++ *   SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ *
++ **/
++
++#include "AppleNandStorage.h"
++
++typedef struct {
++  dt_node_t    *First;
++  UINT32       WantDepth;
++} ANS_FIRST_CHILD_ARG;
++
++//
++// dt_parse's callback takes a plain `int`, which is EDK2's INT32.
++//
++STATIC
++INT32
++AppleDtFirstChildCb (
++  IN VOID       *Arg,
++  IN dt_node_t  *Node,
++  IN INT32      Depth
++  )
++{
++  ANS_FIRST_CHILD_ARG *Search = (ANS_FIRST_CHILD_ARG *)Arg;
++
++  if ((Depth == (INT32)Search->WantDepth) && (Search->First == NULL)) {
++    Search->First = Node;
++  }
++
++  //
++  // Stop once the first child has been recorded: everything deeper is
++  // irrelevant and the ADT can be large.
++  //
++  return (Search->First != NULL) ? 1 : 0;
++}
++
++//
++// m1n1 walks the raw ADT and takes the first child of the ANS node as the IOP
++// node (`asc-dram-mask` lives there).  There is no name to match on, so this
++// does the same by depth.
++//
++STATIC
++dt_node_t *
++AppleDtFirstChild (
++  IN dt_node_t  *Node
++  )
++{
++  ANS_FIRST_CHILD_ARG Search;
++
++  Search.First     = NULL;
++  Search.WantDepth = 1;
++  dt_parse (Node, 0, NULL, AppleDtFirstChildCb, &Search, NULL, NULL);
++  return Search.First;
++}
++
++EFI_STATUS
++AppleAscInit (
++  IN  dt_node_t      *AnsNode,
++  OUT APPLE_ASC_DEV  *Asc
++  )
++{
++  uint64_t  Base;
++
++  if (AnsNode == NULL) {
++    return EFI_NOT_FOUND;
++  }
++
++  //
++  // AppleDTLib speaks stdint types, EDK2 code speaks its own; the two are the
++  // same width on AArch64 but not the same type name, so convert explicitly.
++  //
++  Base = 0;
++  if (dt_node_reg (AnsNode, 0, &Base, NULL) != 0 || Base == 0) {
++    DEBUG ((DEBUG_ERROR, "asc: /arm-io/ans has no usable reg[0]\n"));
++    return EFI_NOT_FOUND;
++  }
++
++  ZeroMem (Asc, sizeof (*Asc));
++  Asc->AnsNode = AnsNode;
++  Asc->CpuBase = (UINTN)Base;
++  Asc->Base    = (UINTN)Base + ASC_MAILBOX_OFFSET;
++  Asc->IopNode = AppleDtFirstChild (AnsNode);
++
++  if (Asc->IopNode == NULL) {
++    DEBUG ((DEBUG_WARN, "asc: no IOP child node under /arm-io/ans; asc-dram-mask will be 0\n"));
++  }
++
++  DEBUG ((
++    DEBUG_INFO,
++    "asc: reg[0] 0x%lx, mailboxes at 0x%lx, iop node %a\n",
++    Base,
++    (UINT64)Asc->Base,
++    (Asc->IopNode != NULL) ? "found" : "missing"
++    ));
++
++  return EFI_SUCCESS;
++}
++
++VOID
++AppleAscCpuStart (
++  IN APPLE_ASC_DEV  *Asc
++  )
++{
++  MmioOr32 (Asc->CpuBase + ASC_CPU_CONTROL, ASC_CPU_CONTROL_START);
++}
++
++VOID
++AppleAscCpuStop (
++  IN APPLE_ASC_DEV  *Asc
++  )
++{
++  MmioAnd32 (Asc->CpuBase + ASC_CPU_CONTROL, (UINT32)~ASC_CPU_CONTROL_START);
++}
++
++BOOLEAN
++AppleAscCpuRunning (
++  IN APPLE_ASC_DEV  *Asc
++  )
++{
++  return (MmioRead32 (Asc->CpuBase + ASC_CPU_CONTROL) & ASC_CPU_CONTROL_START) != 0;
++}
++
++BOOLEAN
++AppleAscCanSend (
++  IN APPLE_ASC_DEV  *Asc
++  )
++{
++  return (MmioRead32 (Asc->Base + ASC_MBOX_A2I_CONTROL) & ASC_MBOX_CONTROL_FULL) == 0;
++}
++
++BOOLEAN
++AppleAscCanRecv (
++  IN APPLE_ASC_DEV  *Asc
++  )
++{
++  return (MmioRead32 (Asc->Base + ASC_MBOX_I2A_CONTROL) & ASC_MBOX_CONTROL_EMPTY) == 0;
++}
++
++BOOLEAN
++AppleAscSend (
++  IN APPLE_ASC_DEV           *Asc,
++  IN CONST APPLE_ASC_MESSAGE *Msg
++  )
++{
++  UINT32  Timeout;
++
++  //
++  // m1n1 waits up to 200 ms for the IOP to drain its receive FIFO.  A FIFO
++  // that stays full means the coprocessor is stuck, and reporting that is
++  // better than writing into a full mailbox.
++  //
++  for (Timeout = 0; Timeout < 2000; Timeout++) {
++    if (AppleAscCanSend (Asc)) {
++      break;
++    }
++
++    gBS->Stall (100);
++  }
++
++  if (!AppleAscCanSend (Asc)) {
++    DEBUG ((DEBUG_ERROR, "asc: A2I mailbox full for 200ms; is the ASC stuck?\n"));
++    return FALSE;
++  }
++
++  MemoryFence ();
++  MmioWrite64 (Asc->Base + ASC_MBOX_A2I_SEND0, Msg->Msg0);
++  MmioWrite64 (Asc->Base + ASC_MBOX_A2I_SEND1, Msg->Msg1);
++
++  return TRUE;
++}
++
++BOOLEAN
++AppleAscRecv (
++  IN  APPLE_ASC_DEV     *Asc,
++  OUT APPLE_ASC_MESSAGE *Msg
++  )
++{
++  if (!AppleAscCanRecv (Asc)) {
++    return FALSE;
++  }
++
++  Msg->Msg0 = MmioRead64 (Asc->Base + ASC_MBOX_I2A_RECV0);
++  Msg->Msg1 = (UINT32)MmioRead64 (Asc->Base + ASC_MBOX_I2A_RECV1);
++  MemoryFence ();
++
++  return TRUE;
++}
++
++BOOLEAN
++AppleAscRecvTimeout (
++  IN  APPLE_ASC_DEV     *Asc,
++  OUT APPLE_ASC_MESSAGE *Msg,
++  IN  UINT32            DelayUsec
++  )
++{
++  UINT32  Elapsed;
++
++  for (Elapsed = 0; Elapsed < DelayUsec; Elapsed++) {
++    if (AppleAscRecv (Asc, Msg)) {
++      return TRUE;
++    }
++
++    gBS->Stall (1);
++  }
++
++  return FALSE;
++}
++
++VOID
++AppleAscDrain (
++  IN APPLE_ASC_DEV  *Asc
++  )
++{
++  APPLE_ASC_MESSAGE  Msg;
++
++  for (;;) {
++    if (!AppleAscRecv (Asc, &Msg)) {
++      break;
++    }
++  }
++}
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.c b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.c
+index dff86f1..3982915 100644
+--- a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.c
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.c
+@@ -1,23 +1,1191 @@
+ /**
+- * Copyright (c) 2023, amarioguy (AppleWOA authors).
+- * 
++ * Copyright (c) 2023, amarioguy (AppleWOA authors). All rights reserved.
++ *
+  * Module Name:
+- *     AppleNANDStorageDxe.c
+- * 
++ *   AppleNandStorageDxe.c
++ *
+  * Abstract:
+- *     Apple NAND Storage controller driver for Apple Silicon platforms.
+- * 
++ *   Apple ANS/ANS2 storage controller driver.  Apple's internal SSD is an NVMe
++ *   engine behind a coprocessor, not a PCIe NVMe device: the controller has to
++ *   be woken through an ASC mailbox and an RTKit handshake, its DMA path goes
++ *   through Apple's NVMMU (one TCB descriptor per submission slot) and its
++ *   address translation for the coprocessor side is a SART window table.
++ *
++ *   The register-level sequence is a port of m1n1's src/nvme.c, which is the
++ *   only public implementation of this controller; the register offsets are
++ *   cross-checked against m1n1 by scripts/check-ans2-constants.py so the two
++ *   cannot drift apart silently.
++ *
++ *   Deliberately not done here:
++ *   - the controller is left enabled at ExitBootServices.  An OS driver that
++ *     understands the ANS can adopt a running controller; a driver that starts
++ *     with a stopped one has to reproduce the RTKit handshake itself, and no
++ *     Windows ANS driver exists yet.
++ *   - multi-block transfers use one command per block.  Apple's NVMe engine
++ *     wants PRP lists for anything larger, and a single-page command is the
++ *     path m1n1 exercises on hardware.  The bounce buffer keeps every DMA
++ *     address known and page-aligned.
++ *
+  * Environment:
+- *     UEFI DXE (Driver Execution Environment).
+- * 
++ *   UEFI DXE (Driver Execution Environment).
++ *
+  * License:
+- *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
+- * 
+-*/
++ *   SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ *
++ **/
++
++#include "AppleNandStorage.h"
++
++#define ANS_ALIGN_16K  0x4000
++
++//
++// Identify Controller fields this driver reports (NVMe 1.4 figure 248).
++//
++#define NVME_ID_CTRL_SERIAL_OFFSET   4
++#define NVME_ID_CTRL_SERIAL_LENGTH   20
++#define NVME_ID_CTRL_MODEL_OFFSET    24
++#define NVME_ID_CTRL_MODEL_LENGTH    40
++#define NVME_ID_CTRL_FIRMWARE_OFFSET 64
++#define NVME_ID_CTRL_FIRMWARE_LENGTH 8
++
++typedef struct {
++  BOOLEAN               Initialized;
++  UINT32                Type;
++  UINT64                NvmeBase;
++  UINT64                NvmmuBase;
++  UINT32                Die;
++  UINT32                Nsid;
++
++  APPLE_ASC_DEV         Asc;
++  APPLE_SART_DEV        Sart;
++  APPLE_RTKIT_DEV       Rtkit;
++  BOOLEAN               RtkitUp;
++
++  APPLE_NVME_QUEUE      AdminQueue;
++  APPLE_NVME_QUEUE      IoQueue;
++
++  UINT8                 *BounceBuffer;
++  UINT8                 *IdentifyBuffer;
++
++  UINT32                BlockSize;
++  UINT64                LastBlock;
++
++  EFI_BLOCK_IO_MEDIA    Media;
++  EFI_BLOCK_IO_PROTOCOL BlockIo;
++  EFI_HANDLE            Handle;
++} ANS_DEVICE;
++
++STATIC ANS_DEVICE  mAns;
++
++//
++// --------------------------------------------------------------------------
++// Register access.  The NVMe engine and the NVMMU are separate regions on M4
++// (T8132) and the same region on M1-M3 (T8103).
++// --------------------------------------------------------------------------
++//
++
++STATIC
++UINT32
++AnsNvmeRead32 (
++  IN UINT64  Offset
++  )
++{
++  return MmioRead32 ((UINTN)(mAns.NvmeBase + Offset));
++}
++
++STATIC
++VOID
++AnsNvmeWrite32 (
++  IN UINT64  Offset,
++  IN UINT32  Value
++  )
++{
++  MmioWrite32 ((UINTN)(mAns.NvmeBase + Offset), Value);
++}
++
++STATIC
++UINT32
++AnsNvmmuRead32 (
++  IN UINT64  Offset
++  )
++{
++  return MmioRead32 ((UINTN)(mAns.NvmmuBase + Offset));
++}
++
++STATIC
++VOID
++AnsNvmmuWrite32 (
++  IN UINT64  Offset,
++  IN UINT32  Value
++  )
++{
++  MmioWrite32 ((UINTN)(mAns.NvmmuBase + Offset), Value);
++}
++
++STATIC
++VOID
++AnsNvmeWrite64 (
++  IN UINT64  Offset,
++  IN UINT64  Value
++  )
++{
++  MmioWrite64 ((UINTN)(mAns.NvmeBase + Offset), Value);
++}
++
++STATIC
++VOID
++AnsNvmmuWrite64 (
++  IN UINT64  Offset,
++  IN UINT64  Value
++  )
++{
++  MmioWrite64 ((UINTN)(mAns.NvmmuBase + Offset), Value);
++}
++
++//
++// --------------------------------------------------------------------------
++// Firmware mailbox plumbing.
++// --------------------------------------------------------------------------
++//
++
++//
++// The firmware logs to its syslog ring continuously and blocks if the driver
++// stops draining it, so every wait in this file goes through here.
++//
++STATIC
++BOOLEAN
++AnsPollFirmware (
++  VOID
++  )
++{
++  APPLE_RTKIT_MESSAGE  Msg;
++  INTN                 Ret;
++
++  if (!mAns.RtkitUp) {
++    return TRUE;
++  }
++
++  for (;;) {
++    Ret = AppleRtkitRecv (&mAns.Rtkit, &Msg);
++    if (Ret < 0) {
++      DEBUG ((DEBUG_ERROR, "ans: the firmware reported a crash\n"));
++      return FALSE;
++    }
++
++    if (Ret == 0) {
++      return TRUE;
++    }
++
++    DEBUG ((DEBUG_WARN, "ans: message for endpoint 0x%02x: 0x%lx\n", Msg.Ep, Msg.Msg));
++  }
++}
++
++STATIC
++BOOLEAN
++AnsWaitRegister (
++  IN UINT64   Offset,
++  IN UINT32   Mask,
++  IN UINT32   Value,
++  IN UINT32   TimeoutUsec
++  )
++{
++  UINT32  Elapsed;
++
++  for (Elapsed = 0; Elapsed < TimeoutUsec; Elapsed += 10) {
++    if ((AnsNvmeRead32 (Offset) & Mask) == Value) {
++      return TRUE;
++    }
++
++    AnsPollFirmware ();
++    gBS->Stall (10);
++  }
++
++  return (AnsNvmeRead32 (Offset) & Mask) == Value;
++}
++
++STATIC
++BOOLEAN
++AnsWaitRegisterBits (
++  IN UINT64  Offset,
++  IN UINT32  Mask,
++  IN UINT32  TimeoutUsec
++  )
++{
++  UINT32  Elapsed;
++
++  for (Elapsed = 0; Elapsed < TimeoutUsec; Elapsed += 10) {
++    if ((AnsNvmeRead32 (Offset) & Mask) != 0) {
++      return TRUE;
++    }
++
++    AnsPollFirmware ();
++    gBS->Stall (10);
++  }
++
++  return (AnsNvmeRead32 (Offset) & Mask) != 0;
++}
++
++//
++// --------------------------------------------------------------------------
++// Queues.
++// --------------------------------------------------------------------------
++//
++
++STATIC
++VOID
++AnsFreeQueue (
++  IN OUT APPLE_NVME_QUEUE  *Queue
++  )
++{
++  if (Queue->Tcbs != NULL) {
++    FreeAlignedPages (Queue->Tcbs, EFI_SIZE_TO_PAGES (NVME_QUEUE_SIZE * sizeof (APPLE_NVMMU_TCB)));
++  }
++
++  if (Queue->Cmds != NULL) {
++    FreeAlignedPages (Queue->Cmds, EFI_SIZE_TO_PAGES (NVME_QUEUE_SIZE * sizeof (APPLE_NVME_COMMAND)));
++  }
++
++  if (Queue->Cqes != NULL) {
++    FreeAlignedPages (Queue->Cqes, EFI_SIZE_TO_PAGES (NVME_QUEUE_SIZE * sizeof (APPLE_NVME_COMPLETION)));
++  }
++
++  ZeroMem (Queue, sizeof (*Queue));
++}
++
++STATIC
++EFI_STATUS
++AnsAllocateQueue (
++  IN OUT APPLE_NVME_QUEUE  *Queue,
++  IN     BOOLEAN           AdminQueue
++  )
++{
++  ZeroMem (Queue, sizeof (*Queue));
++
++  Queue->Tcbs = AllocateAlignedPages (
++                  EFI_SIZE_TO_PAGES (NVME_QUEUE_SIZE * sizeof (APPLE_NVMMU_TCB)),
++                  ANS_ALIGN_16K
++                  );
++  if (Queue->Tcbs == NULL) {
++    return EFI_OUT_OF_RESOURCES;
++  }
++
++  Queue->Cmds = AllocateAlignedPages (
++                  EFI_SIZE_TO_PAGES (NVME_QUEUE_SIZE * sizeof (APPLE_NVME_COMMAND)),
++                  ANS_ALIGN_16K
++                  );
++  if (Queue->Cmds == NULL) {
++    AnsFreeQueue (Queue);
++    return EFI_OUT_OF_RESOURCES;
++  }
++
++  Queue->Cqes = AllocateAlignedPages (
++                  EFI_SIZE_TO_PAGES (NVME_QUEUE_SIZE * sizeof (APPLE_NVME_COMPLETION)),
++                  ANS_ALIGN_16K
++                  );
++  if (Queue->Cqes == NULL) {
++    AnsFreeQueue (Queue);
++    return EFI_OUT_OF_RESOURCES;
++  }
++
++  ZeroMem (Queue->Tcbs, NVME_QUEUE_SIZE * sizeof (APPLE_NVMMU_TCB));
++  ZeroMem (Queue->Cmds, NVME_QUEUE_SIZE * sizeof (APPLE_NVME_COMMAND));
++  ZeroMem (Queue->Cqes, NVME_QUEUE_SIZE * sizeof (APPLE_NVME_COMPLETION));
++
++  Queue->CqHead   = 0;
++  Queue->CqPhase  = 1;
++  Queue->AdminQueue = AdminQueue;
++
++  return EFI_SUCCESS;
++}
++
++//
++// Submit one command in slot 0 of a queue and wait for its completion.  Apple's
++// engine takes the DMA description from the NVMMU TCB for the same slot, so
++// both have to be written before the doorbell.
++//
++STATIC
++EFI_STATUS
++AnsExecuteCommand (
++  IN  APPLE_NVME_QUEUE  *Queue,
++  IN  APPLE_NVME_COMMAND *Command,
++  OUT UINT64            *Result OPTIONAL
++  )
++{
++  APPLE_NVME_COMMAND     *QueueCommand;
++  APPLE_NVMMU_TCB        *Tcb;
++  APPLE_NVME_COMPLETION  Completion;
++  UINT32                 Elapsed;
++  BOOLEAN                Found;
++  CONST UINT8            Tag = 0;
++
++  QueueCommand = &Queue->Cmds[Tag];
++  Tcb          = &Queue->Tcbs[Tag];
++
++  CopyMem (QueueCommand, Command, sizeof (*Command));
++  QueueCommand->Tag = Tag;
++
++  ZeroMem (Tcb, sizeof (*Tcb));
++  if (QueueCommand->Prp1 == 0) {
++    Tcb->DmaFlags = 0;
++  } else if ((QueueCommand->Opcode & 1) != 0) {
++    Tcb->DmaFlags = NVMMU_TCB_DMA_TO_DEVICE;
++  } else {
++    Tcb->DmaFlags = NVMMU_TCB_DMA_FROM_DEVICE;
++  }
++
++  Tcb->SlotId = Tag;
++  Tcb->Len    = QueueCommand->Cdw12;
++  Tcb->Prp1   = QueueCommand->Prp1;
++  Tcb->Prp2   = QueueCommand->Prp2;
++
++  MemoryFence ();
++
++  //
++  // The firmware has to see the command and its TCB before the doorbell.
++  //
++  if (!AnsPollFirmware ()) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  if (Queue->AdminQueue) {
++    AnsNvmeWrite32 (NVME_DB_LINEAR_ASQ, Tag);
++  } else {
++    AnsNvmeWrite32 (NVME_DB_LINEAR_IOSQ, Tag);
++  }
++
++  Found = FALSE;
++  for (Elapsed = 0; Elapsed < NVME_TIMEOUT_USEC; Elapsed += 10) {
++    if (!AnsPollFirmware ()) {
++      return EFI_DEVICE_ERROR;
++    }
++
++    MemoryFence ();
++    CopyMem (&Completion, &Queue->Cqes[Queue->CqHead], sizeof (Completion));
++
++    if ((Completion.Status & 1) != Queue->CqPhase) {
++      gBS->Stall (10);
++      continue;
++    }
++
++    if (Completion.Tag != Tag) {
++      DEBUG ((DEBUG_WARN, "ans: completion for tag %d, expected %d\n", Completion.Tag, Tag));
++    } else {
++      Found = TRUE;
++      if (Result != NULL) {
++        *Result = Completion.Result;
++      }
++    }
++
++    AnsNvmmuWrite32 (NVMMU_TCB_INVAL, Completion.Tag);
++    if (AnsNvmmuRead32 (NVMMU_TCB_STAT) != 0) {
++      DEBUG ((DEBUG_WARN, "ans: NVMMU invalidation of tag %d failed\n", Completion.Tag));
++    }
++
++    Queue->CqHead++;
++    if (Queue->CqHead == NVME_QUEUE_SIZE) {
++      Queue->CqHead = 0;
++      Queue->CqPhase ^= 1;
++    }
++
++    if (Queue->AdminQueue) {
++      AnsNvmeWrite32 (NVME_DB_ACQ, Queue->CqHead);
++    } else {
++      AnsNvmeWrite32 (NVME_DB_IOCQ, Queue->CqHead);
++    }
++
++    break;
++  }
++
++  if (!Found) {
++    DEBUG ((DEBUG_ERROR, "ans: no completion for command 0x%02x\n", Command->Opcode));
++    return EFI_TIMEOUT;
++  }
++
++  Completion.Status >>= 1;
++  if (Completion.Status != 0) {
++    DEBUG ((DEBUG_ERROR, "ans: command 0x%02x failed with status 0x%x\n", Command->Opcode, Completion.Status));
++    return EFI_DEVICE_ERROR;
++  }
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++BOOLEAN
++AnsControllerDisable (
++  VOID
++  )
++{
++  AnsNvmeWrite32 (NVME_CC, AnsNvmeRead32 (NVME_CC) & ~NVME_CC_EN_BIT);
++  return AnsWaitRegister (NVME_CSTS, NVME_CSTS_RDY_BIT, 0, NVME_TIMEOUT_USEC);
++}
++
++STATIC
++BOOLEAN
++AnsControllerEnable (
++  VOID
++  )
++{
++  UINT32  Cc;
++
++  Cc  = AnsNvmeRead32 (NVME_CC);
++  Cc &= ~(UINT32)((BIT15 | BIT14));      // clear the shutdown notification bits
++  Cc |= NVME_CC_EN_BIT;
++  AnsNvmeWrite32 (NVME_CC, Cc);
++
++  return AnsWaitRegisterBits (NVME_CSTS, NVME_CSTS_RDY_BIT, NVME_ENABLE_TIMEOUT_USEC);
++}
++
++STATIC
++BOOLEAN
++AnsControllerShutdown (
++  VOID
++  )
++{
++  UINT32  Cc;
++
++  Cc  = AnsNvmeRead32 (NVME_CC);
++  Cc &= ~(UINT32)(BIT15 | BIT14);
++  Cc |= (NVME_CC_SHN_NORMAL << NVME_CC_SHN_START);
++  AnsNvmeWrite32 (NVME_CC, Cc);
++
++  return AnsWaitRegister (
++           NVME_CSTS,
++           (UINT32)((BIT3 | BIT2)),
++           (UINT32)(NVME_CSTS_SHST_DONE << NVME_CSTS_SHST_START),
++           NVME_SHUTDOWN_TIMEOUT_USEC
++           );
++}
++
++STATIC
++EFI_STATUS
++AnsCreateIoQueues (
++  VOID
++  )
++{
++  APPLE_NVME_COMMAND  Command;
++  EFI_STATUS          Status;
++
++  ZeroMem (&Command, sizeof (Command));
++  Command.Opcode = NVME_ADMIN_CMD_CREATE_CQ;
++  Command.Prp1   = (UINT64)(UINTN)mAns.IoQueue.Cqes;
++  Command.Cdw10  = 1;                       // completion queue id
++  Command.Cdw10 |= (NVME_QUEUE_SIZE - 1) << 16;
++  Command.Cdw11  = NVME_QUEUE_CONTIGUOUS;
++
++  Status = AnsExecuteCommand (&mAns.AdminQueue, &Command, NULL);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: create completion queue failed: %r\n", Status));
++    return Status;
++  }
++
++  ZeroMem (&Command, sizeof (Command));
++  Command.Opcode = NVME_ADMIN_CMD_CREATE_SQ;
++  Command.Prp1   = (UINT64)(UINTN)mAns.IoQueue.Cmds;
++  Command.Cdw10  = 1;                       // submission queue id
++  Command.Cdw10 |= (NVME_QUEUE_SIZE - 1) << 16;
++  Command.Cdw11  = NVME_QUEUE_CONTIGUOUS;
++  Command.Cdw11 |= 1 << 16;                 // completion queue this SQ is bound to
++
++  Status = AnsExecuteCommand (&mAns.AdminQueue, &Command, NULL);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: create submission queue failed: %r\n", Status));
++    return Status;
++  }
++
++  if (mAns.Type == ANS_TYPE_T8132) {
++    //
++    // M4 and later need the IO queue addresses again after the queues exist;
++    // without these two writes the ANS crashes with "I/O SQ: 0 / I/O CQ: 0".
++    //
++    AnsNvmeWrite64 (NVME_IOQ_CQES, (UINT64)(UINTN)mAns.IoQueue.Cqes);
++    AnsNvmeWrite64 (NVME_IOQ_CMDS, (UINT64)(UINTN)mAns.IoQueue.Cmds);
++  }
++
++  return EFI_SUCCESS;
++}
++
++//
++// --------------------------------------------------------------------------
++// Data path.
++// --------------------------------------------------------------------------
++//
++
++STATIC
++EFI_STATUS
++AnsIdentify (
++  IN UINT32  Cns,
++  IN UINT32  Nsid,
++  IN VOID    *Buffer
++  )
++{
++  APPLE_NVME_COMMAND  Command;
++
++  ZeroMem (&Command, sizeof (Command));
++  Command.Opcode = NVME_ADMIN_CMD_IDENTIFY;
++  Command.Nsid   = Nsid;
++  Command.Prp1   = (UINT64)(UINTN)Buffer;
++  Command.Cdw10  = Cns;
++
++  return AnsExecuteCommand (&mAns.AdminQueue, &Command, NULL);
++}
++
++STATIC
++VOID
++AnsLogIdentifyString (
++  IN CONST UINT8  *Identify,
++  IN UINT32       Offset,
++  IN UINT32       Length,
++  IN CONST CHAR8  *Label
++  )
++{
++  CHAR8  Value[41];
++  UINT32  Index;
++  UINT32  Used;
++
++  if (Length > 40) {
++    Length = 40;
++  }
++
++  Used = 0;
++  for (Index = 0; Index < Length; Index++) {
++    CHAR8  Character = (CHAR8)Identify[Offset + Index];
++
++    if ((Character == '\0') || (Character == ' ')) {
++      continue;
++    }
++
++    Value[Used++] = Character;
++  }
++
++  Value[Used] = '\0';
++
++  DEBUG ((DEBUG_INFO, "ans: %a '%a'\n", Label, Value));
++}
++
++STATIC
++UINT32
++AnsGetNamespaceBlockSize (
++  IN CONST APPLE_NVME_IDENTIFY_NAMESPACE  *Identify
++  )
++{
++  UINT32  FormatIndex;
++  UINT8   LbaDataSize;
++  UINT32  Shift;
++
++  FormatIndex = Identify->Flbas & 0x0f;
++  LbaDataSize = Identify->LbaFormat[FormatIndex * NVME_IDENTIFY_LBAF_STRIDE + NVME_IDENTIFY_LBAF_LBADS];
++
++  if ((LbaDataSize < 9) || (LbaDataSize > 16)) {
++    DEBUG ((DEBUG_WARN, "ans: LBA format %d has an unusable LBADS of %d\n", FormatIndex, LbaDataSize));
++    return 0;
++  }
++
++  Shift = LbaDataSize;
++  return (UINT32)LShiftU64 (1, Shift);
++}
++
++//
++// One command per block through the bounce buffer: every DMA address the engine
++// sees is a page-aligned page the driver allocated, and the TCB length field
++// always matches a whole number of blocks.
++//
++STATIC
++EFI_STATUS
++AnsReadWriteBlock (
++  IN BOOLEAN  Write,
++  IN UINT64   Lba,
++  IN VOID     *Buffer
++  )
++{
++  APPLE_NVME_COMMAND  Command;
++
++  ZeroMem (&Command, sizeof (Command));
++  Command.Opcode = Write ? NVME_CMD_WRITE : NVME_CMD_READ;
++  Command.Nsid   = mAns.Nsid;
++  Command.Prp1   = (UINT64)(UINTN)mAns.BounceBuffer;
++  Command.Cdw10  = (UINT32)Lba;
++  Command.Cdw11  = (UINT32)RShiftU64 (Lba, 32);
++  Command.Cdw12  = 0;                       // zero-based block count: one block
++
++  if (Write) {
++    CopyMem (mAns.BounceBuffer, Buffer, mAns.BlockSize);
++  }
++
++  if (EFI_ERROR (AnsExecuteCommand (&mAns.IoQueue, &Command, NULL))) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  if (!Write) {
++    CopyMem (Buffer, mAns.BounceBuffer, mAns.BlockSize);
++  }
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++AnsFlush (
++  VOID
++  )
++{
++  APPLE_NVME_COMMAND  Command;
++
++  ZeroMem (&Command, sizeof (Command));
++  Command.Opcode = NVME_CMD_FLUSH;
++  Command.Nsid   = mAns.Nsid;
++
++  //
++  // No data buffer: the NVMMU TCB for this slot carries no transfer, and a
++  // flush that reports "no completion" is reported but not fatal to the caller.
++  //
++  return AnsExecuteCommand (&mAns.IoQueue, &Command, NULL);
++}
++
++//
++// --------------------------------------------------------------------------
++// EFI_BLOCK_IO_PROTOCOL.
++// --------------------------------------------------------------------------
++//
++
++STATIC
++EFI_STATUS
++EFIAPI
++AnsBlockIoReset (
++  IN EFI_BLOCK_IO_PROTOCOL  *This,
++  IN BOOLEAN                ExtendedVerification
++  )
++{
++  if (!mAns.Initialized) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  //
++  // Bringing the controller back up would mean a firmware handshake; the useful
++  // part of a reset here is getting the volatile write cache to disk, and a
++  // flush that does not report completion is still worth reporting to the log.
++  //
++  if (EFI_ERROR (AnsFlush ())) {
++    DEBUG ((DEBUG_WARN, "ans: flush during reset did not complete\n"));
++  }
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++AnsBlockIoCheckArguments (
++  IN  EFI_BLOCK_IO_PROTOCOL  *This,
++  IN  UINT32                 MediaId,
++  IN  UINT64                 Lba,
++  IN  UINTN                  BufferSize,
++  IN  VOID                   *Buffer,
++  OUT UINT64                 *BlockCount
++  )
++{
++  EFI_BLOCK_IO_MEDIA  *Media;
++
++  Media = This->Media;
++
++  if (Buffer == NULL) {
++    return EFI_INVALID_PARAMETER;
++  }
++
++  if (MediaId != Media->MediaId) {
++    return EFI_MEDIA_CHANGED;
++  }
++
++  if (!Media->MediaPresent) {
++    return EFI_NO_MEDIA;
++  }
++
++  if (BufferSize == 0) {
++    return EFI_BAD_BUFFER_SIZE;
++  }
++
++  if ((BufferSize % Media->BlockSize) != 0) {
++    return EFI_BAD_BUFFER_SIZE;
++  }
++
++  if ((Lba > Media->LastBlock) ||
++      ((Lba + (BufferSize / Media->BlockSize) - 1) > Media->LastBlock))
++  {
++    return EFI_INVALID_PARAMETER;
++  }
++
++  *BlockCount = BufferSize / Media->BlockSize;
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++AnsBlockIoTransfer (
++  IN BOOLEAN  Write,
++  IN UINT64   Lba,
++  IN UINTN    BlockCount,
++  IN VOID     *Buffer
++  )
++{
++  UINT8       *Cursor;
++  UINTN       Index;
++  EFI_STATUS  Status;
++
++  Cursor = (UINT8 *)Buffer;
++
++  for (Index = 0; Index < BlockCount; Index++) {
++    Status = AnsReadWriteBlock (Write, Lba + Index, Cursor);
++    if (EFI_ERROR (Status)) {
++      return Status;
++    }
++
++    Cursor += mAns.BlockSize;
++  }
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++EFIAPI
++AnsBlockIoReadBlocks (
++  IN EFI_BLOCK_IO_PROTOCOL  *This,
++  IN UINT32                 MediaId,
++  IN EFI_LBA                Lba,
++  IN UINTN                  BufferSize,
++  OUT VOID                  *Buffer
++  )
++{
++  EFI_STATUS  Status;
++  UINT64      BlockCount;
++
++  if (!mAns.Initialized) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  BlockCount = 0;
++  Status     = AnsBlockIoCheckArguments (This, MediaId, Lba, BufferSize, Buffer, &BlockCount);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  return AnsBlockIoTransfer (FALSE, Lba, (UINTN)BlockCount, Buffer);
++}
++
++STATIC
++EFI_STATUS
++EFIAPI
++AnsBlockIoWriteBlocks (
++  IN EFI_BLOCK_IO_PROTOCOL  *This,
++  IN UINT32                 MediaId,
++  IN EFI_LBA                Lba,
++  IN UINTN                  BufferSize,
++  IN VOID                   *Buffer
++  )
++{
++  EFI_STATUS  Status;
++  UINT64      BlockCount;
++
++  if (!mAns.Initialized) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  BlockCount = 0;
++  Status     = AnsBlockIoCheckArguments (This, MediaId, Lba, BufferSize, Buffer, &BlockCount);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  return AnsBlockIoTransfer (TRUE, Lba, (UINTN)BlockCount, Buffer);
++}
++
++STATIC
++EFI_STATUS
++EFIAPI
++AnsBlockIoFlushBlocks (
++  IN EFI_BLOCK_IO_PROTOCOL  *This
++  )
++{
++  if (!mAns.Initialized) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  return AnsFlush ();
++}
+ 
+ //
+-// We basically need to roll our own NVMe driver here, because
+-// Apple devices do not have "standard" NVMe, which is normally exposed
+-// over PCIe, and Apple's implementation of NVMe (over the ANS2 controller)
+-// breaks the spec in a few ways.
+-//
+\ No newline at end of file
++// --------------------------------------------------------------------------
++// Bring-up.
++// --------------------------------------------------------------------------
++//
++
++STATIC
++VOID
++AnsReportController (
++  IN dt_node_t  *AnsNode
++  )
++{
++  CHAR8     *Compatible;
++  uint64_t  *ClockGates;
++
++  Compatible = (CHAR8 *)dt_node_prop (AnsNode, "compatible", NULL);
++  DEBUG ((DEBUG_INFO, "ans: compatible %a\n", (Compatible != NULL) ? Compatible : "(none)"));
++
++  ClockGates = (uint64_t *)dt_node_prop (AnsNode, "clock-gates", NULL);
++  if (ClockGates != NULL) {
++    mAns.Die = (UINT32)ANS_FIELD_GET (*ClockGates, 28, 31);
++  } else {
++    DEBUG ((DEBUG_WARN, "ans: no clock-gates property; deriving the die from the base address\n"));
++    mAns.Die = (UINT32)((mAns.NvmeBase >> 37) & 3);
++  }
++
++  DEBUG ((
++    DEBUG_INFO,
++    "ans: %a layout, NVMe 0x%lx, NVMMU 0x%lx, die %d\n",
++    (mAns.Type == ANS_TYPE_T8132) ? "T8132" : "T8103",
++    (UINT64)mAns.NvmeBase,
++    (UINT64)mAns.NvmmuBase,
++    mAns.Die
++    ));
++}
++
++STATIC
++EFI_STATUS
++AnsReadNamespaces (
++  VOID
++  )
++{
++  APPLE_NVME_IDENTIFY_NAMESPACE  *Namespace;
++  UINT8                          *Controller;
++  EFI_STATUS                     Status;
++  UINT32                         BlockSize;
++
++  Namespace = (APPLE_NVME_IDENTIFY_NAMESPACE *)mAns.IdentifyBuffer;
++  ZeroMem (Namespace, mAns.BlockSize);
++
++  Status = AnsIdentify (NVME_CNS_NAMESPACE, mAns.Nsid, Namespace);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: identify namespace %d failed: %r\n", mAns.Nsid, Status));
++    return Status;
++  }
++
++  BlockSize = AnsGetNamespaceBlockSize (Namespace);
++  if (BlockSize == 0) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  if (Namespace->Nsze == 0) {
++    DEBUG ((DEBUG_ERROR, "ans: namespace %d reports zero blocks\n", mAns.Nsid));
++    return EFI_DEVICE_ERROR;
++  }
++
++  if ((BlockSize != NVME_DEFAULT_BLOCK_SIZE) && (BlockSize != 512)) {
++    DEBUG ((DEBUG_WARN, "ans: namespace reports %d-byte blocks\n", BlockSize));
++  }
++
++  mAns.BlockSize = BlockSize;
++  mAns.LastBlock = Namespace->Nsze - 1;
++
++  DEBUG ((
++    DEBUG_INFO,
++    "ans: namespace %d: %ld blocks of %d bytes, LBAF %d\n",
++    mAns.Nsid,
++    Namespace->Nsze,
++    mAns.BlockSize,
++    Namespace->Flbas & 0x0f
++    ));
++
++  ZeroMem (mAns.IdentifyBuffer, mAns.BlockSize);
++  Status = AnsIdentify (NVME_CNS_CONTROLLER, 0, mAns.IdentifyBuffer);
++  if (!EFI_ERROR (Status)) {
++    Controller = mAns.IdentifyBuffer;
++    AnsLogIdentifyString (Controller, NVME_ID_CTRL_MODEL_OFFSET, NVME_ID_CTRL_MODEL_LENGTH, "model");
++    AnsLogIdentifyString (Controller, NVME_ID_CTRL_SERIAL_OFFSET, NVME_ID_CTRL_SERIAL_LENGTH, "serial");
++    AnsLogIdentifyString (Controller, NVME_ID_CTRL_FIRMWARE_OFFSET, NVME_ID_CTRL_FIRMWARE_LENGTH, "firmware");
++  }
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++AnsInitialize (
++  VOID
++  )
++{
++  dt_node_t    *AnsNode;
++  dt_node_t    *SartNode;
++  uint64_t     NvmmuBase;
++  uint64_t     NvmeBase;
++  EFI_STATUS   Status;
++
++  AnsNode = dt_get ("/arm-io/ans");
++  if (AnsNode == NULL) {
++    DEBUG ((DEBUG_WARN, "ans: no /arm-io/ans node in the device tree; no internal storage\n"));
++    return EFI_NOT_FOUND;
++  }
++
++  //
++  // M4 and later describe the NVMe engine and the NVMMU as separate regions and
++  // add an nvme-secure-bar property; M1-M3 use reg[3] for both.
++  //
++  if (dt_node_prop (AnsNode, "nvme-secure-bar", NULL) != NULL) {
++    mAns.Type = ANS_TYPE_T8132;
++  } else {
++    mAns.Type = ANS_TYPE_T8103;
++  }
++
++  NvmmuBase = 0;
++  if (dt_node_reg (AnsNode, 3, &NvmmuBase, NULL) != 0 || NvmmuBase == 0) {
++    DEBUG ((DEBUG_ERROR, "ans: no NVMMU region (reg[3]) on the ANS node\n"));
++    return EFI_NOT_FOUND;
++  }
++
++  if (mAns.Type == ANS_TYPE_T8132) {
++    NvmeBase = 0;
++    if (dt_node_reg (AnsNode, 9, &NvmeBase, NULL) != 0 || NvmeBase == 0) {
++      DEBUG ((DEBUG_ERROR, "ans: no NVMe region (reg[9]) on the ANS node\n"));
++      return EFI_NOT_FOUND;
++    }
++  } else {
++    NvmeBase = NvmmuBase;
++  }
++
++  mAns.NvmmuBase = NvmmuBase;
++  mAns.NvmeBase  = NvmeBase;
++  mAns.Nsid      = 1;
++  mAns.BlockSize = NVME_DEFAULT_BLOCK_SIZE;
++
++  AnsReportController (AnsNode);
++
++  Status = AnsAllocateQueue (&mAns.AdminQueue, TRUE);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: cannot allocate the admin queue: %r\n", Status));
++    return Status;
++  }
++
++  Status = AnsAllocateQueue (&mAns.IoQueue, FALSE);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: cannot allocate the IO queue: %r\n", Status));
++    AnsFreeQueue (&mAns.AdminQueue);
++    return Status;
++  }
++
++  Status = AppleAscInit (AnsNode, &mAns.Asc);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: no ASC mailbox: %r\n", Status));
++    goto Error;
++  }
++
++  SartNode = dt_get ("/arm-io/sart-ans");
++  if (SartNode == NULL) {
++    DEBUG ((DEBUG_ERROR, "ans: no /arm-io/sart-ans node; the firmware cannot be given buffers\n"));
++    Status = EFI_NOT_FOUND;
++    goto Error;
++  }
++
++  Status = AppleSartInit (SartNode, &mAns.Sart);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: SART initialisation failed: %r\n", Status));
++    goto Error;
++  }
++
++  Status = AppleRtkitInit ("ans", &mAns.Asc, &mAns.Sart, &mAns.Rtkit);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: RTKit context failed: %r\n", Status));
++    goto Error;
++  }
++
++  mAns.RtkitUp = TRUE;
++
++  DEBUG ((DEBUG_INFO, "ans: starting the coprocessor firmware\n"));
++  Status = AppleRtkitBoot (&mAns.Rtkit);
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: the coprocessor firmware did not come up: %r\n", Status));
++    goto Error;
++  }
++
++  //
++  // The firmware sets this once its NVMe engine is ready to be programmed.
++  //
++  if (!AnsWaitRegister (NVME_BOOT_STATUS, 0xffffffff, NVME_BOOT_STATUS_OK, 1000000)) {
++    DEBUG ((
++      DEBUG_ERROR,
++      "ans: boot status is 0x%x, expected 0x%x\n",
++      AnsNvmeRead32 (NVME_BOOT_STATUS),
++      NVME_BOOT_STATUS_OK
++      ));
++    Status = EFI_DEVICE_ERROR;
++    goto Error;
++  }
++
++  //
++  // Linear submission queues: the engine takes one TCB per slot instead of
++  // walking a PRP list, and the NVMMU holds the TCB arrays for both queues.
++  //
++  AnsNvmeWrite32 (NVME_LINEAR_SQ_CTRL, AnsNvmeRead32 (NVME_LINEAR_SQ_CTRL) | NVME_LINEAR_SQ_CTRL_EN);
++  AnsNvmeWrite32 (NVME_MAX_PEND_CMDS_CTRL, ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
++  AnsNvmmuWrite32 (NVMMU_NUM, NVME_QUEUE_SIZE - 1);
++  AnsNvmmuWrite64 (NVMMU_ASQ_BASE, (UINT64)(UINTN)mAns.AdminQueue.Tcbs);
++  AnsNvmmuWrite64 (NVMMU_IOSQ_BASE, (UINT64)(UINTN)mAns.IoQueue.Tcbs);
++
++  if (!AnsControllerDisable ()) {
++    DEBUG ((DEBUG_ERROR, "ans: the controller would not stop\n"));
++    Status = EFI_DEVICE_ERROR;
++    goto Error;
++  }
++
++  AnsNvmeWrite64 (NVME_ASQ, (UINT64)(UINTN)mAns.AdminQueue.Cmds);
++  AnsNvmeWrite64 (NVME_ACQ, (UINT64)(UINTN)mAns.AdminQueue.Cqes);
++  AnsNvmeWrite32 (NVME_AQA, ((NVME_QUEUE_SIZE - 1) << 16) | (NVME_QUEUE_SIZE - 1));
++
++  if (!AnsControllerEnable ()) {
++    DEBUG ((DEBUG_ERROR, "ans: the controller never became ready\n"));
++    Status = EFI_DEVICE_ERROR;
++    goto Error;
++  }
++
++  Status = AnsCreateIoQueues ();
++  if (EFI_ERROR (Status)) {
++    goto ErrorController;
++  }
++
++  Status = AnsReadNamespaces ();
++  if (EFI_ERROR (Status)) {
++    goto ErrorController;
++  }
++
++  mAns.BounceBuffer = AllocateAlignedPages (EFI_SIZE_TO_PAGES (mAns.BlockSize), mAns.BlockSize);
++  if (mAns.BounceBuffer == NULL) {
++    Status = EFI_OUT_OF_RESOURCES;
++    goto ErrorController;
++  }
++
++  FreeAlignedPages (mAns.IdentifyBuffer, EFI_SIZE_TO_PAGES (NVME_DEFAULT_BLOCK_SIZE));
++  mAns.IdentifyBuffer = NULL;
++
++  mAns.Initialized = TRUE;
++
++  DEBUG ((
++    DEBUG_INFO,
++    "ans: ready: %ld blocks of %d bytes (%ld MB); the controller stays enabled for the OS\n",
++    mAns.LastBlock + 1,
++    mAns.BlockSize,
++    RShiftU64 ((mAns.LastBlock + 1) * mAns.BlockSize, 20)
++    ));
++
++  return EFI_SUCCESS;
++
++ErrorController:
++  AnsControllerShutdown ();
++  AnsControllerDisable ();
++Error:
++  if (mAns.RtkitUp) {
++    AppleRtkitQuiesce (&mAns.Rtkit);
++    AppleRtkitSleep (&mAns.Rtkit);
++    AppleRtkitFree (&mAns.Rtkit);
++    mAns.RtkitUp = FALSE;
++  }
++
++  AnsFreeQueue (&mAns.IoQueue);
++  AnsFreeQueue (&mAns.AdminQueue);
++  return Status;
++}
++
++STATIC
++EFI_STATUS
++AnsInstallBlockIo (
++  VOID
++  )
++{
++  EFI_STATUS  Status;
++
++  mAns.Media.MediaId          = 1;
++  mAns.Media.RemovableMedia   = FALSE;
++  mAns.Media.MediaPresent     = TRUE;
++  mAns.Media.LogicalPartition = FALSE;
++  mAns.Media.ReadOnly         = FALSE;
++  mAns.Media.WriteCaching     = TRUE;
++  mAns.Media.BlockSize        = mAns.BlockSize;
++  mAns.Media.IoAlign          = 0;
++  mAns.Media.LastBlock        = mAns.LastBlock;
++
++  mAns.BlockIo.Revision    = EFI_BLOCK_IO_PROTOCOL_REVISION;
++  mAns.BlockIo.Media       = &mAns.Media;
++  mAns.BlockIo.Reset       = AnsBlockIoReset;
++  mAns.BlockIo.ReadBlocks  = AnsBlockIoReadBlocks;
++  mAns.BlockIo.WriteBlocks = AnsBlockIoWriteBlocks;
++  mAns.BlockIo.FlushBlocks = AnsBlockIoFlushBlocks;
++
++  mAns.Handle = NULL;
++  Status      = gBS->InstallMultipleProtocolInterfaces (
++                       &mAns.Handle,
++                       &gEfiBlockIoProtocolGuid,
++                       &mAns.BlockIo,
++                       NULL
++                       );
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: cannot publish the block device: %r\n", Status));
++    return Status;
++  }
++
++  DEBUG ((
++    DEBUG_INFO,
++    "ans: EFI_BLOCK_IO_PROTOCOL installed: %ld blocks x %d bytes\n",
++    mAns.LastBlock + 1,
++    mAns.BlockSize
++    ));
++
++  return EFI_SUCCESS;
++}
++
++/**
++  Entry point of the Apple NAND storage driver.
++
++  @param[in] ImageHandle  Handle of this driver image.
++  @param[in] SystemTable  Pointer to the EFI System Table.
++
++  @retval EFI_SUCCESS  The driver installed the controller, or the platform has
++                       no ANS node to drive.
++  @retval others       The controller was found but could not be brought up.
++
++**/
++EFI_STATUS
++EFIAPI
++AppleNANDStorageDxeInitialize (
++  IN EFI_HANDLE        ImageHandle,
++  IN EFI_SYSTEM_TABLE  *SystemTable
++  )
++{
++  EFI_STATUS  Status;
++
++  ZeroMem (&mAns, sizeof (mAns));
++
++  mAns.IdentifyBuffer = AllocateAlignedPages (EFI_SIZE_TO_PAGES (NVME_DEFAULT_BLOCK_SIZE), NVME_DEFAULT_BLOCK_SIZE);
++  if (mAns.IdentifyBuffer == NULL) {
++    DEBUG ((DEBUG_ERROR, "ans: cannot allocate the identify buffer\n"));
++    return EFI_OUT_OF_RESOURCES;
++  }
++
++  Status = AnsInitialize ();
++  if (Status == EFI_NOT_FOUND) {
++    //
++    // Not an M4-class machine, or the tree does not describe an ANS.  That is
++    // not an error for this driver.
++    //
++    Status = EFI_SUCCESS;
++  } else if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "ans: the internal storage controller was not brought up: %r\n", Status));
++  } else {
++    Status = AnsInstallBlockIo ();
++    if (EFI_ERROR (Status)) {
++      mAns.Initialized = FALSE;
++    }
++  }
++
++  if (mAns.IdentifyBuffer != NULL) {
++    FreeAlignedPages (mAns.IdentifyBuffer, EFI_SIZE_TO_PAGES (NVME_DEFAULT_BLOCK_SIZE));
++    mAns.IdentifyBuffer = NULL;
++  }
++
++  return Status;
++}
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.inf b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.inf
+index ff6a82a..8746de4 100644
+--- a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.inf
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNANDStorageDxe.inf
+@@ -3,9 +3,12 @@
+ #
+ #  Module Name:
+ #    AppleNANDStorageDxe.inf
+-#  
++#
+ #  Abstract:
+ #    Apple NAND Storage controller driver for Apple Silicon platforms.
++#    Brings the ANS/ANS2 coprocessor up through its ASC mailbox and RTKit
++#    handshake, programs the NVMMU/NVMe queues and publishes the internal SSD
++#    as an EFI_BLOCK_IO_PROTOCOL device.
+ #
+ #  Environment:
+ #    UEFI Driver Execution Environment (DXE)
+@@ -24,11 +27,33 @@
+ 
+ 
+ [Sources]
++  AppleNandStorage.h
+   AppleNANDStorageDxe.c
++  AppleAsc.c
++  AppleSart.c
++  AppleRtkit.c
+ 
+ 
+ [Packages]
+-  ArmPkg/ArmPkg.dec
+-  MdeModulePkg/MdeModulePkg.dec
+   MdePkg/MdePkg.dec
+-  AppleSiliconPkg/AppleSiliconPkg.dec
+\ No newline at end of file
++  AppleSiliconPkg/AppleSiliconPkg.dec
++
++
++[LibraryClasses]
++  BaseLib
++  BaseMemoryLib
++  DebugLib
++  IoLib
++  MemoryAllocationLib
++  UefiBootServicesTableLib
++  UefiDriverEntryPoint
++  UefiLib
++  AppleDTLib
++
++
++[Protocols]
++  gEfiBlockIoProtocolGuid         ## PRODUCES
++
++
++[Depex]
++  TRUE
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNandStorage.h b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNandStorage.h
+new file mode 100644
+index 0000000..c682d70
+--- /dev/null
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleNandStorage.h
+@@ -0,0 +1,550 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors). All rights reserved.
++ *
++ * Module Name:
++ *   AppleNandStorage.h
++ *
++ * Abstract:
++ *   Types and register definitions for the Apple ANS/ANS2 non-volatile storage
++ *   controller.  The ANS is not a PCIe NVMe device: it is a coprocessor (ASC
++ *   + RTKit firmware) with an NVMe engine behind Apple's own NVMMU, so the
++ *   bring-up order is ASC mailbox -> SART -> RTKit handshake -> NVMMU/NVMe
++ *   queues -> Identify -> BlockIo.
++ *
++ *   The register-level sequence is a port of m1n1's nvme.c, asc.c, sart.c and
++ *   rtkit.c (GPL-2.0-or-later / MIT), which is the only implementation of this
++ *   controller outside Apple's own operating systems.
++ *
++ * Environment:
++ *   UEFI DXE (Driver Execution Environment).
++ *
++ * License:
++ *   SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ *
++ **/
++
++#ifndef APPLE_NAND_STORAGE_H
++#define APPLE_NAND_STORAGE_H
++
++#include <Uefi.h>
++#include <Protocol/BlockIo.h>
++#include <Library/BaseLib.h>
++#include <Library/BaseMemoryLib.h>
++#include <Library/DebugLib.h>
++#include <Library/IoLib.h>
++#include <Library/MemoryAllocationLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++#include <Library/UefiLib.h>
++#include <Library/AppleDTLib.h>
++
++//
++// Field helpers.  BitFieldRead* comes from BaseLib; keeping the bit positions
++// explicit (rather than GENMASK/FIELD_PREP) makes them checkable against
++// m1n1's sources by eye and by scripts/check-ans2-constants.py.
++//
++#define ANS_FIELD_GET(Value, Start, End)  BitFieldRead64 ((UINT64)(Value), (Start), (End))
++#define ANS_FIELD_PREP(Value, Start)      LShiftU64 ((UINT64)(Value), (Start))
++
++//
++// ---------------------------------------------------------------------------
++// ASC (Apple Storage Coprocessor) mailboxes.  Two FIFOs: A2I (AP to IOP) and
++// I2A (IOP to AP).  Each side publishes {u64 msg0, u32 msg1} where msg1 is the
++// RTKit endpoint the message is addressed to.
++// ---------------------------------------------------------------------------
++//
++#define ASC_CPU_CONTROL        0x44
++#define ASC_CPU_CONTROL_START  0x10
++
++#define ASC_MBOX_A2I_CONTROL  0x110
++#define ASC_MBOX_A2I_SEND0    0x800
++#define ASC_MBOX_A2I_SEND1    0x808
++
++#define ASC_MBOX_I2A_CONTROL  0x114
++#define ASC_MBOX_I2A_RECV0    0x830
++#define ASC_MBOX_I2A_RECV1    0x838
++
++#define ASC_MBOX_CONTROL_FULL   BIT16
++#define ASC_MBOX_CONTROL_EMPTY  BIT17
++
++//
++// The mailbox register block starts 0x8000 above the ASC node's reg[0]; the
++// CPU control word is at reg[0] itself.
++//
++#define ASC_MAILBOX_OFFSET  0x8000
++
++typedef struct {
++  UINT64    Msg0;
++  UINT32    Msg1;
++} APPLE_ASC_MESSAGE;
++
++typedef struct {
++  UINTN        CpuBase;
++  UINTN        Base;
++  dt_node_t    *AnsNode;
++  dt_node_t    *IopNode;
++} APPLE_ASC_DEV;
++
++EFI_STATUS
++AppleAscInit (
++  IN  dt_node_t      *AnsNode,
++  OUT APPLE_ASC_DEV  *Asc
++  );
++
++VOID
++AppleAscCpuStart (
++  IN APPLE_ASC_DEV  *Asc
++  );
++
++VOID
++AppleAscCpuStop (
++  IN APPLE_ASC_DEV  *Asc
++  );
++
++BOOLEAN
++AppleAscCpuRunning (
++  IN APPLE_ASC_DEV  *Asc
++  );
++
++BOOLEAN
++AppleAscCanSend (
++  IN APPLE_ASC_DEV  *Asc
++  );
++
++BOOLEAN
++AppleAscCanRecv (
++  IN APPLE_ASC_DEV  *Asc
++  );
++
++BOOLEAN
++AppleAscSend (
++  IN APPLE_ASC_DEV          *Asc,
++  IN CONST APPLE_ASC_MESSAGE *Msg
++  );
++
++BOOLEAN
++AppleAscRecv (
++  IN  APPLE_ASC_DEV    *Asc,
++  OUT APPLE_ASC_MESSAGE *Msg
++  );
++
++BOOLEAN
++AppleAscRecvTimeout (
++  IN  APPLE_ASC_DEV     *Asc,
++  OUT APPLE_ASC_MESSAGE *Msg,
++  IN  UINT32            DelayUsec
++  );
++
++VOID
++AppleAscDrain (
++  IN APPLE_ASC_DEV  *Asc
++  );
++
++//
++// ---------------------------------------------------------------------------
++// SART (System Address Resolution Table).  A 16-entry window table that limits
++// which DRAM the coprocessor (not the NVMe engine) may touch.  Four register
++// layouts exist; the ADT's "sart-version" selects one.
++// ---------------------------------------------------------------------------
++//
++#define APPLE_SART_MAX_ENTRIES  16
++
++#define APPLE_SART0_CONFIG_OFFSET       0x00
++#define APPLE_SART0_PADDR_OFFSET        0x40
++#define APPLE_SART2_CONFIG_OFFSET       0x00
++#define APPLE_SART2_PADDR_OFFSET        0x40
++#define APPLE_SART3_CONFIG_OFFSET       0x00
++#define APPLE_SART3_PADDR_OFFSET        0x40
++#define APPLE_SART3_SIZE_OFFSET         0x80
++#define APPLE_SART4_CONFIG_OFFSET       0x00
++#define APPLE_SART4_PADDR_OFFSET        0x60
++#define APPLE_SART4_SIZE_OFFSET         0xc0
++
++#define APPLE_SART0_CONFIG_FLAGS_START  24
++#define APPLE_SART0_CONFIG_FLAGS_END    28
++#define APPLE_SART0_CONFIG_SIZE_START   0
++#define APPLE_SART0_CONFIG_SIZE_END     18
++#define APPLE_SART0_SIZE_SHIFT          12
++#define APPLE_SART0_PADDR_SHIFT         12
++#define APPLE_SART0_FLAGS_ALLOW         0xf
++
++#define APPLE_SART2_CONFIG_FLAGS_START  24
++#define APPLE_SART2_CONFIG_FLAGS_END    31
++#define APPLE_SART2_CONFIG_SIZE_START   0
++#define APPLE_SART2_CONFIG_SIZE_END     23
++#define APPLE_SART2_SIZE_SHIFT          12
++#define APPLE_SART2_PADDR_SHIFT         12
++#define APPLE_SART2_FLAGS_ALLOW         0xff
++
++#define APPLE_SART3_SIZE_START  0
++#define APPLE_SART3_SIZE_END    29
++#define APPLE_SART3_SIZE_SHIFT  12
++#define APPLE_SART3_PADDR_SHIFT 12
++#define APPLE_SART3_FLAGS_ALLOW 0xff
++
++#define APPLE_SART4_SIZE_START  0
++#define APPLE_SART4_SIZE_END    29
++#define APPLE_SART4_SIZE_SHIFT  12
++#define APPLE_SART4_PADDR_SHIFT 12
++#define APPLE_SART4_FLAGS_ALLOW 0xff
++
++typedef struct _APPLE_SART_DEV APPLE_SART_DEV;
++
++struct _APPLE_SART_DEV {
++  UINTN      Base;
++  UINT32     Version;
++  UINT32     ProtectedEntries;
++  UINT32     FlagsAllow;
++  UINT32     ConfigOffset;
++  UINT32     PaddrOffset;
++  UINT32     SizeOffset;
++
++  VOID
++  (*GetEntry) (
++    IN  APPLE_SART_DEV  *Sart,
++    IN  UINT32          Index,
++    OUT UINT8           *Flags,
++    OUT UINT64          *Paddr,
++    OUT UINT64          *Size
++    );
++
++  BOOLEAN
++  (*SetEntry) (
++    IN APPLE_SART_DEV  *Sart,
++    IN UINT32          Index,
++    IN UINT8           Flags,
++    IN UINT64          Paddr,
++    IN UINT64          Size
++    );
++};
++
++EFI_STATUS
++AppleSartInit (
++  IN  dt_node_t       *SartNode,
++  OUT APPLE_SART_DEV  *Sart
++  );
++
++BOOLEAN
++AppleSartAddAllowedRegion (
++  IN APPLE_SART_DEV  *Sart,
++  IN UINT64          Paddr,
++  IN UINT64          Size
++  );
++
++BOOLEAN
++AppleSartRemoveAllowedRegion (
++  IN APPLE_SART_DEV  *Sart,
++  IN UINT64          Paddr,
++  IN UINT64          Size
++  );
++
++//
++// ---------------------------------------------------------------------------
++// RTKit.  The coprocessor firmware is an RTKit IOP: a small message protocol
++// runs before any NVMe register is touched.  Endpoints 0-0x1f are the
++// firmware's own (management, crashlog, syslog, ioreport, oslog); the driver
++// must answer buffer requests and ACK syslog entries or the IOP stops.
++// ---------------------------------------------------------------------------
++//
++#define RTKIT_EP_MGMT      0
++#define RTKIT_EP_CRASHLOG  1
++#define RTKIT_EP_SYSLOG    2
++#define RTKIT_EP_DEBUG     3
++#define RTKIT_EP_IOREPORT  4
++#define RTKIT_EP_OSLOG     8
++
++#define RTKIT_MGMT_TYPE_START  52
++#define RTKIT_MGMT_TYPE_END    59
++
++#define RTKIT_MGMT_PWR_STATE_START  0
++#define RTKIT_MGMT_PWR_STATE_END    15
++
++#define RTKIT_MSG_BUFFER_REQUEST        1
++#define RTKIT_MSG_BUFFER_REQUEST_SIZE_START  44
++#define RTKIT_MSG_BUFFER_REQUEST_SIZE_END    51
++#define RTKIT_MSG_BUFFER_REQUEST_IOVA_START  0
++#define RTKIT_MSG_BUFFER_REQUEST_IOVA_END    41
++
++#define RTKIT_MSG_SYSLOG_INIT            8
++#define RTKIT_MSG_SYSLOG_INIT_SIZE_START 24
++#define RTKIT_MSG_SYSLOG_INIT_SIZE_END   39
++#define RTKIT_MSG_SYSLOG_INIT_COUNT_START  0
++#define RTKIT_MSG_SYSLOG_INIT_COUNT_END    15
++#define RTKIT_MSG_SYSLOG_LOG             5
++#define RTKIT_MSG_SYSLOG_LOG_INDEX_START 0
++#define RTKIT_MSG_SYSLOG_LOG_INDEX_END   7
++
++#define RTKIT_MSG_OSLOG_INIT  0x10
++#define RTKIT_MSG_OSLOG_ACK   0x30
++
++#define RTKIT_MGMT_MSG_HELLO        1
++#define RTKIT_MGMT_MSG_HELLO_ACK    2
++#define RTKIT_MGMT_MSG_HELLO_MINVER_START  0
++#define RTKIT_MGMT_MSG_HELLO_MINVER_END    15
++#define RTKIT_MGMT_MSG_HELLO_MAXVER_START  16
++#define RTKIT_MGMT_MSG_HELLO_MAXVER_END    31
++
++#define RTKIT_MGMT_MSG_IOP_PWR_STATE      6
++#define RTKIT_MGMT_MSG_IOP_PWR_STATE_ACK  7
++
++#define RTKIT_MGMT_MSG_EPMAP            8
++#define RTKIT_MGMT_MSG_EPMAP_DONE_BIT   51
++#define RTKIT_MGMT_MSG_EPMAP_BASE_START 32
++#define RTKIT_MGMT_MSG_EPMAP_BASE_END   34
++#define RTKIT_MGMT_MSG_EPMAP_BITMAP_START  0
++#define RTKIT_MGMT_MSG_EPMAP_BITMAP_END    31
++
++#define RTKIT_MGMT_MSG_EPMAP_REPLY       8
++#define RTKIT_MGMT_MSG_EPMAP_REPLY_DONE_BIT  51
++#define RTKIT_MGMT_MSG_EPMAP_REPLY_MORE_BIT  0
++
++#define RTKIT_MGMT_MSG_AP_PWR_STATE      0xb
++#define RTKIT_MGMT_MSG_AP_PWR_STATE_ACK  0xb
++
++#define RTKIT_MGMT_MSG_START_EP        5
++#define RTKIT_MGMT_MSG_START_EP_IDX_START  32
++#define RTKIT_MGMT_MSG_START_EP_IDX_END    39
++#define RTKIT_MGMT_MSG_START_EP_FLAG_BIT   1
++
++#define RTKIT_MIN_VERSION  11
++#define RTKIT_MAX_VERSION  12
++
++#define RTKIT_POWER_OFF       0x00
++#define RTKIT_POWER_SLEEP     0x01
++#define RTKIT_POWER_QUIESCED  0x10
++#define RTKIT_POWER_ON        0x20
++#define RTKIT_POWER_INIT      0x220
++
++#define RTKIT_SYSLOG_HDR_SIZE  32
++#define RTKIT_SYSLOG_MSG_MAX   256
++
++typedef struct {
++  UINT8     Ep;
++  UINT64    Msg;
++} APPLE_RTKIT_MESSAGE;
++
++typedef struct {
++  UINT64    Phys;
++  UINT64    Dva;
++  UINT64    Size;
++  BOOLEAN   Allocated;
++} APPLE_RTKIT_BUFFER;
++
++typedef struct {
++  CONST CHAR8      *Name;
++  APPLE_ASC_DEV    Asc;
++  APPLE_SART_DEV   Sart;
++  BOOLEAN          HasSart;
++
++  UINT64           DvaBase;
++
++  UINT32           IopPower;
++  UINT32           ApPower;
++
++  APPLE_RTKIT_BUFFER  Syslog;
++  APPLE_RTKIT_BUFFER  Crashlog;
++  APPLE_RTKIT_BUFFER  Ioreport;
++
++  UINT32           SyslogCount;
++  UINT32           SyslogEntrySize;
++
++  BOOLEAN          Crashed;
++  BOOLEAN          Booted;
++} APPLE_RTKIT_DEV;
++
++EFI_STATUS
++AppleRtkitInit (
++  IN  CONST CHAR8     *Name,
++  IN  APPLE_ASC_DEV   *Asc,
++  IN  APPLE_SART_DEV  *Sart,      OPTIONAL
++  OUT APPLE_RTKIT_DEV *Rtk
++  );
++
++EFI_STATUS
++AppleRtkitBoot (
++  IN OUT APPLE_RTKIT_DEV  *Rtk
++  );
++
++EFI_STATUS
++AppleRtkitQuiesce (
++  IN OUT APPLE_RTKIT_DEV  *Rtk
++  );
++
++EFI_STATUS
++AppleRtkitSleep (
++  IN OUT APPLE_RTKIT_DEV  *Rtk
++  );
++
++VOID
++AppleRtkitFree (
++  IN OUT APPLE_RTKIT_DEV  *Rtk
++  );
++
++INTN
++AppleRtkitRecv (
++  IN  APPLE_RTKIT_DEV      *Rtk,
++  OUT APPLE_RTKIT_MESSAGE  *Msg
++  );
++
++BOOLEAN
++AppleRtkitSend (
++  IN APPLE_RTKIT_DEV            *Rtk,
++  IN CONST APPLE_RTKIT_MESSAGE  *Msg
++  );
++
++//
++// ---------------------------------------------------------------------------
++// NVMe engine and NVMMU.  Two register layouts: M1-M3 (T8103) put the NVMMU and
++// the NVMe registers in the same region (reg[3] of /arm-io/ans); M4 and later
++// (T8132) separate them (NVMMU reg[3], NVMe reg[9]) and need two extra writes
++// after the IO queues are created, or the ANS crashes.
++// ---------------------------------------------------------------------------
++//
++#define ANS_TYPE_T8103  0
++#define ANS_TYPE_T8132  1
++
++#define NVME_TIMEOUT_USEC           1000000
++#define NVME_ENABLE_TIMEOUT_USEC    5000000
++#define NVME_SHUTDOWN_TIMEOUT_USEC  5000000
++#define NVME_QUEUE_SIZE             64
++#define NVME_DEFAULT_BLOCK_SIZE     4096
++
++#define NVME_CC                0x14
++#define NVME_CC_SHN_START      14
++#define NVME_CC_SHN_END        15
++#define NVME_CC_SHN_NONE       0
++#define NVME_CC_SHN_NORMAL     1
++#define NVME_CC_SHN_ABRUPT     2
++#define NVME_CC_EN_BIT         0
++
++#define NVME_CSTS               0x1c
++#define NVME_CSTS_SHST_START    2
++#define NVME_CSTS_SHST_END      3
++#define NVME_CSTS_SHST_NORMAL   0
++#define NVME_CSTS_SHST_BUSY     1
++#define NVME_CSTS_SHST_DONE     2
++#define NVME_CSTS_RDY_BIT       0
++
++#define NVME_AQA  0x24
++#define NVME_ASQ  0x28
++#define NVME_ACQ  0x30
++
++#define NVME_DB_ACQ   0x1004
++#define NVME_DB_IOCQ  0x100c
++
++#define NVME_BOOT_STATUS     0x1300
++#define NVME_BOOT_STATUS_OK  0xde71ce55
++
++#define NVME_LINEAR_SQ_CTRL     0x24908
++#define NVME_LINEAR_SQ_CTRL_EN  BIT0
++
++#define NVME_IOQ_CMDS            0x1200
++#define NVME_IOQ_CQES            0x1208
++#define NVME_MAX_PEND_CMDS_CTRL  0x1210
++#define NVME_DB_LINEAR_ASQ       0x2490c
++#define NVME_DB_LINEAR_IOSQ      0x24910
++
++#define NVMMU_NUM        0x28100
++#define NVMMU_ASQ_BASE   0x28108
++#define NVMMU_IOSQ_BASE  0x28110
++#define NVMMU_TCB_INVAL  0x28118
++#define NVMMU_TCB_STAT   0x29120
++
++#define NVME_ADMIN_CMD_DELETE_SQ  0x00
++#define NVME_ADMIN_CMD_CREATE_SQ  0x01
++#define NVME_ADMIN_CMD_DELETE_CQ  0x04
++#define NVME_ADMIN_CMD_CREATE_CQ  0x05
++#define NVME_ADMIN_CMD_IDENTIFY   0x06
++#define NVME_QUEUE_CONTIGUOUS     BIT0
++
++#define NVME_CMD_FLUSH  0x00
++#define NVME_CMD_WRITE  0x01
++#define NVME_CMD_READ   0x02
++
++#define NVMMU_TCB_DMA_FROM_DEVICE  BIT0
++#define NVMMU_TCB_DMA_TO_DEVICE    BIT1
++
++#define NVME_CNS_NAMESPACE  0x00
++#define NVME_CNS_CONTROLLER 0x01
++
++//
++// Apple's NVMe submission entry: the tag is a single byte and the rest of the
++// standard 16-bit CID field is reserved.
++//
++typedef struct {
++  UINT8     Opcode;
++  UINT8     Flags;
++  UINT8     Tag;
++  UINT8     Rsvd;
++  UINT32    Nsid;
++  UINT32    Cdw2;
++  UINT32    Cdw3;
++  UINT64    Metadata;
++  UINT64    Prp1;
++  UINT64    Prp2;
++  UINT32    Cdw10;
++  UINT32    Cdw11;
++  UINT32    Cdw12;
++  UINT32    Cdw13;
++  UINT32    Cdw14;
++  UINT32    Cdw15;
++} APPLE_NVME_COMMAND;
++
++typedef struct {
++  UINT64    Result;
++  UINT32    Rsvd;
++  UINT16    Tag;
++  UINT16    Status;
++} APPLE_NVME_COMPLETION;
++
++//
++// One NVMMU TCB per submission slot.  The NVMe engine is given TCBs, not
++// commands: the TCB carries the DMA direction, the transfer length and the
++// PRP list for the command in the matching slot.
++//
++typedef struct {
++  UINT8     Opcode;
++  UINT8     DmaFlags;
++  UINT8     SlotId;
++  UINT8     Unk0;
++  UINT32    Len;
++  UINT64    Unk1[2];
++  UINT64    Prp1;
++  UINT64    Prp2;
++  UINT64    Unk2[2];
++  UINT8     AesIv[8];
++  UINT8     AesUnk[64];
++} APPLE_NVMMU_TCB;
++
++typedef struct {
++  APPLE_NVMMU_TCB       *Tcbs;
++  APPLE_NVME_COMMAND    *Cmds;
++  APPLE_NVME_COMPLETION *Cqes;
++
++  UINT8                 CqHead;
++  UINT8                 CqPhase;
++  BOOLEAN               AdminQueue;
++} APPLE_NVME_QUEUE;
++
++//
++// Identify Namespace, only the fields the driver reads.  FLBAS selects the
++// active LBA format from the 16-entry LBAF array at offset 128.
++//
++#define NVME_IDENTIFY_FLBAS_OFFSET  26
++#define NVME_IDENTIFY_LBAF_OFFSET   128
++#define NVME_IDENTIFY_LBAF_STRIDE   4
++#define NVME_IDENTIFY_LBAF_LBADS    2
++
++typedef struct {
++  UINT64    Nsze;
++  UINT64    Ncap;
++  UINT64    Nuse;
++  UINT8     Nsfeat;
++  UINT8     NlbaFormat;
++  UINT8     Flbas;
++  UINT8     Rsvd[101];
++  UINT8     LbaFormat[64];
++  UINT8     Rsvd2[192];
++  UINT8     VendorSpecific[3712];
++} APPLE_NVME_IDENTIFY_NAMESPACE;
++
++#endif /* APPLE_NAND_STORAGE_H */
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleRtkit.c b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleRtkit.c
+new file mode 100644
+index 0000000..61e93c0
+--- /dev/null
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleRtkit.c
+@@ -0,0 +1,824 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors). All rights reserved.
++ *
++ * Module Name:
++ *   AppleRtkit.c
++ *
++ * Abstract:
++ *   RTKit IOP handshake for the ANS coprocessor.  Ported from m1n1's
++ *   src/rtkit.c, restricted to what a storage controller needs (no DART/iova
++ *   path: the ANS uses a SART, which is an identity window table).
++ *
++ *   The firmware will not touch a single NVMe register until this exchange has
++ *   happened, and it expects the driver to answer its own endpoint traffic
++ *   (buffer requests, syslog entries) while it waits - a firmware that is left
++ *   with an unanswered message stops responding entirely.
++ *
++ * Environment:
++ *   UEFI DXE (Driver Execution Environment).
++ *
++ * License:
++ *   SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ *
++ **/
++
++#include "AppleNandStorage.h"
++
++#define RTKIT_DEFAULT_BUFFER_SIZE  (64 * 1024)
++
++//
++// One syslog entry: {u32 hdr, u32 unk, char context[24], char msg[]}.
++//
++#define RTKIT_SYSLOG_CTX_OFFSET  8
++#define RTKIT_SYSLOG_CTX_LENGTH  24
++
++EFI_STATUS
++AppleRtkitInit (
++  IN  CONST CHAR8     *Name,
++  IN  APPLE_ASC_DEV   *Asc,
++  IN  APPLE_SART_DEV  *Sart,      OPTIONAL
++  OUT APPLE_RTKIT_DEV *Rtk
++  )
++{
++  uint64_t  *DramMask;
++
++  ZeroMem (Rtk, sizeof (*Rtk));
++
++  Rtk->Name    = Name;
++  Rtk->Asc     = *Asc;
++  if (Sart != NULL) {
++    Rtk->Sart    = *Sart;
++    Rtk->HasSart = TRUE;
++  }
++
++  Rtk->IopPower = RTKIT_POWER_OFF;
++  Rtk->ApPower  = RTKIT_POWER_OFF;
++  Rtk->DvaBase  = 0;
++
++  if (Rtk->Asc.IopNode != NULL) {
++    DramMask = (uint64_t *)dt_node_prop (Rtk->Asc.IopNode, "asc-dram-mask", NULL);
++    if (DramMask != NULL) {
++      Rtk->DvaBase = (UINT64)*DramMask;
++      DEBUG ((DEBUG_INFO, "rtkit(%a): asc-dram-mask 0x%lx\n", Name, Rtk->DvaBase));
++    }
++  }
++
++  if (!Rtk->HasSart) {
++    DEBUG ((DEBUG_WARN, "rtkit(%a): no SART; the firmware cannot be given buffers\n", Name));
++    return EFI_UNSUPPORTED;
++  }
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++BOOLEAN
++AppleRtkitMapBuffer (
++  IN  APPLE_RTKIT_DEV     *Rtk,
++  OUT APPLE_RTKIT_BUFFER  *Bfr,
++  IN  UINT64              Size
++  )
++{
++  VOID    *Allocation;
++  UINT64  AlignedSize;
++
++  AlignedSize = ALIGN_VALUE (Size, 16384);
++
++  Allocation = AllocateAlignedPages (EFI_SIZE_TO_PAGES (AlignedSize), 16384);
++  if (Allocation == NULL) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): cannot allocate 0x%lx buffer\n", Rtk->Name, Size));
++    return FALSE;
++  }
++
++  ZeroMem (Allocation, (UINTN)AlignedSize);
++
++  Bfr->Phys      = (UINT64)(UINTN)Allocation;
++  Bfr->Size      = AlignedSize;
++  Bfr->Allocated = TRUE;
++
++  if (!AppleSartAddAllowedRegion (&Rtk->Sart, Bfr->Phys, AlignedSize)) {
++    FreeAlignedPages (Allocation, EFI_SIZE_TO_PAGES (AlignedSize));
++    ZeroMem (Bfr, sizeof (*Bfr));
++    return FALSE;
++  }
++
++  Bfr->Dva = Bfr->Phys;
++
++  DEBUG ((
++    DEBUG_INFO,
++    "rtkit(%a): buffer phys 0x%lx size 0x%lx\n",
++    Rtk->Name,
++    Bfr->Phys,
++    Bfr->Size
++    ));
++
++  return TRUE;
++}
++
++STATIC
++VOID
++AppleRtkitFreeBuffer (
++  IN OUT APPLE_RTKIT_DEV     *Rtk,
++  IN OUT APPLE_RTKIT_BUFFER  *Bfr
++  )
++{
++  if (!Bfr->Allocated) {
++    ZeroMem (Bfr, sizeof (*Bfr));
++    return;
++  }
++
++  if (!AppleSartRemoveAllowedRegion (&Rtk->Sart, Bfr->Phys, Bfr->Size)) {
++    DEBUG ((DEBUG_WARN, "rtkit(%a): SART entry for 0x%lx was already gone\n", Rtk->Name, Bfr->Phys));
++  }
++
++  FreeAlignedPages ((VOID *)(UINTN)Bfr->Phys, EFI_SIZE_TO_PAGES ((UINTN)Bfr->Size));
++  ZeroMem (Bfr, sizeof (*Bfr));
++}
++
++STATIC
++BOOLEAN
++AppleRtkitHandleBufferRequest (
++  IN OUT APPLE_RTKIT_DEV     *Rtk,
++  IN     APPLE_RTKIT_MESSAGE *Msg,
++  IN OUT APPLE_RTKIT_BUFFER  *Bfr
++  )
++{
++  UINT64               Pages;
++  UINT64               Size;
++  UINT64               Addr;
++  APPLE_RTKIT_MESSAGE  Reply;
++
++  Pages = ANS_FIELD_GET (
++            Msg->Msg,
++            RTKIT_MSG_BUFFER_REQUEST_SIZE_START,
++            RTKIT_MSG_BUFFER_REQUEST_SIZE_END
++            );
++  Size = LShiftU64 (Pages, 12);
++  Addr = ANS_FIELD_GET (
++           Msg->Msg,
++           RTKIT_MSG_BUFFER_REQUEST_IOVA_START,
++           RTKIT_MSG_BUFFER_REQUEST_IOVA_END
++           );
++
++  if (Addr != 0) {
++    //
++    // The firmware is telling us it already has a buffer; with a SART the
++    // address is physical and no translation is involved.
++    //
++    Bfr->Phys      = (Addr & ~Rtk->DvaBase);
++    Bfr->Dva       = Addr;
++    Bfr->Size      = Size;
++    Bfr->Allocated = FALSE;
++    DEBUG ((DEBUG_INFO, "rtkit(%a): pre-allocated buffer (ep 0x%x, dva 0x%lx)\n", Rtk->Name, Msg->Ep, Addr));
++    return TRUE;
++  }
++
++  if (!AppleRtkitMapBuffer (Rtk, Bfr, Size)) {
++    return FALSE;
++  }
++
++  Reply.Msg  = ANS_FIELD_PREP (RTKIT_MSG_BUFFER_REQUEST, RTKIT_MGMT_TYPE_START);
++  Reply.Msg |= ANS_FIELD_PREP (Pages, RTKIT_MSG_BUFFER_REQUEST_SIZE_START);
++  Reply.Msg |= ANS_FIELD_PREP (Bfr->Dva | Rtk->DvaBase, RTKIT_MSG_BUFFER_REQUEST_IOVA_START);
++  Reply.Ep   = Msg->Ep;
++
++  if (!AppleRtkitSend (Rtk, &Reply)) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): unable to send buffer reply\n", Rtk->Name));
++    AppleRtkitFreeBuffer (Rtk, Bfr);
++    return FALSE;
++  }
++
++  return TRUE;
++}
++
++STATIC
++VOID
++AppleRtkitPrintSyslog (
++  IN APPLE_RTKIT_DEV  *Rtk,
++  IN UINT64           Index
++  )
++{
++  UINT64  Stride;
++  UINT8   *Entry;
++  CHAR8   Context[RTKIT_SYSLOG_CTX_LENGTH + 1];
++  CHAR8   Message[RTKIT_SYSLOG_MSG_MAX + 1];
++  UINTN   MessageLength;
++
++  if ((Rtk->Syslog.Dva == 0) || (Rtk->SyslogEntrySize == 0)) {
++    return;
++  }
++
++  Stride = Rtk->SyslogEntrySize + RTKIT_SYSLOG_CTX_OFFSET + RTKIT_SYSLOG_CTX_LENGTH;
++  if ((Index + 1) * Stride > Rtk->Syslog.Size) {
++    DEBUG ((DEBUG_WARN, "rtkit(%a): syslog index %d is outside the buffer\n", Rtk->Name, Index));
++    return;
++  }
++
++  Entry = (UINT8 *)(UINTN)Rtk->Syslog.Phys + Stride * Index;
++
++  CopyMem (Context, Entry + RTKIT_SYSLOG_CTX_OFFSET, RTKIT_SYSLOG_CTX_LENGTH);
++  Context[RTKIT_SYSLOG_CTX_LENGTH] = '\0';
++
++  MessageLength = AsciiStrnLenS ((CHAR8 *)(Entry + RTKIT_SYSLOG_CTX_OFFSET + RTKIT_SYSLOG_CTX_LENGTH), Rtk->SyslogEntrySize);
++  if (MessageLength > RTKIT_SYSLOG_MSG_MAX) {
++    MessageLength = RTKIT_SYSLOG_MSG_MAX;
++  }
++
++  CopyMem (Message, Entry + RTKIT_SYSLOG_CTX_OFFSET + RTKIT_SYSLOG_CTX_LENGTH, MessageLength);
++  Message[MessageLength] = '\0';
++
++  DEBUG ((DEBUG_INFO, "rtkit(%a) syslog: [%a] %a\n", Rtk->Name, Context, Message));
++}
++
++STATIC
++VOID
++AppleRtkitPrintCrashlog (
++  IN APPLE_RTKIT_DEV  *Rtk
++  )
++{
++  UINT8   *Header;
++  UINT8   *Entry;
++  UINT32  Type;
++  UINT32  Length;
++
++  Rtk->Crashed = TRUE;
++
++  DEBUG ((DEBUG_ERROR, "rtkit(%a): IOP crashed\n", Rtk->Name));
++
++  if (Rtk->Crashlog.Phys == 0) {
++    return;
++  }
++
++  Header = (UINT8 *)(UINTN)Rtk->Crashlog.Phys;
++  Type   = ((UINT32 *)Header)[0];
++  if (Type != SIGNATURE_32 ('C', 'L', 'H', 'E')) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): bad crashlog header 0x%x\n", Rtk->Name, Type));
++    return;
++  }
++
++  Entry = Header + 32;
++  while (((UINT32 *)Entry)[0] != SIGNATURE_32 ('C', 'L', 'H', 'E')) {
++    Type   = ((UINT32 *)Entry)[0];
++    Length = ((UINT32 *)Entry)[12];
++
++    if (Length < 16) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): crashlog entry with length %d; stopping\n", Rtk->Name, Length));
++      break;
++    }
++
++    if (Type == SIGNATURE_32 ('C', 's', 't', 'r')) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): crash message %d: %a\n", Rtk->Name, ((UINT32 *)Entry)[4], (CHAR8 *)(Entry + 20)));
++    } else {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): crashlog entry 0x%x\n", Rtk->Name, Type));
++    }
++
++    Entry += Length;
++  }
++}
++
++BOOLEAN
++AppleRtkitSend (
++  IN APPLE_RTKIT_DEV           *Rtk,
++  IN CONST APPLE_RTKIT_MESSAGE *Msg
++  )
++{
++  APPLE_ASC_MESSAGE  AscMsg;
++
++  AscMsg.Msg0 = Msg->Msg;
++  AscMsg.Msg1 = Msg->Ep;
++
++  return AppleAscSend (&Rtk->Asc, &AscMsg);
++}
++
++STATIC
++BOOLEAN
++AppleRtkitStartEp (
++  IN APPLE_RTKIT_DEV  *Rtk,
++  IN UINT8            Ep
++  )
++{
++  APPLE_ASC_MESSAGE  Msg;
++
++  Msg.Msg0  = ANS_FIELD_PREP (RTKIT_MGMT_MSG_START_EP, RTKIT_MGMT_TYPE_START);
++  Msg.Msg0 |= BIT1;                                            // RTKIT_MGMT_MSG_START_EP_FLAG
++  Msg.Msg0 |= ANS_FIELD_PREP (Ep, RTKIT_MGMT_MSG_START_EP_IDX_START);
++  Msg.Msg1  = RTKIT_EP_MGMT;
++
++  if (!AppleAscSend (&Rtk->Asc, &Msg)) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): unable to start endpoint 0x%02x\n", Rtk->Name, Ep));
++    return FALSE;
++  }
++
++  return TRUE;
++}
++
++INTN
++AppleRtkitRecv (
++  IN  APPLE_RTKIT_DEV      *Rtk,
++  OUT APPLE_RTKIT_MESSAGE  *Msg
++  )
++{
++  APPLE_ASC_MESSAGE  AscMsg;
++  UINT32             MessageType;
++  BOOLEAN            Ok;
++  UINT32             Bitmap;
++  UINT32             Base;
++  UINT32             Index;
++  UINT8              EpIndex;
++
++  if (Rtk->Crashed) {
++    return -1;
++  }
++
++  while (AppleAscRecv (&Rtk->Asc, &AscMsg)) {
++    if (AscMsg.Msg1 >= 0x100) {
++      DEBUG ((DEBUG_WARN, "rtkit(%a): message for invalid endpoint 0x%x\n", Rtk->Name, AscMsg.Msg1));
++      continue;
++    }
++
++    Msg->Msg = AscMsg.Msg0;
++    Msg->Ep  = (UINT8)AscMsg.Msg1;
++
++    //
++    // Application endpoints (>= 0x20) are not part of the boot protocol; the
++    // caller gets them back and decides.
++    //
++    if (Msg->Ep >= 0x20) {
++      return 1;
++    }
++
++    MessageType = (UINT32)ANS_FIELD_GET (Msg->Msg, RTKIT_MGMT_TYPE_START, RTKIT_MGMT_TYPE_END);
++    Ok          = TRUE;
++
++    switch (Msg->Ep) {
++      case RTKIT_EP_MGMT:
++        switch (MessageType) {
++          case RTKIT_MGMT_MSG_IOP_PWR_STATE_ACK:
++            Rtk->IopPower = (UINT32)ANS_FIELD_GET (Msg->Msg, RTKIT_MGMT_PWR_STATE_START, RTKIT_MGMT_PWR_STATE_END);
++            break;
++          case RTKIT_MGMT_MSG_AP_PWR_STATE_ACK:
++            Rtk->ApPower = (UINT32)ANS_FIELD_GET (Msg->Msg, RTKIT_MGMT_PWR_STATE_START, RTKIT_MGMT_PWR_STATE_END);
++            break;
++          case RTKIT_MGMT_MSG_EPMAP:
++            Bitmap = (UINT32)ANS_FIELD_GET (Msg->Msg, RTKIT_MGMT_MSG_EPMAP_BITMAP_START, RTKIT_MGMT_MSG_EPMAP_BITMAP_END);
++            Base   = (UINT32)ANS_FIELD_GET (Msg->Msg, RTKIT_MGMT_MSG_EPMAP_BASE_START, RTKIT_MGMT_MSG_EPMAP_BASE_END);
++
++            for (Index = 0; Index < 32; Index++) {
++              if ((Bitmap & (1U << Index)) == 0) {
++                continue;
++              }
++
++              EpIndex = (UINT8)(32 * Base + Index);
++              if (EpIndex >= 0x20) {
++                continue;
++              }
++
++              switch (EpIndex) {
++                case RTKIT_EP_MGMT:
++                case RTKIT_EP_CRASHLOG:
++                case RTKIT_EP_SYSLOG:
++                case RTKIT_EP_DEBUG:
++                case RTKIT_EP_IOREPORT:
++                case RTKIT_EP_OSLOG:
++                  DEBUG ((DEBUG_INFO, "rtkit(%a): endpoint 0x%02x advertised\n", Rtk->Name, EpIndex));
++                  break;
++                default:
++                  DEBUG ((DEBUG_WARN, "rtkit(%a): unknown system endpoint 0x%02x\n", Rtk->Name, EpIndex));
++              }
++            }
++
++            AscMsg.Msg0  = ANS_FIELD_PREP (RTKIT_MGMT_MSG_EPMAP_REPLY, RTKIT_MGMT_TYPE_START);
++            AscMsg.Msg0 |= ANS_FIELD_PREP (Base, RTKIT_MGMT_MSG_EPMAP_BASE_START);
++            if ((Msg->Msg & BIT51) != 0) {
++              AscMsg.Msg0 |= BIT51;     // RTKIT_MGMT_MSG_EPMAP_REPLY_DONE
++            } else {
++              AscMsg.Msg0 |= BIT0;      // RTKIT_MGMT_MSG_EPMAP_REPLY_MORE
++            }
++
++            AscMsg.Msg1 = RTKIT_EP_MGMT;
++            if (!AppleAscSend (&Rtk->Asc, &AscMsg)) {
++              DEBUG ((DEBUG_ERROR, "rtkit(%a): couldn't reply to the endpoint map\n", Rtk->Name));
++              return -1;
++            }
++
++            break;
++          default:
++            DEBUG ((DEBUG_WARN, "rtkit(%a): unknown management message 0x%x\n", Rtk->Name, MessageType));
++            break;
++        }
++
++        break;
++
++      case RTKIT_EP_SYSLOG:
++        switch (MessageType) {
++          case RTKIT_MSG_BUFFER_REQUEST:
++            Ok = AppleRtkitHandleBufferRequest (Rtk, Msg, &Rtk->Syslog);
++            break;
++          case RTKIT_MSG_SYSLOG_INIT:
++            Rtk->SyslogCount     = (UINT32)ANS_FIELD_GET (Msg->Msg, RTKIT_MSG_SYSLOG_INIT_COUNT_START, RTKIT_MSG_SYSLOG_INIT_COUNT_END);
++            Rtk->SyslogEntrySize = (UINT32)ANS_FIELD_GET (Msg->Msg, RTKIT_MSG_SYSLOG_INIT_SIZE_START, RTKIT_MSG_SYSLOG_INIT_SIZE_END);
++            DEBUG ((
++              DEBUG_INFO,
++              "rtkit(%a): syslog with %d entries of %d bytes\n",
++              Rtk->Name,
++              Rtk->SyslogCount,
++              Rtk->SyslogEntrySize
++              ));
++            break;
++          case RTKIT_MSG_SYSLOG_LOG:
++            AppleRtkitPrintSyslog (
++              Rtk,
++              ANS_FIELD_GET (Msg->Msg, RTKIT_MSG_SYSLOG_LOG_INDEX_START, RTKIT_MSG_SYSLOG_LOG_INDEX_END)
++              );
++            if (!AppleAscSend (&Rtk->Asc, &AscMsg)) {
++              DEBUG ((DEBUG_ERROR, "rtkit(%a): failed to ACK a syslog entry\n", Rtk->Name));
++            }
++
++            break;
++          default:
++            DEBUG ((DEBUG_WARN, "rtkit(%a): unknown syslog message 0x%x\n", Rtk->Name, MessageType));
++            break;
++        }
++
++        break;
++
++      case RTKIT_EP_CRASHLOG:
++        switch (MessageType) {
++          case RTKIT_MSG_BUFFER_REQUEST:
++            if (Rtk->Crashlog.Phys == 0) {
++              Ok = AppleRtkitHandleBufferRequest (Rtk, Msg, &Rtk->Crashlog);
++            } else {
++              AppleRtkitPrintCrashlog (Rtk);
++              return -1;
++            }
++
++            break;
++          default:
++            DEBUG ((DEBUG_WARN, "rtkit(%a): unknown crashlog message 0x%x\n", Rtk->Name, MessageType));
++            break;
++        }
++
++        break;
++
++      case RTKIT_EP_IOREPORT:
++        switch (MessageType) {
++          case RTKIT_MSG_BUFFER_REQUEST:
++            Ok = AppleRtkitHandleBufferRequest (Rtk, Msg, &Rtk->Ioreport);
++            break;
++          case 0x8:
++          case 0xc:
++            //
++            // Unknown, but the firmware waits for the echo.
++            //
++            if (!AppleRtkitSend (Rtk, Msg)) {
++              DEBUG ((DEBUG_WARN, "rtkit(%a): unable to ACK an ioreport message\n", Rtk->Name));
++            }
++
++            break;
++          default:
++            DEBUG ((DEBUG_WARN, "rtkit(%a): unknown ioreport message 0x%x\n", Rtk->Name, MessageType));
++            break;
++        }
++
++        break;
++
++      case RTKIT_EP_DEBUG:
++        break;
++
++      case RTKIT_EP_OSLOG:
++        DEBUG ((DEBUG_WARN, "rtkit(%a): OSLog message 0x%lx\n", Rtk->Name, Msg->Msg));
++        break;
++
++      default:
++        DEBUG ((DEBUG_WARN, "rtkit(%a): message to unknown system endpoint 0x%02x\n", Rtk->Name, Msg->Ep));
++        break;
++    }
++
++    if (!Ok) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): failed to handle system message 0x%02x: 0x%lx\n", Rtk->Name, Msg->Ep, Msg->Msg));
++      return -1;
++    }
++  }
++
++  return 0;
++}
++
++EFI_STATUS
++AppleRtkitBoot (
++  IN OUT APPLE_RTKIT_DEV  *Rtk
++  )
++{
++  APPLE_ASC_MESSAGE    Msg;
++  APPLE_RTKIT_MESSAGE  RtkMsg;
++  UINT32               MessageType;
++  UINT32               MinVersion;
++  UINT32               MaxVersion;
++  UINT32               WantVersion;
++  UINT32               Bitmap;
++  UINT32               Base;
++  UINT32               Index;
++  UINT8                EpIndex;
++  BOOLEAN              HasCrashlog;
++  BOOLEAN              HasDebug;
++  BOOLEAN              HasIoreport;
++  BOOLEAN              HasSyslog;
++  BOOLEAN              HasOslog;
++  BOOLEAN              GotEpmap;
++  INTN                 Ret;
++  UINT32               Spin;
++
++  if (Rtk->Booted) {
++    return EFI_SUCCESS;
++  }
++
++  //
++  // Start the coprocessor if the boot chain left it stopped, then wake it.
++  // The power-state message is safe to send to a running IOP as well.
++  //
++  AppleAscCpuStart (&Rtk->Asc);
++
++  Msg.Msg0  = ANS_FIELD_PREP (RTKIT_MGMT_MSG_IOP_PWR_STATE, RTKIT_MGMT_TYPE_START);
++  Msg.Msg0 |= ANS_FIELD_PREP (RTKIT_POWER_INIT, RTKIT_MGMT_PWR_STATE_START);
++  Msg.Msg1  = RTKIT_EP_MGMT;
++  if (!AppleAscSend (&Rtk->Asc, &Msg)) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): unable to send the wake-up message\n", Rtk->Name));
++    return EFI_DEVICE_ERROR;
++  }
++
++  if (!AppleAscRecvTimeout (&Rtk->Asc, &Msg, 1000000)) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): no HELLO within 1s\n", Rtk->Name));
++    return EFI_TIMEOUT;
++  }
++
++  if (Msg.Msg1 != RTKIT_EP_MGMT) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): expected HELLO, got a message for endpoint 0x%x\n", Rtk->Name, Msg.Msg1));
++    return EFI_DEVICE_ERROR;
++  }
++
++  MessageType = (UINT32)ANS_FIELD_GET (Msg.Msg0, RTKIT_MGMT_TYPE_START, RTKIT_MGMT_TYPE_END);
++  if (MessageType != RTKIT_MGMT_MSG_HELLO) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): expected HELLO, got message type 0x%02x\n", Rtk->Name, MessageType));
++    return EFI_DEVICE_ERROR;
++  }
++
++  MinVersion = (UINT32)ANS_FIELD_GET (Msg.Msg0, RTKIT_MGMT_MSG_HELLO_MINVER_START, RTKIT_MGMT_MSG_HELLO_MINVER_END);
++  MaxVersion = (UINT32)ANS_FIELD_GET (Msg.Msg0, RTKIT_MGMT_MSG_HELLO_MAXVER_START, RTKIT_MGMT_MSG_HELLO_MAXVER_END);
++  WantVersion = MIN (RTKIT_MAX_VERSION, MaxVersion);
++
++  if ((MinVersion > RTKIT_MAX_VERSION) || (MaxVersion < RTKIT_MIN_VERSION)) {
++    DEBUG ((
++      DEBUG_ERROR,
++      "rtkit(%a): firmware speaks [%d,%d], driver speaks [%d,%d]\n",
++      Rtk->Name,
++      MinVersion,
++      MaxVersion,
++      RTKIT_MIN_VERSION,
++      RTKIT_MAX_VERSION
++      ));
++    return EFI_UNSUPPORTED;
++  }
++
++  DEBUG ((DEBUG_INFO, "rtkit(%a): booting with protocol version %d\n", Rtk->Name, WantVersion));
++
++  Msg.Msg0  = ANS_FIELD_PREP (RTKIT_MGMT_MSG_HELLO_ACK, RTKIT_MGMT_TYPE_START);
++  Msg.Msg0 |= ANS_FIELD_PREP (WantVersion, RTKIT_MGMT_MSG_HELLO_MINVER_START);
++  Msg.Msg0 |= ANS_FIELD_PREP (WantVersion, RTKIT_MGMT_MSG_HELLO_MAXVER_START);
++  Msg.Msg1  = RTKIT_EP_MGMT;
++  if (!AppleAscSend (&Rtk->Asc, &Msg)) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): couldn't send the HELLO ack\n", Rtk->Name));
++    return EFI_DEVICE_ERROR;
++  }
++
++  HasCrashlog = FALSE;
++  HasDebug    = FALSE;
++  HasIoreport = FALSE;
++  HasSyslog   = FALSE;
++  HasOslog    = FALSE;
++  GotEpmap    = FALSE;
++
++  while (!GotEpmap) {
++    if (!AppleAscRecvTimeout (&Rtk->Asc, &Msg, 1000000)) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): no endpoint map within 1s\n", Rtk->Name));
++      return EFI_TIMEOUT;
++    }
++
++    if (Msg.Msg1 != RTKIT_EP_MGMT) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): expected the endpoint map, got a message for endpoint 0x%x\n", Rtk->Name, Msg.Msg1));
++      return EFI_DEVICE_ERROR;
++    }
++
++    MessageType = (UINT32)ANS_FIELD_GET (Msg.Msg0, RTKIT_MGMT_TYPE_START, RTKIT_MGMT_TYPE_END);
++    if (MessageType != RTKIT_MGMT_MSG_EPMAP) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): expected the endpoint map, got message type 0x%x\n", Rtk->Name, MessageType));
++      return EFI_DEVICE_ERROR;
++    }
++
++    Bitmap = (UINT32)ANS_FIELD_GET (Msg.Msg0, RTKIT_MGMT_MSG_EPMAP_BITMAP_START, RTKIT_MGMT_MSG_EPMAP_BITMAP_END);
++    Base   = (UINT32)ANS_FIELD_GET (Msg.Msg0, RTKIT_MGMT_MSG_EPMAP_BASE_START, RTKIT_MGMT_MSG_EPMAP_BASE_END);
++
++    for (Index = 0; Index < 32; Index++) {
++      if ((Bitmap & (1U << Index)) == 0) {
++        continue;
++      }
++
++      EpIndex = (UINT8)(32 * Base + Index);
++      if (EpIndex >= 0x20) {
++        continue;
++      }
++
++      switch (EpIndex) {
++        case RTKIT_EP_CRASHLOG:
++          HasCrashlog = TRUE;
++          break;
++        case RTKIT_EP_DEBUG:
++          HasDebug = TRUE;
++          break;
++        case RTKIT_EP_IOREPORT:
++          HasIoreport = TRUE;
++          break;
++        case RTKIT_EP_SYSLOG:
++          HasSyslog = TRUE;
++          break;
++        case RTKIT_EP_OSLOG:
++          HasOslog = TRUE;
++          break;
++        case RTKIT_EP_MGMT:
++          break;
++        default:
++          DEBUG ((DEBUG_WARN, "rtkit(%a): unknown system endpoint 0x%02x in the map\n", Rtk->Name, EpIndex));
++          break;
++      }
++    }
++
++    GotEpmap = ((Msg.Msg0 & BIT51) != 0);
++
++    Msg.Msg0  = ANS_FIELD_PREP (RTKIT_MGMT_MSG_EPMAP_REPLY, RTKIT_MGMT_TYPE_START);
++    Msg.Msg0 |= ANS_FIELD_PREP (Base, RTKIT_MGMT_MSG_EPMAP_BASE_START);
++    if (GotEpmap) {
++      Msg.Msg0 |= BIT51;
++    } else {
++      Msg.Msg0 |= BIT0;
++    }
++
++    Msg.Msg1 = RTKIT_EP_MGMT;
++    if (!AppleAscSend (&Rtk->Asc, &Msg)) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): couldn't reply to the endpoint map\n", Rtk->Name));
++      return EFI_DEVICE_ERROR;
++    }
++  }
++
++  //
++  // The firmware's own endpoints must be started before it will move to the
++  // ON power state, and it must be able to log while doing so.
++  //
++  if (HasDebug && !AppleRtkitStartEp (Rtk, RTKIT_EP_DEBUG)) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  if (HasCrashlog && !AppleRtkitStartEp (Rtk, RTKIT_EP_CRASHLOG)) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  if (HasSyslog && !AppleRtkitStartEp (Rtk, RTKIT_EP_SYSLOG)) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  if (HasIoreport && !AppleRtkitStartEp (Rtk, RTKIT_EP_IOREPORT)) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  if (HasOslog && !AppleRtkitStartEp (Rtk, RTKIT_EP_OSLOG)) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  for (Spin = 0; Rtk->IopPower != RTKIT_POWER_ON; Spin++) {
++    if (Spin > 100000) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): IOP never reached the ON state\n", Rtk->Name));
++      return EFI_TIMEOUT;
++    }
++
++    Ret = AppleRtkitRecv (Rtk, &RtkMsg);
++    if (Ret < 0) {
++      return EFI_DEVICE_ERROR;
++    }
++
++    if (Ret > 0) {
++      DEBUG ((DEBUG_WARN, "rtkit(%a): message for endpoint 0x%02x during boot\n", Rtk->Name, RtkMsg.Ep));
++    }
++
++    gBS->Stall (10);
++  }
++
++  //
++  // This is what enables the firmware's logging.
++  //
++  Msg.Msg0 = ANS_FIELD_PREP (RTKIT_MGMT_MSG_AP_PWR_STATE, RTKIT_MGMT_TYPE_START);
++  Msg.Msg0 |= ANS_FIELD_PREP (RTKIT_POWER_ON, RTKIT_MGMT_PWR_STATE_START);
++  Msg.Msg1 = RTKIT_EP_MGMT;
++  if (!AppleAscSend (&Rtk->Asc, &Msg)) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): unable to send the AP power message\n", Rtk->Name));
++    return EFI_DEVICE_ERROR;
++  }
++
++  Rtk->Booted = TRUE;
++  DEBUG ((DEBUG_INFO, "rtkit(%a): firmware is up\n", Rtk->Name));
++
++  return EFI_SUCCESS;
++}
++
++STATIC
++EFI_STATUS
++AppleRtkitSwitchPowerState (
++  IN OUT APPLE_RTKIT_DEV  *Rtk,
++  IN     UINT32           Target
++  )
++{
++  APPLE_ASC_MESSAGE    Msg;
++  APPLE_RTKIT_MESSAGE  RtkMsg;
++  INTN                 Ret;
++
++  if (Rtk->Crashed) {
++    return EFI_DEVICE_ERROR;
++  }
++
++  //
++  // AP power always goes through QUIESCED first; the firmware assumes that
++  // ordering on the way down.
++  //
++  Msg.Msg0 = ANS_FIELD_PREP (RTKIT_MGMT_MSG_AP_PWR_STATE, RTKIT_MGMT_TYPE_START);
++  Msg.Msg0 |= ANS_FIELD_PREP (RTKIT_POWER_QUIESCED, RTKIT_MGMT_PWR_STATE_START);
++  Msg.Msg1 = RTKIT_EP_MGMT;
++  if (!AppleAscSend (&Rtk->Asc, &Msg)) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): unable to send the AP quiesce message\n", Rtk->Name));
++    return EFI_DEVICE_ERROR;
++  }
++
++  while (Rtk->ApPower != RTKIT_POWER_QUIESCED) {
++    Ret = AppleRtkitRecv (Rtk, &RtkMsg);
++    if (Ret < 0) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): IOP died while quiescing\n", Rtk->Name));
++      return EFI_DEVICE_ERROR;
++    }
++
++    if (Ret > 0) {
++      DEBUG ((DEBUG_WARN, "rtkit(%a): message for endpoint 0x%02x while quiescing\n", Rtk->Name, RtkMsg.Ep));
++    }
++  }
++
++  Msg.Msg0 = ANS_FIELD_PREP (RTKIT_MGMT_MSG_IOP_PWR_STATE, RTKIT_MGMT_TYPE_START);
++  Msg.Msg0 |= ANS_FIELD_PREP (Target, RTKIT_MGMT_PWR_STATE_START);
++  if (!AppleAscSend (&Rtk->Asc, &Msg)) {
++    DEBUG ((DEBUG_ERROR, "rtkit(%a): unable to send the IOP power message\n", Rtk->Name));
++    return EFI_DEVICE_ERROR;
++  }
++
++  while (Rtk->IopPower != Target) {
++    Ret = AppleRtkitRecv (Rtk, &RtkMsg);
++    if (Ret < 0) {
++      DEBUG ((DEBUG_ERROR, "rtkit(%a): IOP died while changing power state\n", Rtk->Name));
++      return EFI_DEVICE_ERROR;
++    }
++
++    if (Ret > 0) {
++      DEBUG ((DEBUG_WARN, "rtkit(%a): message for endpoint 0x%02x while changing power state\n", Rtk->Name, RtkMsg.Ep));
++    }
++  }
++
++  return EFI_SUCCESS;
++}
++
++EFI_STATUS
++AppleRtkitQuiesce (
++  IN OUT APPLE_RTKIT_DEV  *Rtk
++  )
++{
++  return AppleRtkitSwitchPowerState (Rtk, RTKIT_POWER_QUIESCED);
++}
++
++EFI_STATUS
++AppleRtkitSleep (
++  IN OUT APPLE_RTKIT_DEV  *Rtk
++  )
++{
++  EFI_STATUS  Status;
++
++  Status = AppleRtkitSwitchPowerState (Rtk, RTKIT_POWER_SLEEP);
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  AppleAscCpuStop (&Rtk->Asc);
++  Rtk->Booted = FALSE;
++
++  return EFI_SUCCESS;
++}
++
++VOID
++AppleRtkitFree (
++  IN OUT APPLE_RTKIT_DEV  *Rtk
++  )
++{
++  AppleRtkitFreeBuffer (Rtk, &Rtk->Syslog);
++  AppleRtkitFreeBuffer (Rtk, &Rtk->Crashlog);
++  AppleRtkitFreeBuffer (Rtk, &Rtk->Ioreport);
++}
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleSart.c b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleSart.c
+new file mode 100644
+index 0000000..c5582e8
+--- /dev/null
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleNANDStorageDxe/AppleSart.c
+@@ -0,0 +1,415 @@
++/**
++ * Copyright (c) 2023, amarioguy (AppleWOA authors). All rights reserved.
++ *
++ * Module Name:
++ *   AppleSart.c
++ *
++ * Abstract:
++ *   Apple SART (System Address Resolution Table) window table for the
++ *   coprocessor side of the ANS controller.  Ported from m1n1's src/sart.c,
++ *   including all four register layouts; the ADT's "sart-version" property
++ *   selects the layout, and a SART with neither a version nor the t8015
++ *   compatible string is refused rather than guessed at.
++ *
++ * Environment:
++ *   UEFI DXE (Driver Execution Environment).
++ *
++ * License:
++ *   SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ *
++ **/
++
++#include "AppleNandStorage.h"
++
++//
++// SARTv0/v2 pack flags and size into one 32-bit config word; v3/v4 moved the
++// size to its own register and left the config word as raw flags.
++//
++STATIC
++VOID
++AppleSart0GetEntry (
++  IN  APPLE_SART_DEV  *Sart,
++  IN  UINT32          Index,
++  OUT UINT8           *Flags,
++  OUT UINT64          *Paddr,
++  OUT UINT64          *Size
++  )
++{
++  UINT32  Config;
++
++  Config = MmioRead32 (Sart->Base + Sart->ConfigOffset + 4 * Index);
++  *Flags = (UINT8)ANS_FIELD_GET (Config, APPLE_SART0_CONFIG_FLAGS_START, APPLE_SART0_CONFIG_FLAGS_END);
++  *Size  = ANS_FIELD_GET (Config, APPLE_SART0_CONFIG_SIZE_START, APPLE_SART0_CONFIG_SIZE_END)
++           << APPLE_SART0_SIZE_SHIFT;
++  *Paddr = LShiftU64 (MmioRead32 (Sart->Base + Sart->PaddrOffset + 4 * Index), APPLE_SART0_PADDR_SHIFT);
++}
++
++STATIC
++BOOLEAN
++AppleSart0SetEntry (
++  IN APPLE_SART_DEV  *Sart,
++  IN UINT32          Index,
++  IN UINT8           Flags,
++  IN UINT64          Paddr,
++  IN UINT64          Size
++  )
++{
++  UINT32  Config;
++  UINT64  PaddrShifted;
++
++  if ((Size & (LShiftU64 (1, APPLE_SART0_SIZE_SHIFT) - 1)) != 0) {
++    return FALSE;
++  }
++
++  if ((Paddr & (LShiftU64 (1, APPLE_SART0_PADDR_SHIFT) - 1)) != 0) {
++    return FALSE;
++  }
++
++  Size >>= APPLE_SART0_SIZE_SHIFT;
++  if (Size > (LShiftU64 (1, APPLE_SART0_CONFIG_SIZE_END - APPLE_SART0_CONFIG_SIZE_START + 1) - 1)) {
++    return FALSE;
++  }
++
++  PaddrShifted = RShiftU64 (Paddr, APPLE_SART0_PADDR_SHIFT);
++
++  Config  = (UINT32)ANS_FIELD_PREP (
++                      Flags & ((1U << (APPLE_SART0_CONFIG_FLAGS_END - APPLE_SART0_CONFIG_FLAGS_START + 1)) - 1),
++                      APPLE_SART0_CONFIG_FLAGS_START
++                      );
++  Config |= (UINT32)ANS_FIELD_PREP (Size, APPLE_SART0_CONFIG_SIZE_START);
++
++  MmioWrite32 (Sart->Base + Sart->PaddrOffset + 4 * Index, (UINT32)PaddrShifted);
++  MmioWrite32 (Sart->Base + Sart->ConfigOffset + 4 * Index, Config);
++
++  return TRUE;
++}
++
++STATIC
++VOID
++AppleSart2GetEntry (
++  IN  APPLE_SART_DEV  *Sart,
++  IN  UINT32          Index,
++  OUT UINT8           *Flags,
++  OUT UINT64          *Paddr,
++  OUT UINT64          *Size
++  )
++{
++  UINT32  Config;
++
++  Config = MmioRead32 (Sart->Base + Sart->ConfigOffset + 4 * Index);
++  *Flags = (UINT8)ANS_FIELD_GET (Config, APPLE_SART2_CONFIG_FLAGS_START, APPLE_SART2_CONFIG_FLAGS_END);
++  *Size  = ANS_FIELD_GET (Config, APPLE_SART2_CONFIG_SIZE_START, APPLE_SART2_CONFIG_SIZE_END)
++           << APPLE_SART2_SIZE_SHIFT;
++  *Paddr = LShiftU64 (MmioRead32 (Sart->Base + Sart->PaddrOffset + 4 * Index), APPLE_SART2_PADDR_SHIFT);
++}
++
++STATIC
++BOOLEAN
++AppleSart2SetEntry (
++  IN APPLE_SART_DEV  *Sart,
++  IN UINT32          Index,
++  IN UINT8           Flags,
++  IN UINT64          Paddr,
++  IN UINT64          Size
++  )
++{
++  UINT32  Config;
++  UINT64  PaddrShifted;
++
++  if ((Size & (LShiftU64 (1, APPLE_SART2_SIZE_SHIFT) - 1)) != 0) {
++    return FALSE;
++  }
++
++  if ((Paddr & (LShiftU64 (1, APPLE_SART2_PADDR_SHIFT) - 1)) != 0) {
++    return FALSE;
++  }
++
++  Size >>= APPLE_SART2_SIZE_SHIFT;
++  if (Size > (LShiftU64 (1, APPLE_SART2_CONFIG_SIZE_END - APPLE_SART2_CONFIG_SIZE_START + 1) - 1)) {
++    return FALSE;
++  }
++
++  PaddrShifted = RShiftU64 (Paddr, APPLE_SART2_PADDR_SHIFT);
++
++  Config  = (UINT32)ANS_FIELD_PREP (Flags, APPLE_SART2_CONFIG_FLAGS_START);
++  Config |= (UINT32)ANS_FIELD_PREP (Size, APPLE_SART2_CONFIG_SIZE_START);
++
++  MmioWrite32 (Sart->Base + Sart->PaddrOffset + 4 * Index, (UINT32)PaddrShifted);
++  MmioWrite32 (Sart->Base + Sart->ConfigOffset + 4 * Index, Config);
++
++  return TRUE;
++}
++
++STATIC
++VOID
++AppleSart3GetEntry (
++  IN  APPLE_SART_DEV  *Sart,
++  IN  UINT32          Index,
++  OUT UINT8           *Flags,
++  OUT UINT64          *Paddr,
++  OUT UINT64          *Size
++  )
++{
++  *Flags = (UINT8)MmioRead32 (Sart->Base + Sart->ConfigOffset + 4 * Index);
++  *Size  = LShiftU64 (MmioRead32 (Sart->Base + Sart->SizeOffset + 4 * Index), APPLE_SART3_SIZE_SHIFT);
++  *Paddr = LShiftU64 (MmioRead32 (Sart->Base + Sart->PaddrOffset + 4 * Index), APPLE_SART3_PADDR_SHIFT);
++}
++
++STATIC
++BOOLEAN
++AppleSart3SetEntry (
++  IN APPLE_SART_DEV  *Sart,
++  IN UINT32          Index,
++  IN UINT8           Flags,
++  IN UINT64          Paddr,
++  IN UINT64          Size
++  )
++{
++  if ((Size & (LShiftU64 (1, APPLE_SART3_SIZE_SHIFT) - 1)) != 0) {
++    return FALSE;
++  }
++
++  if ((Paddr & (LShiftU64 (1, APPLE_SART3_PADDR_SHIFT) - 1)) != 0) {
++    return FALSE;
++  }
++
++  Size >>= APPLE_SART3_SIZE_SHIFT;
++  if (Size > (LShiftU64 (1, APPLE_SART3_SIZE_END - APPLE_SART3_SIZE_START + 1) - 1)) {
++    return FALSE;
++  }
++
++  MmioWrite32 (Sart->Base + Sart->PaddrOffset + 4 * Index, (UINT32)RShiftU64 (Paddr, APPLE_SART3_PADDR_SHIFT));
++  MmioWrite32 (Sart->Base + Sart->SizeOffset + 4 * Index, (UINT32)Size);
++  MmioWrite32 (Sart->Base + Sart->ConfigOffset + 4 * Index, Flags);
++
++  return TRUE;
++}
++
++STATIC
++VOID
++AppleSart4GetEntry (
++  IN  APPLE_SART_DEV  *Sart,
++  IN  UINT32          Index,
++  OUT UINT8           *Flags,
++  OUT UINT64          *Paddr,
++  OUT UINT64          *Size
++  )
++{
++  *Flags = (UINT8)MmioRead32 (Sart->Base + Sart->ConfigOffset + 4 * Index);
++  *Size  = LShiftU64 (MmioRead32 (Sart->Base + Sart->SizeOffset + 4 * Index), APPLE_SART4_SIZE_SHIFT);
++  *Paddr = LShiftU64 (MmioRead32 (Sart->Base + Sart->PaddrOffset + 4 * Index), APPLE_SART4_PADDR_SHIFT);
++}
++
++STATIC
++BOOLEAN
++AppleSart4SetEntry (
++  IN APPLE_SART_DEV  *Sart,
++  IN UINT32          Index,
++  IN UINT8           Flags,
++  IN UINT64          Paddr,
++  IN UINT64          Size
++  )
++{
++  if ((Size & (LShiftU64 (1, APPLE_SART4_SIZE_SHIFT) - 1)) != 0) {
++    return FALSE;
++  }
++
++  if ((Paddr & (LShiftU64 (1, APPLE_SART4_PADDR_SHIFT) - 1)) != 0) {
++    return FALSE;
++  }
++
++  Size >>= APPLE_SART4_SIZE_SHIFT;
++  if (Size > (LShiftU64 (1, APPLE_SART4_SIZE_END - APPLE_SART4_SIZE_START + 1) - 1)) {
++    return FALSE;
++  }
++
++  MmioWrite32 (Sart->Base + Sart->PaddrOffset + 4 * Index, (UINT32)RShiftU64 (Paddr, APPLE_SART4_PADDR_SHIFT));
++  MmioWrite32 (Sart->Base + Sart->SizeOffset + 4 * Index, (UINT32)Size);
++  MmioWrite32 (Sart->Base + Sart->ConfigOffset + 4 * Index, Flags);
++
++  return TRUE;
++}
++
++EFI_STATUS
++AppleSartInit (
++  IN  dt_node_t       *SartNode,
++  OUT APPLE_SART_DEV  *Sart
++  )
++{
++  uint64_t  Base;
++  UINT32    Version;
++  UINT32    *VersionProp;
++  UINT32  Index;
++  UINT32  Protected;
++  UINT8   Flags;
++  UINT64  Paddr;
++  UINT64  Size;
++
++  if (SartNode == NULL) {
++    return EFI_NOT_FOUND;
++  }
++
++  Base = 0;
++  if (dt_node_reg (SartNode, 0, &Base, NULL) != 0 || Base == 0) {
++    DEBUG ((DEBUG_ERROR, "sart: no usable reg[0] on the SART node\n"));
++    return EFI_NOT_FOUND;
++  }
++
++  VersionProp = (UINT32 *)dt_node_prop (SartNode, "sart-version", NULL);
++  if (VersionProp != NULL) {
++    Version = *VersionProp;
++  } else if (dt_node_prop (SartNode, "compatible", NULL) != NULL) {
++    //
++    // t8015 predates sart-version and is SARTv0 by definition.  Anything else
++    // without the property is unknown; guessing a register layout for a DMA
++    // window table is not something a wrong guess recovers from.
++    //
++    CHAR8   *Compat;
++    size_t  CompatLen;
++
++    Compat = (CHAR8 *)dt_node_prop (SartNode, "compatible", &CompatLen);
++    if ((Compat != NULL) && (AsciiStrStr (Compat, "sart,t8015") != NULL)) {
++      Version = 0;
++    } else {
++      DEBUG ((DEBUG_ERROR, "sart: node has no sart-version property\n"));
++      return EFI_UNSUPPORTED;
++    }
++  } else {
++    DEBUG ((DEBUG_ERROR, "sart: node has neither sart-version nor compatible\n"));
++    return EFI_UNSUPPORTED;
++  }
++
++  ZeroMem (Sart, sizeof (*Sart));
++  Sart->Base    = (UINTN)Base;
++  Sart->Version = Version;
++
++  switch (Version) {
++    case 0:
++      Sart->GetEntry = AppleSart0GetEntry;
++      Sart->SetEntry = AppleSart0SetEntry;
++      Sart->FlagsAllow = APPLE_SART0_FLAGS_ALLOW;
++      Sart->ConfigOffset = APPLE_SART0_CONFIG_OFFSET;
++      Sart->PaddrOffset  = APPLE_SART0_PADDR_OFFSET;
++      break;
++    case 2:
++      Sart->GetEntry = AppleSart2GetEntry;
++      Sart->SetEntry = AppleSart2SetEntry;
++      Sart->FlagsAllow = APPLE_SART2_FLAGS_ALLOW;
++      Sart->ConfigOffset = APPLE_SART2_CONFIG_OFFSET;
++      Sart->PaddrOffset  = APPLE_SART2_PADDR_OFFSET;
++      break;
++    case 3:
++      Sart->GetEntry = AppleSart3GetEntry;
++      Sart->SetEntry = AppleSart3SetEntry;
++      Sart->FlagsAllow = APPLE_SART3_FLAGS_ALLOW;
++      Sart->ConfigOffset = APPLE_SART3_CONFIG_OFFSET;
++      Sart->PaddrOffset  = APPLE_SART3_PADDR_OFFSET;
++      Sart->SizeOffset   = APPLE_SART3_SIZE_OFFSET;
++      break;
++    case 4:
++      Sart->GetEntry = AppleSart4GetEntry;
++      Sart->SetEntry = AppleSart4SetEntry;
++      Sart->FlagsAllow = APPLE_SART4_FLAGS_ALLOW;
++      Sart->ConfigOffset = APPLE_SART4_CONFIG_OFFSET;
++      Sart->PaddrOffset  = APPLE_SART4_PADDR_OFFSET;
++      Sart->SizeOffset   = APPLE_SART4_SIZE_OFFSET;
++      break;
++    default:
++      DEBUG ((DEBUG_ERROR, "sart: unknown sart-version %d\n", Version));
++      return EFI_UNSUPPORTED;
++  }
++
++ //
++  // Entries the boot chain already owns are never touched: they cover the
++  // coprocessor's own firmware and the region iBoot handed it.
++  //
++  Sart->ProtectedEntries = 0;
++  for (Index = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
++    Sart->GetEntry (Sart, Index, &Flags, &Paddr, &Size);
++    if (Flags != 0) {
++      Sart->ProtectedEntries |= (1U << Index);
++    }
++
++    DEBUG ((
++      DEBUG_INFO,
++      "sart: entry %2d flags 0x%02x paddr 0x%lx size 0x%lx%s\n",
++      Index,
++      Flags,
++      Paddr,
++      Size,
++      ((Sart->ProtectedEntries & (1U << Index)) != 0) ? " (protected)" : ""
++      ));
++  }
++
++  for (Index = 0, Protected = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
++    if ((Sart->ProtectedEntries & (1U << Index)) != 0) {
++      Protected++;
++    }
++  }
++
++  DEBUG ((DEBUG_INFO, "sart: SARTv%d at 0x%lx, %d protected entries\n", Version, Base, Protected));
++
++  return EFI_SUCCESS;
++}
++
++BOOLEAN
++AppleSartAddAllowedRegion (
++  IN APPLE_SART_DEV  *Sart,
++  IN UINT64          Paddr,
++  IN UINT64          Size
++  )
++{
++  UINT32  Index;
++  UINT8   EntryFlags;
++  UINT64  EntryPaddr;
++  UINT64  EntrySize;
++
++  for (Index = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
++    if ((Sart->ProtectedEntries & (1U << Index)) != 0) {
++      continue;
++    }
++
++    Sart->GetEntry (Sart, Index, &EntryFlags, &EntryPaddr, &EntrySize);
++    if (EntryFlags != 0) {
++      continue;
++    }
++
++    return Sart->SetEntry (Sart, Index, (UINT8)Sart->FlagsAllow, Paddr, Size);
++  }
++
++  DEBUG ((DEBUG_ERROR, "sart: no free entries for 0x%lx+0x%lx\n", Paddr, Size));
++  return FALSE;
++}
++
++BOOLEAN
++AppleSartRemoveAllowedRegion (
++  IN APPLE_SART_DEV  *Sart,
++  IN UINT64          Paddr,
++  IN UINT64          Size
++  )
++{
++  UINT32  Index;
++  UINT8   EntryFlags;
++  UINT64  EntryPaddr;
++  UINT64  EntrySize;
++
++  for (Index = 0; Index < APPLE_SART_MAX_ENTRIES; Index++) {
++    if ((Sart->ProtectedEntries & (1U << Index)) != 0) {
++      continue;
++    }
++
++    Sart->GetEntry (Sart, Index, &EntryFlags, &EntryPaddr, &EntrySize);
++    if (EntryFlags == 0) {
++      continue;
++    }
++
++    if ((EntryPaddr != Paddr) || (EntrySize != Size)) {
++      continue;
++    }
++
++    return Sart->SetEntry (Sart, Index, 0, 0, 0);
++  }
++
++  DEBUG ((DEBUG_WARN, "sart: no entry matches 0x%lx+0x%lx\n", Paddr, Size));
++  return FALSE;
++}
 diff --git a/Silicon/Apple/T8132FamilyPkg/AcpiTables/BERT.aslc b/Silicon/Apple/T8132FamilyPkg/AcpiTables/BERT.aslc
 new file mode 100644
 index 0000000..7014fe5

@@ -67,7 +67,23 @@ echo
 echo "FD output:"
 find "$ROOT/third_party/ntasp-firmware/Build" -maxdepth 4 -name '*.fd' -print -exec ls -lh {} \;
 
-echo
+if [ "$PLATFORM" = "Mac16_3" ]; then
+    #
+    # The ACPI/image checks never look inside the (compressed) FV, so a driver
+    # that quietly dropped out of the image would still pass them.  The
+    # internal-storage driver is the whole point of the ANS work, so its
+    # presence is checked directly in the Ffs output.
+    #
+    ANS_MODULE="$(find "$ROOT/third_party/ntasp-firmware/Build" -maxdepth 7 -type d \
+        -path '*/FV/Ffs/*AppleNANDStorageDxe' | head -n 1)"
+    if [ -z "$ANS_MODULE" ]; then
+        echo "error: AppleNANDStorageDxe is not in the FV; the internal SSD would not exist" >&2
+        exit 1
+    fi
+    echo "FV contains $(basename "$ANS_MODULE")"
+    echo
+fi
+
 if [ "$PLATFORM" = "Mac16_3" ]; then
     # The M4 package has validated expectations, so a failure here is real.
     "$ROOT/scripts/check-acpi.py" --platform "$PLATFORM"
