@@ -153,13 +153,39 @@ makes it one a strict guest can drive:
 patched sources; `docs/next-steps.md` explains why the firmware could not have
 caught any of it.
 
+`0006` answers the capability question `0004` left open. `GICD_TYPER.No1N` is
+now 1: the distributor does not perform 1-of-N selection, so a guest must name a
+PE in `GICD_IROUTER` rather than ask the distributor to choose. That is a
+statement about the emulated device, not about Apple's hardware. With `No1N`
+set, the architecture makes an `IRM` write of 1 CONSTRAINED UNPREDICTABLE and
+permits the field to behave as if it were 0; the vGIC takes that behaviour,
+clears bit 31 before storing the routing value, and returns the normalised value
+on read-back. The guest's original write is still what the diagnostic ring
+records, because that is the interesting one after a hang.
+
+The remaining gap is the affinity itself. `GICD_IROUTER` names a vCPU, and the
+vGIC decodes it and calls `aic_set_affinity()`, but that call moves an SPI only
+on AICv1, which has `AIC_TARGET_CPU`. AICv2/v3 have no software-programmable
+per-SPI CPU target: the `IRQ_CFG.TARGET` field m1n1 programs at boot comes from
+the ADT's `aic-ext-intr-cfg` and selects a die, and Linux's
+`aic2_chip`/`aic3_chip` has no `irq_set_affinity` at all. On the M4 an SPI is
+therefore delivered to the PE the AIC chooses, and `hv_exc_irq()` injects the
+virtual interrupt into that same physical CPU's list registers. This is a
+performance and observability deviation, not a lost interrupt, but a guest that
+moves an SPI to another PE will not see it move. Honouring affinity would mean
+forwarding an already-acknowledged physical interrupt to another CPU's software
+queue and injecting it there, with the ordering and lost-wakeup problems that
+implies; that is deliberately not attempted before the conformance self-test can
+measure where interrupts actually land.
+
 The tricky parts are:
 
 - maintenance interrupts;
 - SError errata on pre-M3 SoCs;
-- affinity routing when the physical AIC cannot target a specific vCPU
-  (`aic_set_affinity()` is a no-op on AICv3, so `GICD_IROUTER` writes are
-  currently accepted and ignored — a performance limitation, not a hang);
+- affinity routing: `GICD_IROUTER` writes are decoded, translated and stored,
+  and `GICD_TYPER.No1N=1` says the distributor does not choose among PEs for
+  1-of-N. But `aic_set_affinity()` is a no-op on AICv3, so an SPI still lands on
+  the PE the AIC picks — a performance limitation, not a hang (see above);
 - SPIs/PPIs that Windows expects to be edge- or level-triggered;
 - the ITS (mapped but unimplemented; a guest that discovers one through IORT would program a command queue nothing reads, so the firmware publishes no ITS and the MSI frame is used instead);
 - AIC interrupts with no guest INTID, which used to be injected verbatim and are now dropped (see the table above);

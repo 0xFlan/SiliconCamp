@@ -1,0 +1,104 @@
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+index 42ecbe4c..518285ae 100644
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -473,15 +473,36 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+ 
+             case GIC_DIST_IROUTER32 ... GIC_DIST_IROUTER1019:
+                 u32 reg_num;
++                u64 route;
+                 u64 mpidr = 0;
+                 int cpu_num;
+                 reg_num = (relative_addr - GIC_DIST_IROUTER32) / 8;
+-                distributor->gicd_interrupt_router_regs[reg_num] = *val;
+-                
+-                mpidr |= (u64)MPIDR_AFF0(*val);
+-                mpidr |= (u64)MPIDR_AFF1(*val) << 8;
+-                mpidr |= (u64)MPIDR_AFF2(*val) << 16;
+-                mpidr |= (u64)MPIDR_AFF3(*val) << 32;
++                route = *val;
++
++                //
++                // GICD_TYPER.No1N is 1, so 1-of-N routing has no model here.
++                // With No1N set, an IRM write of 1 is CONSTRAINED
++                // UNPREDICTABLE, and one of the permitted behaviours is that
++                // the field acts as if it were 0.  Take that behaviour, and
++                // keep the bit out of the stored value so a read-back cannot
++                // report a mode this distributor will not perform.  *val is
++                // left alone: the diagnostic ring should show what the guest
++                // actually asked for.
++                //
++                if (route & GICD_IROUTER_IRM) {
++                    route &= ~GICD_IROUTER_IRM;
++                    vgic_note(VGIC_NOTE_UNMODELLED,
++                              "HV vGIC [WARN]: GICD_IROUTER%d.IRM ignored, "
++                              "1-of-N routing is not implemented\n",
++                              (unsigned)reg_num);
++                }
++
++                distributor->gicd_interrupt_router_regs[reg_num] = route;
++
++                mpidr |= (u64)MPIDR_AFF0(route);
++                mpidr |= (u64)MPIDR_AFF1(route) << 8;
++                mpidr |= (u64)MPIDR_AFF2(route) << 16;
++                mpidr |= (u64)MPIDR_AFF3(route) << 32;
+                 cpu_num = smp_get_id(mpidr);
+ 
+                 //
+@@ -490,6 +511,14 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                 // affinity that is not in the ADT, and BIT(-1) is undefined, so
+                 // guard both before touching the AIC.
+                 //
++                // The affinity is honoured only where the SoC can move an
++                // SPI's target: AICv1 has AIC_TARGET_CPU, while AICv2/v3 have
++                // no software-programmable per-SPI CPU target (their
++                // IRQ_CFG.TARGET comes from the ADT and selects a die), so
++                // aic_set_affinity() returns early there.  On the M4 the AIC
++                // decides which PE takes the interrupt; see
++                // docs/architecture.md.
++                //
+                 u32 aic_irq = guest_msi_aic_irq(reg_num + 32);
+                 if (aic_irq && cpu_num >= 0)
+                     aic_set_affinity(aic_irq, cpu_num);
+@@ -1611,13 +1640,21 @@ void hv_vgicv3_init_dist_registers(void)
+     // GIC type will be defined as the following:
+     // - No extended SPIs (Update on 6/10/2025: maz in Asahi IRC says we can probably expose extended SPIs? could also look into some other hacks for > 1024 IRQ platforms)
+     // - Affinity level 0 can go up to 15
+-    // - 1 of N SPI interrupts are supported (kind of how AIC2 can behave?)
+-    // - Affinity 3 invalid
++    // - Affinity 3 invalid (A3V = 0: the ADT never numbers a CPU above Aff2,
++    //   and smp_get_id() compares all four levels)
+     // - 16 interrupt ID bits (to match what the CPU interface supports)
+     // - No LPIs: there is no ITS, so MSIs are delivered through the ACPI GIC MSI
+     //   Frame (SPIs 512-767), not through GICD_TYPER.LPIS.
++    // - No1N: 1-of-N SPI routing is not implemented.  That mode asks the
++    //   distributor to choose a target PE, and this emulation has no such
++    //   choice: on AICv3 the delivery target of an SPI is decided by the AIC,
++    //   not by a register the vGIC can write (Linux's aic2_chip/aic3_chip has
++    //   no irq_set_affinity, and aic_set_affinity() returns early for
++    //   version != 1).  Advertising it would invite a guest to rely on a
++    //   selection that never happens.  GICD_IROUTER.IRM is treated as 0.
+     //
+-    distributor->gicd_type_reg = (BIT(22) | BIT(21) | BIT(20) | BIT(19) | BIT(4) | BIT(3) | BIT(2) | BIT(1) | BIT(0));
++    distributor->gicd_type_reg = (BIT(25) | BIT(22) | BIT(21) | BIT(20) | BIT(19) |
++                                  BIT(4) | BIT(3) | BIT(2) | BIT(1) | BIT(0));
+     distributor->gicd_imp_id_reg = (BIT(10) | BIT(5) | BIT(4) | BIT(3) | BIT(1) | BIT(0));
+     distributor->gicd_type_reg_2 = 0; 
+     distributor->gicd_err_sts = 0;
+diff --git a/src/hv_vgic.h b/src/hv_vgic.h
+index 74db074b..06bc5f4d 100644
+--- a/src/hv_vgic.h
++++ b/src/hv_vgic.h
+@@ -111,6 +111,12 @@
+ 
+ #define GIC_DIST_IROUTER32 0x6100
+ #define GIC_DIST_IROUTER1019 0x7FD8
++
++//
++// GICD_IROUTER<n>.Interrupt_Routing_Mode.  GICD_TYPER.No1N is 1, so this bit
++// is not part of the model and a write of 1 is treated as 0.
++//
++#define GICD_IROUTER_IRM BIT(31)
+ #define GIC_DIST_IROUTER0E 0x8000
+ #define GIC_DIST_IROUTER1023E 0x9FFC
+ 

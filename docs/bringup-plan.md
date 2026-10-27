@@ -8,8 +8,10 @@ This is ordered by dependency, not by excitement. Do not start the GPU or anti-c
 - Upstream m1n1 and NTASP m1n1-windows both build.
 - M4 vGIC topology and PSCI T8132 patches applied (six E-cores, four P-cores).
 - The vGIC guest contract is fixed and checked offline (patch 0004,
-  `scripts/check-vgic.py`), and its diagnostics no longer print on the hot path
-  (patch 0005, `docs/vgic-diagnostics.md`).
+  `scripts/check-vgic.py`), its diagnostics no longer print on the hot path
+  (patch 0005, `docs/vgic-diagnostics.md`), and it no longer advertises 1-of-N
+  SPI routing it cannot perform (patch 0006: `GICD_TYPER.No1N=1`, `IRM`
+  treated as 0).
 
 **Exit criteria:** `./scripts/build-m1n1.sh` produces `m1n1.bin` and `m1n1.macho` with no errors.
 
@@ -77,7 +79,9 @@ Next:
   redistributor frame via `GICR_TYPER`, read-modify-write `GICR_WAKER` on each
   and poll `ChildrenAsleep` with a timeout, confirm both `RWP` bits read 0,
   enable the GTDT timer PPI, and send a self-SGI. It is the only way to observe
-  the contract before Windows exists (`docs/next-steps.md`).
+  the contract before Windows exists (`docs/next-steps.md`). Have it record
+  which PE takes each SPI as well: that measures the `GICD_IROUTER` affinity gap
+  described in `docs/architecture.md` instead of arguing about it.
 - Chainload the UEFI firmware from m1n1 on the M4 (gated by the safety checklist).
 - Capture the UEFI serial log and check the memory map, CPU count, and ACPI
   table addresses at runtime.

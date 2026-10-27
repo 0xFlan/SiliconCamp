@@ -16,14 +16,14 @@ firmware `18000.161.10`.
 | QEMU | 11.1.2 |
 | upstream m1n1 build | success, `third_party/m1n1/build/m1n1.bin` |
 | NTASP m1n1-windows build | success, `third_party/m1n1-windows/build/m1n1.bin` |
-| M4 vGIC + PSCI + PCIe/MSI patches | applied in five cumulative patches; the series builds |
+| M4 vGIC + PSCI + PCIe/MSI patches | applied in six cumulative patches; the series builds |
 | M4 PSCI topology | T8132 tree is 2 clusters (6E+4P); ADT core count checked at init |
 | m1n1 PCIe hand-off | `src/pcie_guest.c` maps ECAM + BAR windows into stage 2 and bypasses every APCIE DART, verifying each stream by read-back |
 | m1n1 guest MSI | `src/guest_msi.c` programs all 256 port MSIMAP entries with read-back, unmasks AIC 1506–1761, and `hv_vgic3_guest_vintid()` maps them to INTIDs 512–767; the firmware advertises the same window as a MADT GIC MSI Frame |
-| Patch integrity | the m1n1-windows series (0001-0005) and both firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-27); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from (`667cd3ce…` / `20f98b16…`); the firmware platform patch reproduces every file it owns, including the MADT MSI frame |
+| Patch integrity | the m1n1-windows series (0001-0006) and both firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-27); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from (`222b6f9b…` / `c59b4f14…`); the firmware platform patch reproduces every file it owns, including the MADT MSI frame |
 | NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB), published as release `v0.8.0` |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 83 pass (`python3 -m unittest discover -s tests`), including 16 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect |
+| Checker regression tests | 87 pass (`python3 -m unittest discover -s tests`), including 20 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect |
 | M4 ACPI tables | disassembled and checked (below) |
 | MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
 | GIC MSI Frame | MADT entry 0x0D: doorbell `0xfffff000`, SPIs 512–767; cross-checked against `src/guest_msi.h` and rejected if it runs past SPI 1019 |
@@ -126,6 +126,17 @@ m1n1 keeps running at EL2 after the guest hangs, so that state can be read over
 the proxy precisely when there is no log to read; `docs/vgic-diagnostics.md`
 documents the offsets and a reader.
 
+The one capability claim that was still wrong is `GICD_TYPER.No1N`. It was 0,
+which advertises distributor-side 1-of-N SPI selection that this vGIC never
+performs (and the `GICR_CTLR.DPG*` opt-out bits, which it does not model).
+Patch 0006 sets it to 1, treats an `IRM` write of 1 as 0 — the behaviour ARM
+IHI 0069 permits when `No1N` is 1 — and stores the routing value without bit 31,
+so read-back cannot claim a mode that never runs. `No1N` is a statement about
+the emulated device, not about Apple's AIC: `aic_set_affinity()` is a no-op on
+AICv2/v3, so an SPI still lands on the PE the AIC picks. That residual gap, and
+why it is not closed before the self-test can measure it, is in
+`docs/architecture.md`.
+
 None of this has run on hardware; a UEFI conformance self-test is the next
 milestone because it is the only way to observe the contract before Windows
 exists. The ring and counters say what the guest *did*, not whether it was
@@ -136,7 +147,7 @@ correct.
 | Component | Status | Notes |
 |---|---|---|
 | m1n1 hardware init on M4 | Partial | Upstream has T8132 CPU, NVMe, PCIe, SPTM/GXF work; Asahi still calls M4 bring-up incomplete. |
-| m1n1-windows vGIC | Patched, builds | Original code lacked `T8132`; CPU count and PA window are now dynamic. Patch 0004 makes the redistributor and distributor honour the guest contract: per-frame decode, `GICR_WAKER` wake completion, `RWP` always 0, no LPI capabilities, and INTID→AIC translation on every mask/unmask/routing path. `scripts/check-vgic.py` locks it. Patch 0005 takes the per-access `printf()` off the hot path (it was a UART write per emulated register access) and replaces it with a ring buffer, touched bitmaps and a budgeted exception log in the global `vgic_diag`, readable over the proxy after a hang (`docs/vgic-diagnostics.md`). Not hardware-tested. |
+| m1n1-windows vGIC | Patched, builds | Original code lacked `T8132`; CPU count and PA window are now dynamic. Patch 0004 makes the redistributor and distributor honour the guest contract: per-frame decode, `GICR_WAKER` wake completion, `RWP` always 0, no LPI capabilities, and INTID→AIC translation on every mask/unmask/routing path. `scripts/check-vgic.py` locks it. Patch 0005 takes the per-access `printf()` off the hot path (it was a UART write per emulated register access) and replaces it with a ring buffer, touched bitmaps and a budgeted exception log in the global `vgic_diag`, readable over the proxy after a hang (`docs/vgic-diagnostics.md`). Patch 0006 sets `GICD_TYPER.No1N`: the distributor does not select a target PE, so it no longer advertises 1-of-N routing, and `GICD_IROUTER.IRM=1` is treated as 0. The affinity itself still cannot move an SPI on AICv3 (`docs/architecture.md`). Not hardware-tested. |
 | PSCI | Patched, builds | `hv_psci.c` had no `T8132` case; it now has the 6E+4P power-domain tree, the T8132 CPU-start offset (`0x34000`, same as `smp.c`), ADT bounds/count checks, and Aff1:Aff0 MPIDR normalisation. Unknown SoCs are fatal instead of dereferencing an unset topology pointer. Not hardware-tested. |
 | SMMU/DART abstraction | Stub | `hv_smmu.c` is 45 lines; not a real IOMMU. |
 | vTPM | Stub | `hv_vtpm.c` is 16 lines; no TPM 2.0. |

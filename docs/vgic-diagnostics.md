@@ -156,7 +156,7 @@ EOF
 /tmp/off
 ```
 
-As of this build (m1n1.macho SHA-256 `667cd3ce09f7…`) that prints
+As of this build (m1n1.macho SHA-256 `222b6f9bf8e8…`) that prints
 `size 4664 ring 56 dist 1592 redist 2616`.
 
 ---

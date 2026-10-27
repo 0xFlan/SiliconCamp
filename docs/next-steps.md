@@ -238,7 +238,7 @@ reserve as a bisection tool.
    submodule) and against patched sources; `tests/test_check_vgic.py` puts each
    defect back and requires the checker to fail.
 
-2. **Turn vGIC logging into an opt-in diagnostic.** *(done in this change)*
+2. **Turn vGIC logging into an opt-in diagnostic.** *(done, `0005`)*
    `hv_vgic.c` defined `ENABLE_VGIC_LOGGING 1`, so `vgic_log()` was a `printf()`
    on **every emulated register access**. **Verified.** At 115200 baud a 60-byte
    line costs about 5 ms, so a Windows HAL programming ~1020 INTIDs plus a
@@ -262,15 +262,46 @@ reserve as a bisection tool.
    printing, prints instead of recording, or lets an exceptional site bypass the
    budget. **machine-checked.**
 
-3. **Decide the `IROUTER` question honestly.** `aic_set_affinity()` is a no-op on
-   AICv3. Either find the AICv3 redirection mechanism, or report
-   `GICD_TYPER.No1N = 1` and accept fixed SPI routing. Right now the vGIC
-   advertises one-of-N routing it does not implement, which is defect 5/6 in a
-   different register.
+3. **Decide the `IROUTER` question honestly.** *(done, `0006`)*
+   The question was whether `GICD_TYPER.No1N` should stay 0, which advertises
+   1-of-N SPI routing, or become 1, which forbids the guest from asking the
+   distributor to choose a target PE. The answer came from two places:
+
+   - **ARM IHI 0069, `GICD_TYPER.No1N`.** When `No1N` is 1, 1-of-N distribution
+     is not supported and setting `GICD_IROUTER.IRM` to 1 is CONSTRAINED
+     UNPREDICTABLE; the permitted behaviours include "the field behaves as if
+     set to 0 for all purposes". When `No1N` is 0, a distributor is expected to
+     choose among participating PEs, which requires the `GICR_CTLR.DPG*` bits
+     that this vGIC does not model (and whose capability bits `0004` already
+     cleared).
+   - **Linux's Apple AIC driver.** `aic2_chip` and `aic3_chip` have no
+     `.irq_set_affinity`; the function that would implement it
+     (`aic_irq_set_affinity()`) writes `AIC_TARGET_CPU`, a register only AICv1
+     has, and `aic2_info`/`aic3_info` leave `target_cpu == 0`, so the
+     `BUG_ON(!ic->info.target_cpu)` inside it is unreachable on those SoCs. The
+     `AIC23_IRQ_CFG_TARGET` field that m1n1 programs at boot is filled from the
+     ADT's `aic-ext-intr-cfg` and selects a die, not a CPU. There is no
+     software-programmable per-SPI CPU target on AICv3.
+
+   `0006-vgic-honest-spi-routing.patch` sets `No1N` (bit 25), treats an `IRM`
+   write of 1 as 0, keeps bit 31 out of the stored routing value so read-back
+   cannot claim a mode that never runs, and still decodes the affinity and
+   translates the INTID before `aic_set_affinity()`. The diagnostic ring keeps
+   the guest's original write, which is the useful half of the event.
+
+   The residual gap is stated rather than papered over: on AICv2/v3 an SPI is
+   delivered to the PE the AIC chooses, and `hv_exc_irq()` injects the virtual
+   interrupt into that physical CPU's list registers. A guest that moves an SPI
+   to another PE will not see it move. `No1N` removes the *other* unsupported
+   promise — distributor-side selection — and `docs/architecture.md` records
+   why the affinity itself cannot be honoured without forwarding an
+   acknowledged physical interrupt to another CPU's queue. **machine-checked.**
 
 4. **Write the UEFI conformance self-test (option B)** so it is in the image
    before the first hardware boot. It costs nothing offline and is the difference
    between "the firmware booted" and "the firmware proved the interrupt contract".
+   When it runs, it should also record which PE actually takes each SPI: that
+   turns the affinity gap above from an argument into a measurement.
 
 ### Hardware-gated
 
@@ -297,8 +328,9 @@ reserve as a bisection tool.
 | Apple's CPU interface diverges from the architecture in ways only a real guest finds | Guest `ICC_*` behaviour differs from what the emulated distributor implies | Nothing offline can detect this; it is what hardware is for |
 | `ENABLE_VGIC_LOGGING` is turned back on | First boot looks like a hang at the first interrupt | Step 2 shipped `0005`; the checker fails if any patch restores it |
 | The ACPI tables describe the vGIC accurately but Windows ignores the MSI frame | MSI never works | `check-acpi.py` already pins the frame against `guest_msi.h`; the self-test should read the doorbell back |
-| Deterministic-build claim is mistaken | Patches and artifacts drift | The series reproduces the working tree and rebuilds to `m1n1.macho = 667cd3ce…`, `m1n1.bin = 20f98b16…` (**verified** on 2026-10-27) |
+| Deterministic-build claim is mistaken | Patches and artifacts drift | The series reproduces the working tree and rebuilds to `m1n1.macho = 222b6f9b…`, `m1n1.bin = c59b4f14…` (**verified** on 2026-10-27) |
 | The diagnostics are mistaken for a conformance test | A green log is read as "the vGIC is correct" | The ring records what the guest *did*, not whether it was correct; the conformance question is the UEFI self-test (step 4) |
+| An OS refuses to boot because an SPI it moved is still delivered on the AIC's PE | Interrupt affinity is performance-only on this hardware, unless a driver depends on locality | Step 3 shipped `0006`; the self-test should record the delivering PE per SPI, and the fix (forwarding an acknowledged interrupt to another CPU's queue) is designed only after that measurement |
 
 ---
 
@@ -315,7 +347,9 @@ The plan is wrong if any of these turns out to be true on hardware:
   frames 1–9 entirely — then defect 1 was unreachable and the fix is hygiene,
   not a milestone.
 - The AICv3 has no per-interrupt redirection at all and Windows refuses to run
-  with fixed SPI routing — then `IROUTER` moves from hygiene to blocker.
+  with fixed SPI routing — then `IROUTER` moves from hygiene to blocker. Step 3
+  established *that* AICv2/v3 expose no software-programmable per-SPI CPU
+  target; what remains to measure is whether a guest tolerates it.
 
 Each of these is cheap to check once the machine is available, which is the point
 of putting the self-test in the image first.
@@ -326,8 +360,13 @@ of putting the self-test in the image first.
 
 - ARM IHI 0069, *GIC architecture version 3.0 and version 4.0*: `GICR_WAKER`,
   `GICR_CTLR`, `GICR_TYPER`, `GICD_CTLR`, `GICD_TYPER`, redistributor frame layout.
+- ARM A-profile register reference, `GICD_IROUTER<n>`: the `No1N` /
+  `Interrupt_Routing_Mode` interaction quoted in step 3.
 - `include/linux/irqchip/arm-gic-v3.h` and `hw/intc/gicv3_internal.h` in QEMU:
   bit positions and the `VLPIS` stride rule.
+- `drivers/irqchip/irq-apple-aic.c` in Linux: `aic1_info`/`aic2_info`/`aic3_info`,
+  `aic_irq_set_affinity()`, and the `IRQ_CFG` layout that makes the AICv3 gap
+  visible.
 - `arch/arm64/kvm/vgic/vgic-v3.c` and `arch/arm64/kvm/sys_regs.c`: when
   `TALL0`/`TALL1` are used, and the SGI trap path.
 - EDK2 `ArmGicV3Dxe.c` (vendored in `third_party/ntasp-firmware`): the firmware's

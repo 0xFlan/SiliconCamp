@@ -134,6 +134,32 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("distributor accesses are recorded", result.stdout)
 
+    def test_series_without_no1n_is_rejected(self) -> None:
+        # No1N=1 is the only thing stopping a guest from asking the distributor
+        # to pick a target PE.  This vGIC has no such selection: on AICv3 the
+        # AIC decides, not a register the vGIC can write.
+        series = self._mutated_series(
+            "0006-vgic-honest-spi-routing.patch",
+            "+    distributor->gicd_type_reg = (BIT(25) | BIT(22)",
+            "+    distributor->gicd_type_reg = (BIT(22)",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No1N", result.stdout)
+
+    def test_series_that_accepts_irm_is_rejected(self) -> None:
+        # With No1N set, IRM=1 is CONSTRAINED UNPREDICTABLE.  Acting on it as
+        # though it meant something would route a guest that read No1N anyway,
+        # and storing it would make read-back claim a mode that never happens.
+        series = self._mutated_series(
+            "0006-vgic-honest-spi-routing.patch",
+            "+                    route &= ~GICD_IROUTER_IRM;",
+            "+                    route = route;",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("IRM=1 is treated as 0", result.stdout)
+
     def test_series_that_unmasks_on_disable_is_rejected(self) -> None:
         # A raw guest INTID at the AIC means SPI 512 masks AIC 512, not the
         # APCIE source at 1506 that actually raises it.
@@ -289,6 +315,21 @@ class PatchedTreeTests(unittest.TestCase):
         result = run_checker("--tree", tree)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("budgeted vgic_note", result.stdout)
+
+    def test_tree_without_no1n_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c", "BIT(25) | BIT(22)", "BIT(22)")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No1N", result.stdout)
+
+    def test_tree_that_keeps_irm_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "route &= ~GICD_IROUTER_IRM;", "(void)0;")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("IRM=1 is treated as 0", result.stdout)
 
     def test_unsigned_cpu_number_is_rejected(self) -> None:
         # smp_get_id() returns -1 for an affinity that is not in the ADT, and
