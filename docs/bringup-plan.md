@@ -8,7 +8,8 @@ This is ordered by dependency, not by excitement. Do not start the GPU or anti-c
 - Upstream m1n1 and NTASP m1n1-windows both build.
 - M4 vGIC topology and PSCI T8132 patches applied (six E-cores, four P-cores).
 - The vGIC guest contract is fixed and checked offline (patch 0004,
-  `scripts/check-vgic.py`).
+  `scripts/check-vgic.py`), and its diagnostics no longer print on the hot path
+  (patch 0005, `docs/vgic-diagnostics.md`).
 
 **Exit criteria:** `./scripts/build-m1n1.sh` produces `m1n1.bin` and `m1n1.macho` with no errors.
 
@@ -66,13 +67,12 @@ Done:
   programming with read-back, AIC unmask of 1506-1761, and AIC-to-INTID
   translation in the EL2 IRQ path. `check-acpi.py` compares the frame against
   `src/guest_msi.h` so the two ends cannot drift apart (`docs/pcie.md`).
+- Compile out the vGIC's per-access logging and replace it with bounded,
+  one-shot diagnostics (patch 0005; `docs/vgic-diagnostics.md`). Nothing on the
+  first boot is readable without it.
 
 Next:
 
-- Compile out the vGIC's per-access logging (`ENABLE_VGIC_LOGGING` is 1 today, so
-  every emulated register access is a UART write) and replace it with bounded,
-  one-shot diagnostics. This is offline work and the cheapest way to keep the
-  first boot readable.
 - Add a vGIC conformance self-test to the firmware image: walk every
   redistributor frame via `GICR_TYPER`, read-modify-write `GICR_WAKER` on each
   and poll `ChildrenAsleep` with a timeout, confirm both `RWP` bits read 0,

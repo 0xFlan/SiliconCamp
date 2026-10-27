@@ -163,8 +163,13 @@ The tricky parts are:
 - SPIs/PPIs that Windows expects to be edge- or level-triggered;
 - the ITS (mapped but unimplemented; a guest that discovers one through IORT would program a command queue nothing reads, so the firmware publishes no ITS and the MSI frame is used instead);
 - AIC interrupts with no guest INTID, which used to be injected verbatim and are now dropped (see the table above);
-- per-access logging, which is still compiled in (`ENABLE_VGIC_LOGGING`), and
-  turns a guest that programs ~1020 INTIDs into tens of thousands of UART writes.
+- observability. The per-access console trace is compiled out
+  (`ENABLE_VGIC_LOGGING 0`): it put three `printf()` calls on every emulated
+  register access, which over a 115200-baud console is minutes of output for a
+  guest that programs ~1020 INTIDs. What remains is a 64-entry ring of recent
+  accesses, one-bit-per-8-bytes touched bitmaps per address space, and a
+  32-line budget for exceptional events, all in the global `vgic_diag` and
+  readable over the proxy after a guest hang (`docs/vgic-diagnostics.md`).
 
 ## 5. The memory path
 

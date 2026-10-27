@@ -16,14 +16,14 @@ firmware `18000.161.10`.
 | QEMU | 11.1.2 |
 | upstream m1n1 build | success, `third_party/m1n1/build/m1n1.bin` |
 | NTASP m1n1-windows build | success, `third_party/m1n1-windows/build/m1n1.bin` |
-| M4 vGIC + PSCI + PCIe/MSI patches | applied in four cumulative patches; the series builds |
+| M4 vGIC + PSCI + PCIe/MSI patches | applied in five cumulative patches; the series builds |
 | M4 PSCI topology | T8132 tree is 2 clusters (6E+4P); ADT core count checked at init |
 | m1n1 PCIe hand-off | `src/pcie_guest.c` maps ECAM + BAR windows into stage 2 and bypasses every APCIE DART, verifying each stream by read-back |
 | m1n1 guest MSI | `src/guest_msi.c` programs all 256 port MSIMAP entries with read-back, unmasks AIC 1506–1761, and `hv_vgic3_guest_vintid()` maps them to INTIDs 512–767; the firmware advertises the same window as a MADT GIC MSI Frame |
-| Patch integrity | the m1n1-windows series (0001-0004) and both firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-27); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from; the firmware platform patch reproduces every file it owns, including the MADT MSI frame |
+| Patch integrity | the m1n1-windows series (0001-0005) and both firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-27); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from (`667cd3ce…` / `20f98b16…`); the firmware platform patch reproduces every file it owns, including the MADT MSI frame |
 | NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB), published as release `v0.8.0` |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 78 pass (`python3 -m unittest discover -s tests`), including 11 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect |
+| Checker regression tests | 83 pass (`python3 -m unittest discover -s tests`), including 16 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect |
 | M4 ACPI tables | disassembled and checked (below) |
 | MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
 | GIC MSI Frame | MADT entry 0x0D: doorbell `0xfffff000`, SPIs 512–767; cross-checked against `src/guest_msi.h` and rejected if it runs past SPI 1019 |
@@ -112,16 +112,31 @@ architectural reset. `docs/next-steps.md` records the reasoning and the sources.
 `scripts/check-vgic.py` is the gate. It asserts the contract against the patch
 series (no submodule, no compiler) and against patched sources, and
 `tests/test_check_vgic.py` puts each defect back and requires the checker to fail.
+
+Being correct is not the same as being observable, and the second half of this is
+a boot hazard of its own. `hv_vgic.c` built with `ENABLE_VGIC_LOGGING 1`, which
+put three `printf()` calls at the end of every emulated register access. Over a
+115200-baud console a 60-byte line costs about 5 ms, and a guest programming
+~1020 SPIs plus one redistributor frame per PE performs tens of thousands of
+accesses — minutes of console output, which presents as a hang in the code the
+logging was added to debug. Patch 0005 compiles the trace out and replaces it
+with a 64-entry ring, one-bit-per-8-bytes touched bitmaps per address space, and
+a 32-line budget for genuinely exceptional events, all in the global `vgic_diag`.
+m1n1 keeps running at EL2 after the guest hangs, so that state can be read over
+the proxy precisely when there is no log to read; `docs/vgic-diagnostics.md`
+documents the offsets and a reader.
+
 None of this has run on hardware; a UEFI conformance self-test is the next
 milestone because it is the only way to observe the contract before Windows
-exists.
+exists. The ring and counters say what the guest *did*, not whether it was
+correct.
 
 ## Component status
 
 | Component | Status | Notes |
 |---|---|---|
 | m1n1 hardware init on M4 | Partial | Upstream has T8132 CPU, NVMe, PCIe, SPTM/GXF work; Asahi still calls M4 bring-up incomplete. |
-| m1n1-windows vGIC | Patched, builds | Original code lacked `T8132`; CPU count and PA window are now dynamic. Patch 0004 makes the redistributor and distributor honour the guest contract: per-frame decode, `GICR_WAKER` wake completion, `RWP` always 0, no LPI capabilities, and INTID→AIC translation on every mask/unmask/routing path. `scripts/check-vgic.py` locks it. Not hardware-tested. |
+| m1n1-windows vGIC | Patched, builds | Original code lacked `T8132`; CPU count and PA window are now dynamic. Patch 0004 makes the redistributor and distributor honour the guest contract: per-frame decode, `GICR_WAKER` wake completion, `RWP` always 0, no LPI capabilities, and INTID→AIC translation on every mask/unmask/routing path. `scripts/check-vgic.py` locks it. Patch 0005 takes the per-access `printf()` off the hot path (it was a UART write per emulated register access) and replaces it with a ring buffer, touched bitmaps and a budgeted exception log in the global `vgic_diag`, readable over the proxy after a hang (`docs/vgic-diagnostics.md`). Not hardware-tested. |
 | PSCI | Patched, builds | `hv_psci.c` had no `T8132` case; it now has the 6E+4P power-domain tree, the T8132 CPU-start offset (`0x34000`, same as `smp.c`), ADT bounds/count checks, and Aff1:Aff0 MPIDR normalisation. Unknown SoCs are fatal instead of dereferencing an unset topology pointer. Not hardware-tested. |
 | SMMU/DART abstraction | Stub | `hv_smmu.c` is 45 lines; not a real IOMMU. |
 | vTPM | Stub | `hv_vtpm.c` is 16 lines; no TPM 2.0. |
@@ -203,7 +218,7 @@ To rebuild m1n1 from a clean `m1n1-windows` checkout:
 
 ```bash
 git -C third_party/m1n1-windows checkout -- .
-./scripts/apply-patches.sh       # applies 0001-0004 in order
+./scripts/apply-patches.sh       # applies 0001-0005 in order
 ./scripts/build-m1n1.sh          # also applies them, idempotently
 ```
 

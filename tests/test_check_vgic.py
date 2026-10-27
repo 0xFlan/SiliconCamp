@@ -110,6 +110,30 @@ class PatchSeriesTests(unittest.TestCase):
         result = run_checker("--patches", series)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_series_that_turns_logging_back_on_is_rejected(self) -> None:
+        # A printf() per emulated register access is not slow logging, it is a
+        # hang: the guest programs thousands of registers and the console is a
+        # UART, so the boot stalls in a way that looks like the bug it was
+        # supposed to find.
+        series = self._mutated_series(
+            "0005-vgic-diagnostics.patch",
+            "+#define ENABLE_VGIC_LOGGING 0",
+            "+#define ENABLE_VGIC_LOGGING 1",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("UART trace", result.stdout)
+
+    def test_series_without_a_distributor_trace_is_rejected(self) -> None:
+        series = self._mutated_series(
+            "0005-vgic-diagnostics.patch",
+            "+    vgic_diag_record('D', 0, relative_addr, *val, write,",
+            "+    (void)relative_addr; (void)val; (void)write;",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("distributor accesses are recorded", result.stdout)
+
     def test_series_that_unmasks_on_disable_is_rejected(self) -> None:
         # A raw guest INTID at the AIC means SPI 512 masks AIC 512, not the
         # APCIE source at 1506 that actually raises it.
@@ -236,6 +260,35 @@ class PatchedTreeTests(unittest.TestCase):
                      "aic_set_affinity(reg_num + 32, cpu_num);")
         result = run_checker("--tree", tree)
         self.assertNotEqual(result.returncode, 0)
+
+    def test_tree_with_logging_on_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "#define ENABLE_VGIC_LOGGING 0",
+                     "#define ENABLE_VGIC_LOGGING 1")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("compiled out", result.stdout)
+
+    def test_tree_that_prints_instead_of_recording_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "    vgic_diag_record('D', 0, relative_addr, *val, write,",
+                     "    printf(\"acc\\n\");\n    (void)relative_addr; (void)val; (void)write;\n    if (0) vgic_diag_record('D', 0, relative_addr, *val, write,")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no raw printf()", result.stdout)
+
+    def test_tree_with_an_unbudgeted_warning_is_rejected(self) -> None:
+        # The budget is the only thing standing between a guest that spins on a
+        # missing register and an unbounded flood.
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     'vgic_note(VGIC_NOTE_UNKNOWN, "HV vGIC [ERR]',
+                     'vgic_log(VGIC_NOTE_UNKNOWN, "HV vGIC [ERR]')
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("budgeted vgic_note", result.stdout)
 
     def test_unsigned_cpu_number_is_rejected(self) -> None:
         # smp_get_id() returns -1 for an affinity that is not in the ADT, and
