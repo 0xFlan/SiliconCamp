@@ -39,9 +39,10 @@ Windows on Arm requires:
 - a GICv3-compatible interrupt controller (the vGIC);
 - PSCI CPU power management (m1n1);
 - ACPI tables describing CPUs, timers, interrupts, PCIe, and the IOMMU — the
-  M4 package now has MCFG and `PCI0` for the first APCIE root complex and the
-  m1n1 hand-off maps its windows and bypasses the APCIE DARTs, but there is no
-  IORT, no described MSI path and no `apciec` description;
+  M4 package now has MCFG, `PCI0` for the first APCIE root complex and a GIC MSI
+  Frame, and the m1n1 hand-off maps its windows, bypasses the APCIE DARTs and
+  translates the MSI window; but there is no IORT and no `apciec` description,
+  and none of the interrupt path has run on hardware;
 - a WDDM display driver (or a basic framebuffer for bring-up);
 - storage and input drivers;
 - for anti-cheat, VBS/HVCI and a trusted platform.
@@ -86,6 +87,9 @@ hardware AIC IRQ/FIQ
 m1n1 EL2 exception handler
         |
         v
+hv_vgic3_guest_vintid(): AIC number -> guest INTID
+        |
+        v
 vGIC LR injection (ICH_LR_EL2)
         |
         v
@@ -97,13 +101,24 @@ Windows GIC driver -> device driver
 
 The guest's writes to the emulated GICD/GICR frames are trapped by `hv_map_hook`. The vGIC maintains distributor and redistributor state in heap memory, and injects virtual interrupts through the GIC virtual CPU interface list registers.
 
+An AIC interrupt number is not a GIC INTID, and the two do not line up:
+
+| AIC interrupt | What it is | Guest INTID |
+|---|---|---|
+| 0-1019 | peripherals whose AIC number happens to be a valid SPI | same number |
+| 1506-1761 | APCIE MSI vectors (`msi-vector-offset` + index) | 512 + index |
+| everything else (UART 1046, APCIE root complexes 1231-1249) | no INTID representation | dropped, source masked, logged once |
+
+The MSI window exists because Apple's PCIe controllers do not use the GIC's ITS: a device writes an index to the controller's doorbell, the port maps it and the AIC raises `msi-vector-offset + index`. The firmware advertises SPIs 512-767 as a GIC MSI Frame at that doorbell (`docs/pcie.md`), the OS programs a device's MSI-X table with `data = INTID - 512`, and the hypervisor translates back. The two ends of that contract are checked by `scripts/check-acpi.py`.
+
 The tricky parts are:
 
 - maintenance interrupts;
 - SError errata on pre-M3 SoCs;
 - affinity routing when the physical AIC cannot target a specific vCPU;
 - SPIs/PPIs that Windows expects to be edge- or level-triggered;
-- the ITS (currently mapped but mostly unimplemented; direct injection is used instead).
+- the ITS (mapped but unimplemented; a guest that discovers one through IORT would program a command queue nothing reads, so the firmware publishes no ITS and the MSI frame is used instead);
+- AIC interrupts with no guest INTID, which used to be injected verbatim and are now dropped (see the table above).
 
 ## 5. The memory path
 

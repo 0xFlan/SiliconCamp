@@ -59,6 +59,11 @@ Done:
 - Added MCFG and `PCI0`/`_CRS` for the first APCIE root complex, with `RES0`
   reserving the 256 MB ECAM. `check-acpi.py` pins the bus range, both windows,
   the translation, and the ECAM reservation.
+- Added a MADT GIC MSI Frame for SPIs 512-767 at Apple's APCIE doorbell
+  (`0xfffff000`), and the hypervisor half in `guest_msi.c`: port MSIMAP
+  programming with read-back, AIC unmask of 1506-1761, and AIC-to-INTID
+  translation in the EL2 IRQ path. `check-acpi.py` compares the frame against
+  `src/guest_msi.h` so the two ends cannot drift apart (`docs/pcie.md`).
 
 Next:
 
@@ -66,9 +71,16 @@ Next:
 - Capture the UEFI serial log and check the memory map, CPU count, and ACPI
   table addresses at runtime.
 - Bring up the USB DWC3/XHCI path so a USB keyboard and USB installer are usable.
-- Give the guest an MSI path: the doors and the DARTs are done (m1n1 maps the
-  windows and bypasses the APCIE DARTs; MCFG and `PCI0`/`_CRS` are in the
-  firmware), so the next blocker is interrupts, not enumeration or DMA.
+- Validate the MSI path: the frame, the MSIMAP programming and the translation
+  are written and checked offline, but the first boot has to show that the port
+  map is where `pcie.c` assumes (`0x3800`), that `msi-vector-offset` is really
+  the AIC interrupt of vector 0, and that Windows accepts a MSI frame without an
+  IORT. The log prints each of those numbers (`docs/pcie.md`).
+- Describe the four `apciec` root complexes (ECAMs, bus ranges, apertures) so
+  Thunderbolt/USB4 devices can appear; `PCI0` currently covers only
+  `apcie@B0000000`.
+- Add `_PRT`/IORT once the first boot says whether Windows needs them; neither is
+  invented in advance.
 
 **Exit criteria:** the UEFI boot menu appears on the M4's display or over serial, and the firmware reports the correct CPU count and memory map.
 

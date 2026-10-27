@@ -204,8 +204,10 @@ The following remain provisional and must be checked on hardware:
   host offset and prefetch window are captured and described (`docs/pcie.md`),
   `PcdPciMmio32Translation` carries the same `host - bus` value as the DSDT
   `_TRA`, and the m1n1 hand-off maps the windows and bypasses the APCIE DARTs.
-  What is untested is MSI: no interrupt path to the guest is described yet. The
-  four `apciec` complexes also have their own apertures that a single
+  MSI is described by a GIC MSI Frame (SPIs 512–767 at `0xfffff000`) and
+  translated by the hypervisor, but the port-map offset, the vector offset, the
+  AIC target and whether Windows needs an IORT are unproven (`docs/pcie.md`).
+  The four `apciec` complexes also have their own apertures that a single
   host-bridge descriptor cannot represent.
 - ANS2/SART storage for the internal SSD; USB storage is the current install path.
 - DCP/display handoff beyond the iBoot framebuffer.

@@ -137,9 +137,12 @@ windows into the guest and puts every APCIE DART into bypass (all streams,
 verified by read-back), and prints the ADT's controller/MSI topology during
 bring-up. What remains:
 
-1. MSI: the guest has no way to be told about Apple's `0xfffff000` doorbell yet,
-   and the vGIC's ITS window (`0x5200000000`) only decodes `GITS_CTLR` and
-   `GITS_BASER*`. See the MSI section of `docs/pcie.md`.
+1. MSI validation: the firmware now publishes a GIC MSI Frame (SPIs 512–767 at
+   `0xfffff000`) and `guest_msi.c` programs the port maps and translates the AIC
+   interrupts, but none of it has run. The port-map offset, the vector offset,
+   the AIC target and Windows' need for an IORT are open questions listed in the
+   MSI section of `docs/pcie.md`. The vGIC's ITS window (`0x5200000000`) still
+   decodes only `GITS_CTLR` and `GITS_BASER*`; the guest is given no ITS.
 2. Describing the four `apciec` complexes (one host bridge each): their ECAMs and
    apertures still need capturing, and only `apcie@B0000000` has `PCI0` today.
 3. Validating BAR assignment, DMA and interrupts on hardware.

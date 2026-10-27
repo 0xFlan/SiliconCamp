@@ -1,17 +1,22 @@
 # Build artifacts
 
 These are the outputs of the 2026-10-27 build on the `Mac16,3` / `J624` M4 iMac,
-published as release **v0.7.0**.
+published as release **v0.8.0**.
 
-The UEFI image changed since v0.6.0; the two hypervisor images are byte-identical
-to v0.6.0 because no m1n1 source changed.
+All three images changed since v0.7.0.
 
-- the UEFI image now contains `AppleNANDStorageDxe`, a real driver for the
-  internal ANS/ANS2 SSD: ASC mailboxes, SART windows, RTKit handshake,
-  NVMMU/NVMe queues, `Identify`, and `EFI_BLOCK_IO_PROTOCOL`. It replaces a
-  comment-only stub and is the first firmware in this project that attempts to
-  address the internal disk. It has never run on hardware, so USB storage remains the
-  install target until the first boot log says otherwise (`../docs/ans2.md`).
+- the UEFI MADT now carries a **GIC MSI Frame**: doorbell `0xfffff000` (the
+  captured APCIE `msi-address`), SPIs 512–767. This is how a guest that has no
+  APCIE driver is told how to signal through an Apple controller.
+- the hypervisor now has the other half: `guest_msi.c` programs each APCIE port's
+  256-entry MSI map (read back, because iBoot hands over with it cleared),
+  unmasks AIC 1506–1761, and `hv_vgic3_guest_vintid()` translates those AIC
+  interrupts into the SPIs the firmware advertises. An AIC interrupt with no
+  guest INTID is now masked and logged instead of being injected verbatim.
+- the v0.7.0 changes remain: `AppleNANDStorageDxe`, a real driver for the
+  internal ANS/ANS2 SSD, is in the UEFI image. It has never run on hardware, so
+  USB storage remains the install target until the first boot log says otherwise
+  (`../docs/ans2.md`).
 - the v0.6.0 changes remain: the hypervisor's `0003-pcie-guest-handoff.patch`
   maps the APCIE ECAM and BAR windows into the guest's stage 2 and bypasses every
   APCIE DART with per-stream read-back, and the UEFI image carries the corrected
@@ -29,24 +34,27 @@ checked against.
 | File | Size | What it is |
 |---|---|---|
 | `MAC16_3_EFI.fd` | 30 MB | NTASP Project Mu UEFI firmware for the M4 iMac, `Mac16,3` |
-| `m1n1-windows.bin` | 1.1 MB | raw m1n1-windows hypervisor image |
-| `m1n1-windows.macho` | 896 KB | Mach-O form of the same m1n1-windows build |
+| `m1n1-windows.bin` | 1.2 MB | raw m1n1-windows hypervisor image |
+| `m1n1-windows.macho` | 933 KB | Mach-O form of the same m1n1-windows build |
 | `SHA256SUMS` | — | SHA-256 of the three images above |
 
 ## SHA-256
 
 ```
-3bc227d442e2ac6258a86f3a3db6c81d5a352dd817cb54d996b04c3c21a19e02  MAC16_3_EFI.fd
-ea4b4ba322d123dabfa127e9e7c70ee7b5aa1704c535e08b53c936703e641de7  m1n1-windows.bin
-b2595ac056b23eed623d9a50158325714173975d1e2983efad17148f01f49ad9  m1n1-windows.macho
+31416f196b404889f57fd190c7b46084adb6ebbc690cbbf231f0ad0f981c6cfc  MAC16_3_EFI.fd
+571aafe38ef267656c4068f39af87b5b16d70c2b67e0c1cc669c904994b1eb31  m1n1-windows.bin
+c3346f007c1e90d30a6aac14409547662779adaf3765b2e65386f3912e91211c  m1n1-windows.macho
 ```
 
 The m1n1 hashes come from a detached worktree of the pinned submodule commit
-with `patches/m1n1-windows/0001`–`0003` applied. A recursive `diff -r` of that
+with `patches/m1n1-windows/0001`–`0003` applied (0003 now carries both the PCIe
+and the MSI hand-off). A recursive `diff -r` of that
 tree against the working tree the patches were developed in reports no
 difference outside `.git`, `build/` and `target/`, and both trees build the same
 `m1n1.bin` byte for byte — so the hashes identify clean-checkout + patches, not
-a dirty tree.
+a dirty tree. The UEFI image was built from the firmware tree that
+`patches/ntasp-firmware/0001` reproduces from its pinned commit; a `diff -r`
+ignoring `__pycache__` reports no difference.
 
 ## What the UEFI image contains
 
@@ -55,7 +63,8 @@ a dirty tree.
   Apple boot args), 10 cores, two clusters.
 - MADT: 10 GICC entries; E-core MPIDRs `0x0`–`0x5`, P-core MPIDRs
   `0x10100`–`0x10103`; GICD `0x5000000000`; GICR `0x5100000000`, length
-  `0x140000`.
+  `0x140000`; one GIC MSI Frame (type `0x0D`): doorbell `0xfffff000`, flags 0,
+  SPIs 512–767.
 - PPTT: one package, 6-core E-cluster, 4-core P-cluster, cores ACPI IDs 0–9.
 - DSDT: `DIE0` with `CLU0` (CPU0–CPU5) and `CLU1` (CPU6–CPU9); `COM0` at
   `0x3ad200000`, interrupt 1046.
@@ -96,14 +105,20 @@ larger than the whole image.
   windows are mapped into the guest's stage 2; every DART stream is put into
   bypass (`BYPASS_DART | BYPASS_DAPF`), the TLB is flushed, and every stream is
   read back. A stream that is locked or ignores the write fails the hand-off.
+- guest MSI (patch 0003): 256 MSIMAP entries per APCIE port programmed to
+  `0x80000000 | i` and read back, AIC 1506–1761 unmasked, and AIC interrupts
+  translated to SPIs 512–767 (`guest_msi.c`, `hv_vgic3_guest_vintid()`). AIC
+  interrupts above SPI 1019 with no INTID representation — the UART at 1046, the
+  root complexes at 1231–1249 — are masked and logged once.
 - `HV_QUIESCE_PCIE` in `config.h` restores upstream's `pcie_shutdown()` — it is
   **not** defined in this build.
 
 ## What is not in these images
 
-- No MSI path for the guest. Apple's doorbell (`0xfffff000`, vector offset
-  1506) works from the hardware's point of view, but nothing describes it to
-  Windows, and the vGIC's ITS window handles only `GITS_CTLR`/`GITS_BASER*`.
+- No *validated* MSI path. The frame, the port map programming and the
+  translation are written, but the port map offset on T8132, the meaning of
+  `msi-vector-offset`, the AIC target CPU, and whether Windows accepts a MSI
+  frame without an IORT are unproven on hardware (`../docs/pcie.md`).
 - No description of the four `apciec0`–`apciec3` root complexes; `PCI0`
   describes only the first `apcie` node. Their DARTs are bypassed by the m1n1
   hand-off, and the hand-off prints their ECAMs at boot for the next capture.

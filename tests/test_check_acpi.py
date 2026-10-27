@@ -43,7 +43,8 @@ ARM64_HEADER = bytes.fromhex(
 
 
 def run_checker(build_dir: str,
-                firmware_root: str | None = None) -> subprocess.CompletedProcess:
+                firmware_root: str | None = None,
+                env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     argv = [sys.executable, CHECKER, "--build-dir", build_dir]
     if firmware_root is not None:
         argv += ["--firmware-root", firmware_root]
@@ -52,7 +53,22 @@ def run_checker(build_dir: str,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
+
+
+def msi_frame_offsets(madt: bytes) -> list[int]:
+    """Return the byte offset of every GIC MSI Frame entry in a MADT."""
+    offsets = []
+    off = 44
+    while off + 2 <= len(madt):
+        etype, elen = madt[off], madt[off + 1]
+        if elen < 2:
+            break
+        if etype == 0x0D:
+            offsets.append(off)
+        off += elen
+    return offsets
 
 
 def gicc_offsets(madt: bytes) -> list[int]:
@@ -113,6 +129,16 @@ class TestCheckerPasses(FixtureCase):
         self.assertNotIn("skipping image checks", result.stdout)
         self.assertIn("image: ARM64 Image magic present", result.stdout)
 
+    def test_msi_frame_is_checked(self) -> None:
+        # MSI reaches Windows only through this entry: an OS with no MSI
+        # controller never programs a device's MSI-X table, and an OS with the
+        # wrong window programs doorbell indices m1n1 does not translate.
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("MADT: MSI doorbell 0xfffff000", result.stdout)
+        self.assertIn("MADT: MSI SPIs 0x200+256", result.stdout)
+        self.assertIn("window ends at SPI 767 (<= 1019)", result.stdout)
+
 
 class TestTopologyDump(FixtureCase):
     def test_dump_describes_the_build(self) -> None:
@@ -167,6 +193,61 @@ class TestCheckerRejects(FixtureCase):
         result = run_checker(self.build_dir)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("efficiency class", result.stdout)
+
+    def edit_msi_frame(self, **fields) -> None:
+        """Rewrite one field of the fixture's GIC MSI Frame entry."""
+        madt = self.table("*MADT*")
+        with open(madt, "rb") as f:
+            data = f.read()
+        off = msi_frame_offsets(data)[0]
+        order = {"frame_id": ("<I", 4), "address": ("<Q", 8),
+                 "flags": ("<I", 16), "count": ("<H", 20), "base": ("<H", 22)}
+        for name, value in fields.items():
+            fmt, delta = order[name]
+            self.patch_bytes(madt, off + delta, struct.pack(fmt, value))
+
+    def test_wrong_msi_doorbell(self) -> None:
+        self.edit_msi_frame(address=0xFFFFF004)
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("MSI doorbell", result.stdout)
+
+    def test_wrong_msi_spi_window(self) -> None:
+        self.edit_msi_frame(base=1024)
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("MSI SPIs", result.stdout)
+
+    def test_msi_window_past_the_spi_range(self) -> None:
+        # 512 + 512 = 1024 would run past SPI 1019 and into the reserved range,
+        # where the guest's interrupt controller has no state.
+        self.edit_msi_frame(count=512)
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("window ends at SPI", result.stdout)
+
+    def test_missing_msi_frame(self) -> None:
+        madt = self.table("*MADT*")
+        with open(madt, "rb") as f:
+            data = bytearray(f.read())
+        self.patch_bytes(madt, msi_frame_offsets(data)[0], b"\x0e")
+        result = run_checker(self.build_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("GIC MSI frame (0 found)", result.stdout)
+
+    def test_msi_window_disagrees_with_the_hypervisor(self) -> None:
+        # The half of the contract the firmware cannot see: m1n1's own table.
+        tree = os.path.join(self.tmp, "m1n1")
+        os.makedirs(os.path.join(tree, "src"))
+        with open(os.path.join(tree, "src", "guest_msi.h"), "w") as f:
+            f.write("#define GUEST_MSI_SPI_BASE 256\n"
+                    "#define GUEST_MSI_VECTORS  256\n"
+                    "#define GUEST_GIC_MAX_INTID 1023\n"
+                    "#define GIC_LAST_SPI 1019\n")
+        env = dict(os.environ, M1N1_ROOT=tree)
+        result = run_checker(self.build_dir, env=env)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("hypervisor SPI base 256 == MADT 512", result.stdout)
 
     def test_wrong_gicr_range(self) -> None:
         madt = self.table("*MADT*")

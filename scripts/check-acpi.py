@@ -70,6 +70,14 @@ class Platform:
     #: PCIe PCDs.  The same windows appear in the ACPI tables; both are checked
     #: against the captured values so they cannot drift apart.
     pcd_sources: tuple[str, ...] = ()
+    #: Guest MSI window, from the MADT GIC MSI Frame entry.  All zero for a
+    #: platform that publishes no MSI frame.  `msi_doorbell` is the APCIE
+    #: `msi-address` captured from this machine (docs/pcie.md); the SPI window
+    #: is the one m1n1 translates (src/guest_msi.h), and the two are checked
+    #: against each other because a mismatch drops every MSI silently.
+    msi_doorbell: int = 0
+    msi_spi_base: int = 0
+    msi_vectors: int = 0
 
 
 # Sources for every value are recorded in docs/hardware-values.md.
@@ -101,6 +109,11 @@ PLATFORMS: dict[str, Platform] = {
             "Platform/Mac16_3Pkg/Mac16_3.dsc",
             "Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc",
         ),
+        # apcie@B0000000 `msi-address`; the AIC raises `msi-vector-offset`
+        # (1506) + index, which m1n1 translates onto these SPIs.
+        msi_doorbell=0xFFFFF000,
+        msi_spi_base=512,
+        msi_vectors=256,
     ),
 }
 
@@ -174,6 +187,7 @@ def read_madt(data: bytes, ck: Checker | None = None) -> dict:
         "efficiency": [],
         "per_cpu_gicr": [],
         "gicc_lengths": [],
+        "msi_frames": [(off, length) for (t, off, length) in entries if t == 0x0D],
     }
     for etype, off, length in entries:
         if etype != 0x0B:
@@ -580,6 +594,8 @@ def check_madt(data: bytes, ck: Checker, plat: Platform) -> None:
                  f"MADT: GICR range 0x{base:x}+0x{size:x} == "
                  f"0x{plat.gicr_base:x}+0x{want:x}")
 
+    check_msi_frame(data, ck, plat, info["msi_frames"])
+
     if giccs != count:
         ck.note(f"      skipping per-core checks: expected {count} GICCs")
         return
@@ -602,6 +618,96 @@ def check_madt(data: bytes, ck: Checker, plat: Platform) -> None:
     # A zero per-CPU GICR base means "use the GICR discovery range" (ACPI 6.3).
     ck.check(info["per_cpu_gicr"] == [0] * count,
              "MADT: per-CPU GICR bases are 0, GICR range is authoritative")
+
+
+def m1n1_root() -> str:
+    """The hypervisor submodule, whose guest MSI window the MADT describes."""
+    return os.environ.get("M1N1_ROOT") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "third_party", "m1n1-windows")
+
+
+#: Values in src/guest_msi.h that the firmware's MADT has to agree with.
+GUEST_MSI_DEFINES = ("GUEST_MSI_SPI_BASE", "GUEST_MSI_VECTORS",
+                     "GUEST_GIC_MAX_INTID", "GIC_LAST_SPI")
+
+
+def read_guest_msi_header(path: str) -> dict[str, int]:
+    """Read the hypervisor's MSI window constants."""
+    values: dict[str, int] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r"\s*#define\s+(\w+)\s+(0x[0-9A-Fa-f]+|\d+)\s*$", line)
+            if m and m.group(1) in GUEST_MSI_DEFINES:
+                values[m.group(1)] = int(m.group(2), 0)
+    return values
+
+
+def check_msi_frame(data: bytes, ck: Checker, plat: Platform,
+                    frames: list[tuple[int, int]]) -> None:
+    """Check the MADT GIC MSI Frame entry against the platform and m1n1.
+
+    An OS that is told nothing about MSI never programs a device's MSI-X table,
+    so the device raises interrupts that do not exist.  An OS that is told the
+    wrong window programs the doorbell with indices m1n1 does not translate, and
+    every interrupt is dropped with a line in the hypervisor log instead of an
+    interrupt.  Both failures are silent from the guest's point of view, so the
+    three numbers are pinned here.
+    """
+    if not plat.msi_vectors:
+        ck.check(not frames, f"MADT: no GIC MSI frame ({len(frames)} found)")
+        return
+
+    if not ck.check(len(frames) == 1,
+                    f"MADT: exactly one GIC MSI frame ({len(frames)} found)"):
+        return
+
+    off, length = frames[0]
+    if not ck.check(length == 24, f"MADT: GIC MSI frame is 24 bytes ({length})"):
+        return
+
+    frame_id, address, flags, count, base = struct.unpack_from("<IQIHH", data, off + 4)
+
+    ck.check(address == plat.msi_doorbell,
+             f"MADT: MSI doorbell 0x{address:x} == 0x{plat.msi_doorbell:x}")
+    ck.check(flags == 0,
+             f"MADT: MSI frame flags 0x{flags:x} (SPI count and base are valid)")
+    ck.check(base == plat.msi_spi_base and count == plat.msi_vectors,
+             f"MADT: MSI SPIs 0x{base:x}+{count} == "
+             f"0x{plat.msi_spi_base:x}+{plat.msi_vectors}")
+
+    # ACPI 6.3 leaves GicMsiFrameId to the firmware; it only has to be unique,
+    # and there is one frame.
+    ck.note(f"      GIC MSI frame id {frame_id}")
+
+    header = os.path.join(m1n1_root(), "src", "guest_msi.h")
+    if not os.path.exists(header):
+        ck.note("      hypervisor tree not checked out; MSI window not cross-checked")
+        return
+
+    m1n1 = read_guest_msi_header(header)
+    if not ck.check(all(name in m1n1 for name in
+                        ("GUEST_MSI_SPI_BASE", "GUEST_MSI_VECTORS")),
+                    "MSI: hypervisor declares the guest window"):
+        return
+
+    ck.check(m1n1["GUEST_MSI_SPI_BASE"] == base,
+             f"MSI: hypervisor SPI base {m1n1['GUEST_MSI_SPI_BASE']} == MADT {base}")
+    ck.check(m1n1["GUEST_MSI_VECTORS"] == count,
+             f"MSI: hypervisor vector count {m1n1['GUEST_MSI_VECTORS']} == MADT {count}")
+
+    # The window has to be architecturally addressable: SPIs start at 32, end at
+    # 1019, and the emulated distributor only has state for INTIDs up to the
+    # GICD_TYPER limit, which is 1023 for the 32-bank distributor m1n1 models.
+    ck.check(base >= 32, f"MSI: SPI base {base} is in the SPI range (>= 32)")
+    if "GIC_LAST_SPI" in m1n1:
+        ck.check(base + count - 1 <= m1n1["GIC_LAST_SPI"],
+                 f"MSI: window ends at SPI {base + count - 1} "
+                 f"(<= {m1n1['GIC_LAST_SPI']})")
+    if "GUEST_GIC_MAX_INTID" in m1n1:
+        ck.check(base + count - 1 <= m1n1["GUEST_GIC_MAX_INTID"],
+                 f"MSI: window ends at INTID {base + count - 1} "
+                 f"(<= emulated distributor's {m1n1['GUEST_GIC_MAX_INTID']})")
 
 
 def check_pptt(data: bytes, ck: Checker, plat: Platform) -> None:
