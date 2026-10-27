@@ -32,6 +32,17 @@ if ! rustup target list --installed 2>/dev/null | grep -qx 'aarch64-unknown-none
     exit 1
 fi
 
+if [ "$TREE" = "$ROOT/third_party/m1n1-windows" ]; then
+    #
+    # A fresh submodule checkout is unpatched.  Apply the project patches here
+    # so "clone, build" produces the image this repository documents; the
+    # script is idempotent and refuses a tree that no longer matches.
+    #
+    echo "Applying m1n1-windows patches (idempotent)"
+    "$ROOT/scripts/apply-patches.sh" "$TREE"
+    echo
+fi
+
 echo "Building: $TREE"
 make -C "$TREE" -j"$(sysctl -n hw.ncpu)"
 

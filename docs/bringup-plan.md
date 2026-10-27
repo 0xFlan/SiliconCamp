@@ -6,7 +6,7 @@ This is ordered by dependency, not by excitement. Do not start the GPU or anti-c
 
 - macOS arm64 host, Homebrew LLVM/LLD, Rust target, QEMU.
 - Upstream m1n1 and NTASP m1n1-windows both build.
-- M4 vGIC topology patch applied.
+- M4 vGIC topology and PSCI T8132 patches applied (six E-cores, four P-cores).
 
 **Exit criteria:** `./scripts/build-m1n1.sh` produces `m1n1.bin` and `m1n1.macho` with no errors.
 
@@ -27,9 +27,18 @@ This is the first hardware step and the first irreversible one. It requires the 
 HV vGIC: 10 CPUs, 42-bit PA, dist=0x5000000000 redist=0x5100000000 its=0x5200000000
 ```
 
+and the PSCI initialization agrees with it:
+
+```
+PSCI DEBUG: topology tree selected
+PSCI DEBUG: Number of cores for PSCI nodes is 10
+PSCI DEBUG: Number of clusters for PSCI nodes is 2
+```
+
 The exact PA width may be 42 or larger; the patch chooses the 42-bit window for
 anything above 36 bits. If it prints `no CPU nodes found`, the ADT CPU parsing is
-wrong for this M4; stop and fix before proceeding.
+wrong for this M4. A `PSCI: topology has N cores but the ADT has M` line means
+the descriptor and the machine disagree; stop and fix before proceeding.
 
 ## Phase 2 — NTASP UEFI on the M4
 

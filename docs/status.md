@@ -16,8 +16,9 @@ firmware `18000.161.10`.
 | QEMU | 11.1.2 |
 | upstream m1n1 build | success, `third_party/m1n1/build/m1n1.bin` |
 | NTASP m1n1-windows build | success, `third_party/m1n1-windows/build/m1n1.bin` |
-| M4 vGIC topology patch | applied and builds |
-| Patch integrity | each patch reproduces the submodule's whole working-tree diff (2026-10-26: the trees the artifacts came from) |
+| M4 vGIC + PSCI patches | applied; both build |
+| M4 PSCI topology | T8132 tree is 2 clusters (6E+4P); ADT core count checked at init |
+| Patch integrity | the m1n1-windows patches reproduce the submodule's whole working-tree diff from a clean checkout; the firmware patches still apply to their pinned commits (2026-10-26) |
 | NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB) |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
 | Checker regression tests | 35 pass (`python3 -m unittest discover -s tests`) |
@@ -75,7 +76,7 @@ them compressed inside the Project Mu FV), and enforced by
 |---|---|---|
 | m1n1 hardware init on M4 | Partial | Upstream has T8132 CPU, NVMe, PCIe, SPTM/GXF work; Asahi still calls M4 bring-up incomplete. |
 | m1n1-windows vGIC | Patched, builds | Original code lacked `T8132`; CPU count and PA window are now dynamic. Not hardware-tested. |
-| PSCI | Present, builds | `hv_psci.c`; needs hardware validation on M4. |
+| PSCI | Patched, builds | `hv_psci.c` had no `T8132` case; it now has the 6E+4P power-domain tree, the T8132 CPU-start offset (`0x34000`, same as `smp.c`), ADT bounds/count checks, and Aff1:Aff0 MPIDR normalisation. Unknown SoCs are fatal instead of dereferencing an unset topology pointer. Not hardware-tested. |
 | SMMU/DART abstraction | Stub | `hv_smmu.c` is 45 lines; not a real IOMMU. |
 | vTPM | Stub | `hv_vtpm.c` is 16 lines; no TPM 2.0. |
 | NTASP UEFI firmware | Builds | M2 reference and M4 `Mac16_3` package both build in the Lima VM. |
@@ -147,8 +148,8 @@ To rebuild m1n1 from a clean `m1n1-windows` checkout:
 
 ```bash
 git -C third_party/m1n1-windows checkout -- .
-git -C third_party/m1n1-windows apply ../../patches/m1n1-windows/0001-vgic-m4-topology.patch
-./scripts/build-m1n1.sh
+./scripts/apply-patches.sh       # applies 0001 and 0002 in order
+./scripts/build-m1n1.sh          # also applies them, idempotently
 ```
 
 ## Honest assessment
