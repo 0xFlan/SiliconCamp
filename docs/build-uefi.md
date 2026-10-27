@@ -191,8 +191,10 @@ The following remain provisional and must be checked on hardware:
 
 - PCIe beyond the first root complex. The `apcie@B0000000` ECAM, bus window,
   host offset and prefetch window are captured and described (`docs/pcie.md`),
-  but the APCIE DARTs are not programmed, so devices can enumerate but cannot
-  DMA. The four `apciec` complexes have their own apertures that a single
+  `PcdPciMmio32Translation` carries the same `host - bus` value as the DSDT
+  `_TRA`, and the m1n1 hand-off maps the windows and bypasses the APCIE DARTs.
+  What is untested is MSI: no interrupt path to the guest is described yet. The
+  four `apciec` complexes also have their own apertures that a single
   host-bridge descriptor cannot represent.
 - ANS2/SART storage for the internal SSD; USB storage is the current install path.
 - DCP/display handoff beyond the iBoot framebuffer.

@@ -75,25 +75,41 @@ Decoded:
 
 ## What this means for the firmware
 
-`AppleSiliconPciHostBridgeLib` takes the aperture base in **bus** address space
-and computes
+The 32-bit window exists in two coordinate systems at once, and three separate
+sign conventions meet in the middle:
+
+1. `AppleSiliconPciHostBridgeLib` fills in the root bridge descriptor from the
+   PCDs and computes the aperture field as
+   `PcdPciMmio32Base - (PcdPciMmio32Base + PcdPciMmio32Translation)`, i.e.
+   `-PcdPciMmio32Translation`.
+2. `MdeModulePkg/Bus/Pci/PciHostBridgeDxe/PciHostBridge.h` defines that field as
+   `Translation = Device Address - Host Address` and converts with
+   `TO_HOST_ADDRESS(dev, tra) = dev - tra`.
+3. ACPI's `_TRA` in the DSDT `_CRS` is the other way round:
+   `DynamicTablesPkg`'s `SsdtPcieGenerator` emits `_TRA = CpuAddress -
+   PciAddress`, which is `host - bus` — the value this file's `_CRS` uses.
+
+So the PCD carries **host - bus**:
 
 ```
-Translation = PcdPciMmio32Base - (PcdPciMmio32Base + PcdPciMmio32Translation)
-```
-
-so the PCD must carry `bus - host`:
-
-```
-PcdPciMmio32Base        = 0x80000000
+PcdPciMmio32Base        = 0x80000000          /* bus address */
 PcdPciMmio32Size        = 0x40000000
-PcdPciMmio32Translation = 0xFFFFFFF500000000   /* -0xb00000000 */
+PcdPciMmio32Translation = 0xB00000000         /* host - bus */
 ```
 
-That yields a host aperture of `0xb80000000`–`0xbbfffffff`. The page tables must
-therefore map the **host** addresses (`0xb80000000`+1 GB), while the PCI core
-does the bus↔host conversion. Mapping the bus address, or dropping a digit,
-leaves every BAR access decoding nowhere.
+which the library turns into an aperture translation of `-0xb00000000`, and
+`TO_HOST_ADDRESS(0x80000000, -0xb00000000)` then returns `0xb80000000`. The
+T602X platform uses the same convention (`bus 0xc0000000`, `host 0x5c0000000`,
+`PCD 0x500000000`).
+
+The page tables must map the **host** addresses (`0xb80000000`+1 GB), while the
+PCI core does the bus↔host conversion.
+
+This sign was wrong in the first revision of the platform: the PCD carried
+`bus - host` (`0xFFFFFFF500000000`), which builds, boots, and enumerates, and
+then places every BAR at a host address that no device decodes. The fix is in
+`T8132FamilyPkg.dsc.inc`, and `scripts/check-acpi.py` now fails the build if the
+PCD, the DSDT `_CRS` and the captured values disagree — including the sign.
 
 `T8132FamilyVirtualMemoryMapDefines.h` maps three regions for this root complex:
 ECAM `0x1cb0000000`+256 MB, the 32-bit window `0xb80000000`+1 GB, and the
@@ -121,28 +137,71 @@ Both are pinned by `scripts/check-acpi.py`:
   prefetchable window is `0xbc0000000`–`0xbdfffffff`.
 - **`RES0`**: reserves the 256 MB ECAM, `0x1cb0000000`–`0x1cbfffffff`.
 
-The `_CRS` translation is **host - bus** (`+0xb00000000`), while
-`PcdPciMmio32Translation` is **bus - host** (`0xFFFFFFF500000000`). The host
-bridge library flips the sign when it builds the root-bridge descriptor; the
-checker pins both representations so a future edit cannot silently use the
-wrong direction.
+The `_CRS` translation and `PcdPciMmio32Translation` are **both host - bus**
+(`+0xb00000000`) — the ACPI descriptor and the PCD use the same value, and the
+host bridge library negates it on the way into the root-bridge descriptor. The
+checker pins the arithmetic in both directions so a future edit cannot silently
+flip it.
 
-Devices behind `PCI0` can enumerate, but the APCIE DARTs are still not
-programmed, so DMA will fault until the DART driver handles them.
+## Guest hand-off: what m1n1 now does (2026-10-27, patch 0003)
+
+Between the tables and a working device there is one entity: the guest's stage 2.
+An EL1 guest started by m1n1 can only touch IPAs that m1n1 has mapped, and a
+fault on an unmapped one is fatal — `hv_handle_dabort()` prints `HV: Unmapped
+IPA` and returns an unhandled exception. Before patch 0003 nothing mapped the
+controllers, so the first PCIe config read would have killed the guest; and
+nothing had touched the DARTs, so the first DMA would have faulted in the DART.
+
+`src/pcie_guest.c` (patch 0003) walks the ADT at `hv_init()` time and does three
+things:
+
+1. reports every APCIE controller it finds — path, ECAM base and size, `#ports`,
+   and the MSI parameters (`msi-address`, `msi-vector-offset`, MSI vector count)
+   — so the first hardware boot records the topology instead of requiring another
+   capture session;
+2. maps the ECAM and the two BAR windows into the guest's stage 2 (skipping
+   anything already mapped, and refusing addresses outside the guest's PA size);
+3. puts each APCIE DART into bypass: every stream enabled, every stream's TCR
+   written with `BYPASS_DART | BYPASS_DAPF`, the TLB flushed, and every stream
+   read back to prove it.
+
+Bypass is the right state because the guest runs with an identity stage 2
+(IPA == PA): a device DMA address is a physical address, and bypass makes the
+DART pass it through unchanged. The guest has no DART driver, so nothing else
+would arrange that. A DART that is locked or that ignores the write is reported
+and makes the hand-off return an error, rather than leaving a device that
+silently cannot DMA.
+
+The one thing the ADT does not describe is the host side of the BAR windows, so
+those are the captured values above, keyed by SoC; a SoC without an entry gets
+its ECAM mapped and a warning naming the missing values.
 
 ## What is still missing
 
-1. **DART enablement.** `dart-apcie0` (`0x90000000`) and `dart-apcie2`
-   (`0x92000000`) have to be mapped and either bypassed or programmed before
-   devices can DMA. `AppleDartIoMmuDxe` exists in the tree but has not run on
-   this machine.
+1. **MSI.** Devices behind `PCI0` can enumerate and DMA, but their MSI/MSI-X
+   messages have nowhere useful to land yet. Two mechanisms exist and neither is
+   wired to the guest:
+
+   - Apple's own doorbell: a device writes `msi-vector-offset + vector` to
+     `msi-address` (`0xfffff000` on this machine, offset 1506/`0x5e2`), the
+     controller turns that into an AIC interrupt, and m1n1's vGIC forwards AIC
+     interrupts to the guest one-for-one. This works from the hardware's point
+     of view today — it is only Windows that has no way to be told about it.
+   - A guest-visible GIC ITS. m1n1's vGIC maps an ITS window
+     (`0x5200000000` on a 40-bit guest) and `hv_vgic.c` handles `GITS_CTLR` and
+     `GITS_BASER*`, but the command queue is not decoded, so an OS that
+     discovers an ITS through IORT would program it into a black hole.
+
+   The shortest path to MSI for Windows is the first mechanism plus a small
+   kernel driver (or an ACPI-described mailbox, which no ACPI binding covers
+   yet); the second is a vITS project that has to trap the command queue by
+   mapping it read-only in stage 2.
 2. **The `apciec` root complexes.** Their ECAMs, bus ranges (0–128) and
    apertures need the same capture-then-wire treatment before Thunderbolt or
-   USB4 devices can appear. `PCI0` describes only `apcie@B0000000`.
-3. **MSI wiring.** In the vGIC build the guest's MSI path is the emulated GIC
-   ITS at `0x5200000000`, so Apple's `0xfffff000` doorbell is not used. It only
-   matters for a bare-metal `AIC_BUILD=TRUE` build, and then the doorbell range
-   must be mapped and programmed into the AIC.
+   USB4 devices can appear. `PCI0` describes only `apcie@B0000000`; the m1n1
+   hand-off reports all of them, so the next capture session can fill in the
+   rest. Their DARTs are already bypassed (`dart-apciec0`-`dart-apciec3`), so
+   DMA is not the blocker there — the tables are.
 
 ## Storage
 

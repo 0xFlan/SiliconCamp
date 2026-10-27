@@ -42,9 +42,13 @@ ARM64_HEADER = bytes.fromhex(
 )
 
 
-def run_checker(build_dir: str) -> subprocess.CompletedProcess:
+def run_checker(build_dir: str,
+                firmware_root: str | None = None) -> subprocess.CompletedProcess:
+    argv = [sys.executable, CHECKER, "--build-dir", build_dir]
+    if firmware_root is not None:
+        argv += ["--firmware-root", firmware_root]
     return subprocess.run(
-        [sys.executable, CHECKER, "--build-dir", build_dir],
+        argv,
         capture_output=True,
         text=True,
         check=False,
@@ -373,6 +377,112 @@ class TestCheckerRejects(FixtureCase):
         result = run_checker(self.build_dir)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("header image_size", result.stdout)
+
+
+PCD_FIXTURES = os.path.join(TESTS_DIR, "fixtures", "pcd")
+FW_ROOT = os.path.join(ROOT, "third_party", "ntasp-firmware")
+REAL_FAMILY_INC = os.path.join(FW_ROOT, "Silicon", "Apple", "T8132FamilyPkg",
+                               "T8132FamilyPkg.dsc.inc")
+
+
+def load_checker_module():
+    """Import scripts/check-acpi.py (its name is not a valid identifier)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("check_acpi", CHECKER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestPciePcds(FixtureCase):
+    """The PCIe windows are described twice, so both are checked.
+
+    The host bridge library builds its apertures from the PCDs and Windows
+    assigns BARs out of the DSDT _CRS.  A mismatch still enumerates, so it
+    survives every check that looks at one side only -- and then no device BAR
+    decodes.  These tests use tests/fixtures/pcd, which mirrors the firmware
+    tree's layout so the checker needs nothing beyond --firmware-root.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fw = os.path.join(self.tmp, "firmware")
+        shutil.copytree(PCD_FIXTURES, self.fw)
+        self.dsc = os.path.join(self.fw, "Silicon", "Apple", "T8132FamilyPkg",
+                                "T8132FamilyPkg.dsc.inc")
+
+    def edit_pcd(self, old: str, new: str) -> None:
+        with open(self.dsc, "r", encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn(old, text, f"fixture lost {old!r}")
+        with open(self.dsc, "w", encoding="utf-8") as f:
+            f.write(text.replace(old, new))
+
+    def test_matching_pcds_pass(self) -> None:
+        result = run_checker(self.build_dir, self.fw)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PCD: gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation "
+                      "= 0xb00000000 == 0xb00000000", result.stdout)
+
+    def test_translation_sign_is_enforced(self) -> None:
+        # The bug this check exists for: bus - host instead of host - bus.  It
+        # compiles, it boots, PCI enumeration works, and every BAR decodes
+        # nowhere, which is a very expensive way to find out.
+        self.edit_pcd("PcdPciMmio32Translation|0xB00000000",
+                      "PcdPciMmio32Translation|0xFFFFFFF500000000")
+        result = run_checker(self.build_dir, self.fw)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("PcdPciMmio32Translation", result.stdout)
+
+    def test_missing_pcd_fails(self) -> None:
+        self.edit_pcd(
+            "  gAppleSiliconPkgTokenSpaceGuid.PcdPciExpressBarLimit|0x1CBFFFFFFF\n", "")
+        result = run_checker(self.build_dir, self.fw)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("PcdPciExpressBarLimit is set", result.stdout)
+
+    def test_conflicting_sections_fail(self) -> None:
+        # In a DSC the later section silently wins, so two different values for
+        # the same window have to be an error rather than a coin toss.
+        with open(self.dsc, "a", encoding="utf-8") as f:
+            f.write("\n[PcdsFixedAtBuild.common]\n"
+                    "  gArmTokenSpaceGuid.PcdPciMmio32Size|0x80000000\n")
+        result = run_checker(self.build_dir, self.fw)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("different values", result.stdout)
+
+    def test_missing_firmware_tree_is_noted(self) -> None:
+        # CI's static job checks out no submodules; the check is skipped loudly
+        # rather than passing in silence.
+        result = run_checker(self.build_dir, os.path.join(self.tmp, "absent"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("skipping the PCIe PCD check", result.stdout)
+
+
+@unittest.skipUnless(os.path.isfile(REAL_FAMILY_INC),
+                     "ntasp-firmware submodule not checked out")
+class TestRealPciePcds(FixtureCase):
+    """The real Mac16_3 sources must satisfy the same contract."""
+
+    def test_submodule_pcds_pass(self) -> None:
+        result = run_checker(self.build_dir, FW_ROOT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PCD: gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation",
+                      result.stdout)
+
+    def test_fixture_matches_the_submodule(self) -> None:
+        # The fixture is a copy, so every PCD the tests above mutate has to
+        # still have the value the firmware really builds with.
+        module = load_checker_module()
+        fixture = module.read_pcds([os.path.join(
+            PCD_FIXTURES, "Silicon", "Apple", "T8132FamilyPkg",
+            "T8132FamilyPkg.dsc.inc")])
+        real = module.read_pcds([REAL_FAMILY_INC])
+        for name, values in fixture.items():
+            self.assertIn(name, real, f"fixture has {name}, the submodule does not")
+            self.assertEqual(sorted(set(values)), sorted(set(real[name])),
+                             f"fixture and submodule disagree about {name}")
 
 
 if __name__ == "__main__":

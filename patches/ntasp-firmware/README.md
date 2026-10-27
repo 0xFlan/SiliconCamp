@@ -10,6 +10,14 @@ vendored NTASP tree at the commit recorded by the top-level repository:
   `0x100E0000`.
 - `Silicon/Apple/T8132FamilyPkg` — T8132 PCDs, MADT, PPTT, memory map, PCIe
   ECAM bar size/limit, libraries.
+  The PCIe window PCDs carry the captured J624 values, and
+  `PcdPciMmio32Translation` is **host - bus** (`0xb00000000`), not bus - host:
+  `AppleSiliconPciHostBridgeLib` negates the PCD into the aperture's bus - host
+  translation, and the T602X platform uses the same convention. The first
+  revision of this patch had the sign the other way round, which builds and
+  enumerates but leaves every device BAR decoding nowhere; the derivation is in
+  the file's comment block and `scripts/check-acpi.py` now fails the build if the
+  PCD, the DSDT `_CRS` and the captured values disagree.
 - `Platform/MacBookProEarly2023Pkg/PlatformBuild.py` — drop `cibuild` from the
   reference platform so AArch64 builds do not require the unreachable NuGet
   feeds.
@@ -45,3 +53,11 @@ git -C third_party/ntasp-firmware reset -q -- Platform Silicon
 
 The `add -N` step is what makes Git include the new platform and SoC files;
 the `reset` only clears the intent-to-add index entries, not the worktree.
+
+`scripts/check-acpi.py` reads two of the files this patch adds
+(`Platform/Mac16_3Pkg/Mac16_3.dsc` and
+`Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc`) and checks their PCIe PCDs
+against the ACPI tables and the captured machine values, so regenerating the
+patch is also what keeps that check meaningful. `--firmware-root` points the
+checker at another tree; the test suite uses that to run the same checks against
+a fixture without the firmware submodule checked out.

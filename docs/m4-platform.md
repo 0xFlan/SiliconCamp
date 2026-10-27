@@ -103,13 +103,21 @@ from this machine:
 | ECAM | `0x1cb0000000`, 256 MB |
 | Bus range | 0–8 |
 | 32-bit window | bus `0x80000000` → host `0xb80000000`, 1 GB |
-| Host offset | `0xb00000000` (`PcdPciMmio32Translation` = `-0xb00000000`) |
+| Host offset | `0xb00000000` (`PcdPciMmio32Translation` = `0xb00000000` = host - bus) |
 | Prefetchable | `0xbc0000000`, 512 MB, no translation |
 
 The host bridge library wants the *bus* base plus the offset, while the page
 tables map the *host* addresses; `docs/pcie.md` shows the raw property cells and
 the arithmetic. The ECAM and both windows are mapped in
 `T8132FamilyVirtualMemoryMapDefines.h`.
+
+`PcdPciMmio32Translation` is `host - bus`, not `bus - host`: the library negates
+it into the descriptor's `bus - host` translation, and
+`PciHostBridgeDxe` then recovers host addresses with
+`TO_HOST_ADDRESS(dev, tra) = dev - tra`. The first revision of this package had
+the sign the other way round, which builds and enumerates and then decodes
+nothing; `scripts/check-acpi.py` now checks the sign against the DSDT `_CRS` and
+the captured machine values on every build.
 
 Only the first root complex (`apcie@B0000000`) is described. `apciec0`–`apciec3`
 are separate complexes with their own ECAMs (starting at `0x1c50000000`), bus
@@ -123,14 +131,18 @@ translated by `0xb00000000` to host `0xb80000000`, the prefetch window
 and `PcdPciExpressBarLimit` are now set for T8132 (`0x10000000` and
 `0x1CBFFFFFFF`) so the reservation cannot drift.
 
-The APCIE DARTs are still not programmed, so a device can enumerate but cannot
-DMA. What remains:
+The firmware's job ends at the tables, so the DARTs and the guest's stage 2 are
+handled on the m1n1 side: patch 0003's `pcie_guest.c` maps the ECAM and both BAR
+windows into the guest and puts every APCIE DART into bypass (all streams,
+verified by read-back), and prints the ADT's controller/MSI topology during
+bring-up. What remains:
 
-1. programming the APCIE DARTs (`0x90000000`, `0x92000000`) and validating DMA;
-2. describing the four `apciec` complexes (one host bridge each);
-3. validating BAR assignment and the guest MSI path on hardware. In the vGIC
-   build MSIs go through the emulated ITS at `0x5200000000`; Apple's
-   `0xfffff000` doorbell is only used by a bare-metal AIC build.
+1. MSI: the guest has no way to be told about Apple's `0xfffff000` doorbell yet,
+   and the vGIC's ITS window (`0x5200000000`) only decodes `GITS_CTLR` and
+   `GITS_BASER*`. See the MSI section of `docs/pcie.md`.
+2. Describing the four `apciec` complexes (one host bridge each): their ECAMs and
+   apertures still need capturing, and only `apcie@B0000000` has `PCI0` today.
+3. Validating BAR assignment, DMA and interrupts on hardware.
 
 ## AICv3
 
@@ -149,8 +161,10 @@ still required.
 ## Remaining unknowns
 
 - Whether the low 1 GB mapping is sufficient for every USB/DART path on J624.
-- The `apciec0`–`apciec3` apertures and DART programming; the `apcie` windows
-  themselves are captured and written down.
+- The `apciec0`–`apciec3` apertures. Their DARTs are bypassed by the m1n1
+  hand-off and the `apciec` windows themselves need capturing; the `apcie`
+  windows are captured and written down, and m1n1 now prints all of them at boot
+  so the next session can record the rest.
 - ANS2/SART storage protocol for the internal SSD.
 - DCP/display handoff beyond the iBoot framebuffer.
 - M4 SMC/SEP behavior under the m1n1 hypervisor.
