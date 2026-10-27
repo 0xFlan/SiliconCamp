@@ -1,15 +1,16 @@
 # m1n1-windows patches
 
-Three patches apply to the NTASP `m1n1_windows` commit pinned by this
-repository. They are cumulative (0002 assumes 0001, 0003 assumes both), so the
-order below is part of the contract, and `verify-patches.sh` applies them in it
-to a pristine worktree:
+Four patches apply to the NTASP `m1n1_windows` commit pinned by this
+repository. They are cumulative (0002 assumes 0001, 0003 assumes both, 0004
+assumes all three), so the order below is part of the contract, and
+`verify-patches.sh` applies the whole series, in order, to one pristine worktree:
 
 | Patch | Files | What it fixes |
 |---|---|---|
 | `0001-vgic-m4-topology.patch` | `src/hv_vgic.c`, `src/smp.c`, `src/smp.h` | Replaces the per-SoC vGIC window switch with one derived from the guest PA size, and takes the redistributor count from the ADT. Without this, `T8132` fell through to an unset window and a hard-coded 8 CPUs. |
 | `0002-psci-t8132.patch` | `src/hv_psci.c`, `src/hv_psci.h`, `src/hv_exc.c` | Adds the M4 power-domain tree (two clusters: six E-cores, four P-cores), the T8132 PMGR CPU-start offset, ADT bounds/count checks, per-CPU PSCI state, and Aff1:Aff0 MPIDR normalisation. Without the first part, `hv_psci_init()` had no `T8132` case and read an unset `topology_tree` pointer. |
 | `0003-pcie-guest-handoff.patch` | `src/pcie_guest.c`, `src/pcie_guest.h`, `src/guest_msi.c`, `src/guest_msi.h` (new), `src/dart.c`, `src/dart.h`, `src/hv.c`, `src/hv_exc.c`, `src/hv_vgic.c`, `src/hv_vgic.h`, `src/proxy.c`, `src/proxy.h`, `proxyclient/m1n1/proxy.py`, `Makefile`, `config.h` | Hands PCIe and MSI to a guest that has no APCIE driver: maps the controllers' ECAM and BAR windows into the guest's stage 2, puts every APCIE DART into bypass (all streams, verified by read-back), programs each port's MSI map and unmasks the AIC vectors it raises, and translates AIC interrupt numbers into the guest's INTID window. Replaces the unconditional `pcie_shutdown()` in `hv_init()`, which left a Windows guest with no root complex at all. |
+| `0004-vgic-guest-contract.patch` | `src/hv_vgic.c`, `src/hv_vgic.h`, `src/hv_exc.c`, `src/guest_msi.c`, `src/guest_msi.h` | Makes the emulated distributor and redistributors behave the way a GICv3 guest is entitled to assume: decode each redistributor frame from its address instead of the faulting CPU, complete `GICR_WAKER` wake sequences, never leave `RWP` set, stop advertising LPI capabilities nothing implements, and translate every guest INTID into an AIC number before masking it, unmasking it, or routing it. |
 
 ## Why 0002 is not optional on M4
 
@@ -116,6 +117,66 @@ instead of assumed, and a run that cannot bypass everything makes
 To keep the controllers instead for a guest that owns them, define
 `HV_QUIESCE_PCIE` in `config.h`; that restores the upstream `pcie_shutdown()`.
 
+## Why 0004 exists
+
+Patch 0003 taught the hypervisor to translate AIC interrupts into guest INTIDs.
+0004 is about the other half of that path: the register interface the guest uses
+to enable, route, wake, and acknowledge them.
+
+The reason this was not caught earlier is that the firmware is a very forgiving
+guest. EDK2's `ArmGicV3Dxe` (`Silicon/ARM/TIANO/ArmPkg/Drivers/ArmGicDxe/GicV3/ArmGicV3Dxe.c`)
+locates a redistributor by walking `GICR_TYPER` from the discovery base until it
+finds the executing PE's affinity, and it does that from the boot CPU. It never
+writes `GICR_WAKER` at all, and it never polls `RWP`. So a vGIC can satisfy the
+firmware while being unusable to an operating system:
+
+- **Redistributor frames were all the same frame.** `handle_vgic_redist_access()`
+  computed `relative_addr = addr - redist_base` and then
+  `cpu_num = ctx->cpu_id`. Any access through a frame other than the first
+  therefore decoded as an unknown register — CPU 1's `GICR_WAKER` arrives at
+  `0x20014`, not `0x14` — and returned a data abort. A homogeneous 8-core
+  emulation happened to hide it because the boot CPU's frame is frame 0. The
+  fix takes the frame index from the address (`frame_offset / GICR_FRAME_SIZE`),
+  bounds-checks it against `num_cpus`, and uses `frame_offset % GICR_FRAME_SIZE`
+  as the register offset.
+- **`GICR_WAKER` never finished waking.** The write was stored verbatim, so
+  `ChildrenAsleep` (bit 2, read-only) stayed exactly as the guest wrote it. The
+  documented wake sequence is: clear `ProcessorSleep`, then poll
+  `ChildrenAsleep == 0`. A read-modify-write preserves the bit, so a conforming
+  guest polls forever. The emulated redistributor has no separate power domain,
+  so the transition is now immediate, and the reset value is the architectural
+  `ProcessorSleep | ChildrenAsleep`.
+- **`RWP` was set and never cleared.** `GICD_CTLR.RWP` (bit 31) was set on a
+  group disable and on every `GICD_ICENABLER` write; `GICR_CTLR.RWP` was written
+  as bit 31, which is `UWP` — RES0 when `VLPIS` is 0 — instead of bit 3. `RWP`
+  exists so software can tell when a write has landed; with synchronous
+  emulation it is always already landed, so both now read 0.
+- **Capabilities advertised features with no implementation.**
+  `GICR_TYPER.PLPIS`, `DirectLPI` and `DPGS` were set while `GICR_SETLPIR` was a
+  no-op and `GICR_CTLR.DPG0/DPG1NS` were unimplemented, and
+  `GICD_TYPER.LPIS` was set with no ITS behind it. A guest that believes those
+  bits allocates an LPI configuration table and waits for an interrupt that
+  cannot arrive. MSIs reach this guest through the ACPI GIC MSI Frame (0003),
+  not through LPIs, so the bits are now 0 and the comments say why.
+- **Mask polarity was inverted and INTIDs were not translated.**
+  `GICD_ICENABLER` unmasked (`aic_set_mask(irq, false)`) while logging that it
+  was masking, so every interrupt the guest disabled stayed live. Both enable and
+  disable, `GICD_IROUTER`, and the LR-EOI path passed guest INTIDs straight to
+  the AIC, which means SPI 512 touched AIC 512 instead of the APCIE source at
+  1506. `guest_msi_aic_irq()` is the exact inverse of the existing
+  `guest_msi_intid()`, and every one of those paths now goes through it. INTIDs
+  below 32 are SGIs/PPIs with no AIC line and are skipped.
+- **`GICD_IROUTER` could compute `BIT(-1)`.** `smp_get_id()` returns `-1` for an
+  affinity that is not in the ADT, and the result was assigned to a `u32` before
+  being handed to `aic_set_affinity()`, which expands it as `BIT(cpu)`. The
+  variable is now signed and the call is guarded.
+
+None of this has run on hardware. What is machine-checked is that the series
+contains each fix and removes each defect: `scripts/check-vgic.py` asserts the
+contract against the patches (no submodule needed) and against patched sources,
+and `tests/test_check_vgic.py` mutates the series to prove each assertion fails
+when the defect is put back.
+
 ## The SMC trace
 
 `hv_handle_smc()` used to print the PSCI function ID on every guest SMC. That is
@@ -127,21 +188,50 @@ bring-up. It is now behind `DEBUG_PSCI_SMC` (off by default); define it in
 ## Apply and verify
 
 ```bash
-./scripts/apply-patches.sh          # all three patches, idempotent
-./scripts/verify-patches.sh         # applies each to a clean worktree of the pin
+./scripts/apply-patches.sh          # the whole series, idempotent
+./scripts/verify-patches.sh         # applies 0001-0004 in order to a clean worktree of the pin
+./scripts/check-vgic.py             # asserts the vGIC contract against the series
 ```
 
-To regenerate a patch after changing the tree:
+`verify-patches.sh` applies the series to *one* worktree rather than checking
+each patch against a pristine `HEAD`. That distinction matters: a later patch is
+written on top of its predecessors, so checking it against `HEAD` either fails
+for the wrong reason or, worse, passes because a hunk happened to match.
+
+## Regenerating a patch
+
+Every patch after 0001 is cumulative, so it has to be generated against the tree
+its predecessors produce, not against `HEAD`. The reliable procedure is to build
+that base as a commit in a throwaway worktree, copy the files the patch owns, and
+diff against the commit:
 
 ```bash
-git -C third_party/m1n1-windows diff src/hv_psci.c src/hv_psci.h src/hv_exc.c \
-    > patches/m1n1-windows/0002-psci-t8132.patch
+TMP=$(mktemp -d)
+git -C third_party/m1n1-windows worktree add --detach "$TMP/tree" HEAD
+for p in 0001-vgic-m4-topology 0002-psci-t8132 0003-pcie-guest-handoff; do
+    git -C "$TMP/tree" apply "$PWD/patches/m1n1-windows/$p.patch"
+done
+# make the base a commit, so the diff below contains only this patch
+git -C "$TMP/tree" add -A
+git -C "$TMP/tree" -c user.email=build@local -c user.name=build commit -qm base
 
-# 0003 is cumulative: generate it from HEAD + 0001 + 0002, not from HEAD.
-git -C third_party/m1n1-windows worktree add --detach /tmp/m1n1-base HEAD
-git -C /tmp/m1n1-base apply patches/m1n1-windows/000[12]-*.patch
-# copy the changed files from the working tree, then:
-git -C /tmp/m1n1-base diff > patches/m1n1-windows/0003-pcie-guest-handoff.patch
+# copy the files this patch owns out of the working tree, then:
+git -C "$TMP/tree" add -A
+git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0004-vgic-guest-contract.patch
 ```
 
-Then run `verify-patches.sh` and rebuild with `./scripts/build-m1n1.sh`.
+Skipping the base commit is the mistake that silently produces a 1000-line patch
+containing 0001-0003 as well. Verify the result by applying the whole series to
+a fresh worktree and confirming it reproduces the working tree:
+
+```bash
+diff -r --exclude=.git --exclude=build --exclude='*.o' \
+     third_party/m1n1-windows "$TMP/tree"
+```
+
+Then run `./scripts/verify-patches.sh`, `./scripts/check-vgic.py --tree
+third_party/m1n1-windows`, and rebuild with `./scripts/build-m1n1.sh`. As a
+reproducibility check, the series as committed builds
+`m1n1.macho` = `7559eb588df7…` and `m1n1.bin` = `355a19b2b5be…` (SHA-256), the
+same bytes as the working tree it was generated from.
+

@@ -70,6 +70,17 @@ The NTASP vGIC maps its emulated GIC at fixed guest-physical addresses:
 
 The UEFI MADT and the Windows ACPI expectations must match whichever window the hypervisor chooses. The original code selected the window from a per-chip `switch`; that switch had no `T8132` case and several missing `break`s. The patch in `patches/m1n1-windows/0001-vgic-m4-topology.patch` chooses the window from `vaddr_bits` and takes the redistributor count from the ADT CPU nodes.
 
+A redistributor is not one register block: each PE owns a 64 KiB `RD_base`
+frame followed by a 64 KiB `SGI_base` frame, so the stride is `0x20000` (it would
+be `0x40000` if `GICR_TYPER.VLPIS` were set). On the M4 the MADT therefore
+describes `0x5100000000 + 10 × 0x20000 = 0x140000` bytes. Which frame a trapped
+access belongs to is decided by the address, not by the CPU that took the fault:
+`0004-vgic-guest-contract.patch` computes `frame = (addr - redist_base) / 0x20000`
+and `relative_addr = (addr - redist_base) % 0x20000`, bounds-checks the frame
+against `num_cpus`, and indexes the per-CPU state with it. The original code used
+`ctx->cpu_id` as the index and the un-normalised offset as the register, so only
+the boot CPU's frame ever decoded correctly.
+
 PSCI has a second per-SoC table of its own: `hv_psci.c` encodes the E/P core
 split so it can build the power-domain tree. T8132 is 6E+4P, not the T602X 4E+4P,
 and had no case at all. `0002-psci-t8132.patch` adds the tree and the PMGR
@@ -111,14 +122,49 @@ An AIC interrupt number is not a GIC INTID, and the two do not line up:
 
 The MSI window exists because Apple's PCIe controllers do not use the GIC's ITS: a device writes an index to the controller's doorbell, the port maps it and the AIC raises `msi-vector-offset + index`. The firmware advertises SPIs 512-767 as a GIC MSI Frame at that doorbell (`docs/pcie.md`), the OS programs a device's MSI-X table with `data = INTID - 512`, and the hypervisor translates back. The two ends of that contract are checked by `scripts/check-acpi.py`.
 
+The translation has to work in both directions, and it needs the same map in
+both:
+
+| Direction | Function | Used by |
+|---|---|---|
+| AIC number → guest INTID | `guest_msi_intid()` | the EL2 IRQ path, before injecting into an LR |
+| guest INTID → AIC number | `guest_msi_aic_irq()` | `GICD_ISENABLER`/`ICENABLER`, `GICD_IROUTER`, and LR EOI |
+
+`0003` added the first direction; `0004` added the second. Before `0004`, every
+control-path call passed the guest INTID straight to `aic_set_mask()` or
+`aic_set_affinity()`, so a guest disabling SPI 512 masked AIC 512 — an unrelated
+peripheral — while the APCIE source at 1506 stayed unmasked. INTIDs below 32 are
+SGIs/PPIs, which belong to the CPU interface and have no AIC line; those calls
+are skipped rather than redirected.
+
+The register interface around the translation is a contract too, and `0004`
+makes it one a strict guest can drive:
+
+- the redistributor frame is selected by address (section 3);
+- `GICR_WAKER` completes the wake sequence, so `ChildrenAsleep` clears when the
+  guest clears `ProcessorSleep`;
+- `GICD_CTLR.RWP` and `GICR_CTLR.RWP` always read 0, because synchronous
+  emulation has nothing pending;
+- `GICR_TYPER`/`GICD_TYPER` advertise no LPI support, because there is no ITS
+  and Apple's hardware never writes `GITS_TRANSLATER`;
+- `GICD_ICENABLER` masks and `GICD_ISENABLER` unmasks.
+
+`scripts/check-vgic.py` asserts all of it, against the patch series and against
+patched sources; `docs/next-steps.md` explains why the firmware could not have
+caught any of it.
+
 The tricky parts are:
 
 - maintenance interrupts;
 - SError errata on pre-M3 SoCs;
-- affinity routing when the physical AIC cannot target a specific vCPU;
+- affinity routing when the physical AIC cannot target a specific vCPU
+  (`aic_set_affinity()` is a no-op on AICv3, so `GICD_IROUTER` writes are
+  currently accepted and ignored — a performance limitation, not a hang);
 - SPIs/PPIs that Windows expects to be edge- or level-triggered;
 - the ITS (mapped but unimplemented; a guest that discovers one through IORT would program a command queue nothing reads, so the firmware publishes no ITS and the MSI frame is used instead);
-- AIC interrupts with no guest INTID, which used to be injected verbatim and are now dropped (see the table above).
+- AIC interrupts with no guest INTID, which used to be injected verbatim and are now dropped (see the table above);
+- per-access logging, which is still compiled in (`ENABLE_VGIC_LOGGING`), and
+  turns a guest that programs ~1020 INTIDs into tens of thousands of UART writes.
 
 ## 5. The memory path
 
