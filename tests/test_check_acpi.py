@@ -391,7 +391,14 @@ def load_checker_module():
 
     spec = importlib.util.spec_from_file_location("check_acpi", CHECKER)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Register before executing: from 3.14 on, @dataclass looks the defining
+    # module up in sys.modules and fails on a module that was never added.
+    sys.modules["check_acpi"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules["check_acpi"]
+        raise
     return module
 
 
