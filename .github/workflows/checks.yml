@@ -87,19 +87,28 @@ jobs:
       - name: Install the bare-metal Rust target
         run: rustup target add aarch64-unknown-none-softfloat
 
-      - name: Make sure lld is present
-        run: command -v ld.lld || sudo apt-get install --yes lld
+      - name: Make sure lld and llvm-objcopy are present
+        run: |
+          command -v ld.lld || sudo apt-get install --yes lld
+          for candidate in llvm-objcopy llvm-objcopy-18 llvm-objcopy-17 \
+                           /usr/lib/llvm-18/bin/llvm-objcopy; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              echo "OBJCOPY=$candidate" >> "$GITHUB_ENV"
+              echo "using $candidate"
+              exit 0
+            fi
+          done
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends llvm
+          echo "OBJCOPY=llvm-objcopy" >> "$GITHUB_ENV"
 
       - name: Apply the m1n1-windows patches
         run: ./scripts/apply-patches.sh
 
       - name: Build the raw hypervisor image
         run: |
-          # GNU objcopy is multiarch and emits the same elf64-littleaarch64
-          # object the Makefile asks llvm-objcopy for; the runner does not
-          # install the LLVM binutils.
           make -C third_party/m1n1-windows -j"$(nproc)" \
-            USE_CLANG=1 ARCH=aarch64-linux-gnu OBJCOPY=objcopy \
+            USE_CLANG=1 ARCH=aarch64-linux-gnu OBJCOPY="${OBJCOPY:-llvm-objcopy}" \
             build/m1n1.bin
 
       # A build that produces no image is not a build.  The Mach-O form is
