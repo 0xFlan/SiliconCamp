@@ -1,0 +1,841 @@
+diff --git a/Makefile b/Makefile
+index e3ab4d15..75b57db6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -158,6 +158,7 @@ OBJECTS := \
+ 	nvme.o \
+ 	payload.o \
+ 	pcie.o \
++	pcie_guest.o \
+ 	pmgr.o \
+ 	proxy.o \
+ 	ringbuffer.o \
+diff --git a/config.h b/config.h
+index 182e5d77..e6220c56 100644
+--- a/config.h
++++ b/config.h
+@@ -26,6 +26,20 @@
+ // Enable SMMU abstraction layer to expose a fake SMMU to the guest which will redirect writes to the host IOMMU in a compatible manner
+ // #define ENABLE_SMMU
+ 
++//
++// PCIe hand-off policy, used by hv_init().
++//
++// Unset (the default) keeps the APCIE controllers in the state iBoot left them
++// in, maps their ECAM and BAR windows into the guest's stage 2 and puts their
++// DARTs into bypass, which is what a guest without an APCIE driver (Windows, or
++// the UEFI firmware that loads it) needs.  See src/pcie_guest.c.
++//
++// Define this to get upstream m1n1's behaviour instead: tear the controllers
++// down so that a guest which has its own APCIE driver (macOS) can bring them up
++// from a clean state.
++//
++// #define HV_QUIESCE_PCIE
++
+ //
+ // Enable the vGIC module.
+ //
+diff --git a/proxyclient/m1n1/proxy.py b/proxyclient/m1n1/proxy.py
+index 712990eb..dd1b388d 100644
+--- a/proxyclient/m1n1/proxy.py
++++ b/proxyclient/m1n1/proxy.py
+@@ -685,6 +685,7 @@ class M1N1Proxy(Reloadable):
+ 
+     P_PCIE_INIT = 0xe00
+     P_PCIE_SHUTDOWN = 0xe01
++    P_PCIE_GUEST_HANDOFF = 0xe02
+ 
+     P_NVME_INIT = 0xf00
+     P_NVME_SHUTDOWN = 0xf01
+@@ -1202,6 +1203,10 @@ class M1N1Proxy(Reloadable):
+         return self.request(self.P_PCIE_INIT)
+     def pcie_shutdown(self):
+         return self.request(self.P_PCIE_SHUTDOWN)
++    def pcie_guest_handoff(self, apply=True):
++        '''Report the ADT's APCIE controllers and DARTs, and when apply is set,
++        map their MMIO for the guest and bypass their DARTs.'''
++        return self.request(self.P_PCIE_GUEST_HANDOFF, 1 if apply else 0)
+ 
+     def nvme_init(self):
+         return self.request(self.P_NVME_INIT)
+diff --git a/src/dart.c b/src/dart.c
+index abb02011..e36d499e 100644
+--- a/src/dart.c
++++ b/src/dart.c
+@@ -84,6 +84,9 @@
+ #define DART_T8110_ENABLE_STREAMS  0xc00
+ #define DART_T8110_DISABLE_STREAMS 0xc20
+ 
++/* One 32-bit word of stream-enable bits per 32 SIDs: 256 streams on t8110. */
++#define DART_T8110_ENABLE_STREAMS_WORDS 8
++
+ #define DART_MAX_TTBR_COUNT 4
+ 
+ #define DART_TCR(dart) (dart->regs + dart->params->tcr_off + 4 * dart->device)
+@@ -107,6 +110,12 @@ struct dart_params {
+     int ttbr_count;
+ 
+     void (*tlb_invalidate)(dart_dev_t *dart);
++
++    /*
++     * Invalidate every stream's TLB, not just dart->device's.  See the
++     * whole-DART operations at the end of this file.
++     */
++    void (*tlb_invalidate_all)(dart_dev_t *dart);
+ };
+ 
+ struct dart_dev {
+@@ -133,6 +142,21 @@ static void dart_t8020_tlb_invalidate(dart_dev_t *dart)
+         printf("dart: DART_T8020_STREAM_COMMAND_BUSY did not clear.\n");
+ }
+ 
++/*
++ * The t8020 stream select register is a bitmask of the SIDs the STREAM_COMMAND
++ * applies to, so all 32 streams can be flushed in one go.
++ */
++static void dart_t8020_tlb_invalidate_all(dart_dev_t *dart)
++{
++    write32(dart->regs + DART_T8020_STREAM_SELECT, ~0U);
++
++    dma_wmb();
++    write32(dart->regs + DART_T8020_STREAM_COMMAND, DART_T8020_STREAM_COMMAND_INVALIDATE);
++
++    if (poll32(dart->regs + DART_T8020_STREAM_COMMAND, DART_T8020_STREAM_COMMAND_BUSY, 0, 100))
++        printf("dart: DART_T8020_STREAM_COMMAND_BUSY did not clear.\n");
++}
++
+ static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
+ {
+     /* ensure that the DART can see the updated pagetables before invalidating */
+@@ -145,6 +169,17 @@ static void dart_t8110_tlb_invalidate(dart_dev_t *dart)
+         printf("dart: DART_T8110_TLB_CMD_BUSY did not clear.\n");
+ }
+ 
++/* The t8110 command word has a dedicated flush-everything opcode. */
++static void dart_t8110_tlb_invalidate_all(dart_dev_t *dart)
++{
++    dma_wmb();
++    write32(dart->regs + DART_T8110_TLB_CMD,
++            FIELD_PREP(DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_OP_FLUSH_ALL));
++
++    if (poll32(dart->regs + DART_T8110_TLB_CMD_OP, DART_T8110_TLB_CMD_BUSY, 0, 100))
++        printf("dart: DART_T8110_TLB_CMD_BUSY did not clear.\n");
++}
++
+ const struct dart_params dart_t8020 = {
+     .sid_count = 32,
+     .pte_flags = FIELD_PREP(DART_PTE_SP_END, 0xfff) | FIELD_PREP(DART_PTE_SP_START, 0) |
+@@ -159,6 +194,7 @@ const struct dart_params dart_t8020 = {
+     .ttbr_off = DART_T8020_TTBR_OFF,
+     .ttbr_count = 4,
+     .tlb_invalidate = dart_t8020_tlb_invalidate,
++    .tlb_invalidate_all = dart_t8020_tlb_invalidate_all,
+ };
+ 
+ const struct dart_params dart_t6000 = {
+@@ -175,6 +211,7 @@ const struct dart_params dart_t6000 = {
+     .ttbr_off = DART_T8020_TTBR_OFF,
+     .ttbr_count = 4,
+     .tlb_invalidate = dart_t8020_tlb_invalidate,
++    .tlb_invalidate_all = dart_t8020_tlb_invalidate_all,
+ };
+ 
+ const struct dart_params dart_t8110 = {
+@@ -191,6 +228,7 @@ const struct dart_params dart_t8110 = {
+     .ttbr_off = DART_T8110_TTBR_OFF,
+     .ttbr_count = 1,
+     .tlb_invalidate = dart_t8110_tlb_invalidate,
++    .tlb_invalidate_all = dart_t8110_tlb_invalidate_all,
+ };
+ 
+ dart_dev_t *dart_init(uintptr_t base, u8 device, bool keep_pts, enum dart_type_t type)
+@@ -763,3 +801,177 @@ u64 dart_vm_base(dart_dev_t *dart)
+ {
+     return dart->vm_base;
+ }
++
++/*
++ * Whole-DART operations.
++ *
++ * Everything above works on a single stream because that is all m1n1 needs for
++ * the devices it drives itself.  A guest OS with no DART driver needs the
++ * opposite property: every stream of the DART has to end up in one state that
++ * the guest can rely on, and the caller has to be able to verify that state
++ * afterwards.
++ *
++ * The state that makes device DMA work without an IOMMU driver in the guest is
++ * bypass.  TCR.BYPASS_DART makes the DART pass device transactions through
++ * untranslated, so a device DMAs to the raw physical address its driver
++ * programmed -- exactly what a guest running with an identity stage 2 wants.
++ * TCR.BYPASS_DAPF does the same for the CPU's accesses to device registers.
++ *
++ * TCR is banked per stream (one word per SID at params->tcr_off), so a full
++ * hand-over walks every stream instead of the single SID m1n1 happens to know
++ * about, and it reads the result back per stream: a DART that is locked or that
++ * ignores writes is reported rather than assumed.
++ */
++
++struct dart_adt_info {
++    enum dart_type_t type;
++    const struct dart_params *params;
++    const char *type_s;
++    u64 base;
++    bool locked;
++};
++
++/*
++ * Resolve an ADT DART node to a register base and an IP version without
++ * allocating page tables or changing any register.
++ */
++static int dart_adt_info(const char *path, struct dart_adt_info *info)
++{
++    int offsets[8];
++    int node = adt_path_offset_trace(adt, path, offsets);
++
++    if (node < 0)
++        return -1;
++
++    if (adt_is_compatible(adt, node, "dart,t8020")) {
++        info->type = DART_T8020;
++        info->params = &dart_t8020;
++        info->type_s = "t8020";
++    } else if (adt_is_compatible(adt, node, "dart,t6000")) {
++        info->type = DART_T6000;
++        info->params = &dart_t6000;
++        info->type_s = "t6000";
++    } else if (adt_is_compatible(adt, node, "dart,t8110")) {
++        info->type = DART_T8110;
++        info->params = &dart_t8110;
++        info->type_s = "t8110";
++    } else {
++        /*
++         * A DART IP version this tree does not know about.  Do not guess at a
++         * register layout: print what the ADT called it so the version can be
++         * added from the machine that reports it.
++         */
++        const char *compat = adt_getprop(adt, node, "compatible", NULL);
++        printf("dart: %s has unknown compatible \"%s\"\n", path, compat ? compat : "(none)");
++        return -2;
++    }
++
++    if (adt_get_reg(adt, offsets, "reg", 0, &info->base, NULL)) {
++        printf("dart: %s has no reg[0]\n", path);
++        return -1;
++    }
++
++    /*
++     * A locked DART has had its translation registers frozen, in practice by
++     * the secure monitor, and writes to them are ignored.
++     */
++    if (info->type == DART_T8110)
++        info->locked =
++            (read32(info->base + DART_T8110_PROTECT) & DART_T8110_PROTECT_TTBR_TCR) != 0;
++    else
++        info->locked = (read32(info->base + DART_T8020_CONFIG) & DART_T8020_CONFIG_LOCK) != 0;
++
++    return 0;
++}
++
++int dart_report_adt(const char *path)
++{
++    struct dart_adt_info info;
++    int translating = 0, bypassed = 0, other = 0;
++
++    if (dart_adt_info(path, &info) < 0)
++        return -1;
++
++    u32 bypass = (u32)info.params->tcr_disabled;
++    u32 translate = (u32)info.params->tcr_enabled;
++
++    for (int sid = 0; sid < info.params->sid_count; sid++) {
++        u32 tcr = read32(info.base + info.params->tcr_off + 4 * sid);
++
++        if ((tcr & bypass) == bypass)
++            bypassed++;
++        else if (tcr & translate)
++            translating++;
++        else
++            other++;
++    }
++
++    printf("dart: %s at 0x%lx is a %s%s with %d streams: %d bypassed, %d translating, %d other\n",
++           path, info.base, info.type_s, info.locked ? " (locked)" : "", info.params->sid_count,
++           bypassed, translating, other);
++
++    return 0;
++}
++
++int dart_bypass_adt(const char *path)
++{
++    struct dart_adt_info info;
++    dart_dev_t dev;
++    int stuck = 0;
++
++    if (dart_adt_info(path, &info) < 0)
++        return -1;
++
++    if (info.locked) {
++        printf("dart: %s is locked, leaving its %d streams alone\n", path, info.params->sid_count);
++        return -1;
++    }
++
++    /* The flush helpers take a device, and only use its register base. */
++    memset(&dev, 0, sizeof(dev));
++    dev.regs = info.base;
++    dev.device = 0;
++    dev.type = info.type;
++    dev.params = info.params;
++
++    /*
++     * Enable every stream.  An SID that is not enabled is not routed through
++     * this DART's translation logic at all, and which state it is in then is not
++     * something a guest can reason about.  All streams enabled and bypassed is a
++     * state that fits in one line.
++     */
++    if (info.type == DART_T8110) {
++        for (int word = 0; word < DART_T8110_ENABLE_STREAMS_WORDS; word++)
++            write32(info.base + DART_T8110_ENABLE_STREAMS + 4 * word, ~0U);
++    } else {
++        write32(info.base + DART_T8020_ENABLED_STREAMS, ~0U);
++    }
++
++    u32 bypass = (u32)info.params->tcr_disabled;
++
++    for (int sid = 0; sid < info.params->sid_count; sid++)
++        write32(info.base + info.params->tcr_off + 4 * sid, bypass);
++
++    /* Streams may already hold translated entries in the TLB. */
++    info.params->tlb_invalidate_all(&dev);
++
++    for (int sid = 0; sid < info.params->sid_count; sid++) {
++        u32 tcr = read32(info.base + info.params->tcr_off + 4 * sid);
++
++        if ((tcr & bypass) != bypass) {
++            if (!stuck)
++                printf("dart: %s stream %d still reads tcr=%#x\n", path, sid, tcr);
++            stuck++;
++        }
++    }
++
++    if (stuck) {
++        printf("dart: %s: %d of %d streams did not take bypass\n", path, stuck,
++               info.params->sid_count);
++        return -1;
++    }
++
++    printf("dart: %s: all %d streams bypassed\n", path, info.params->sid_count);
++
++    return 0;
++}
+diff --git a/src/dart.h b/src/dart.h
+index cc91f142..7eee590e 100644
+--- a/src/dart.h
++++ b/src/dart.h
+@@ -32,4 +32,16 @@ u64 dart_find_iova(dart_dev_t *dart, s64 start, size_t len);
+ void dart_shutdown(dart_dev_t *dart);
+ u64 dart_vm_base(dart_dev_t *dart);
+ 
++/*
++ * Whole-DART operations.
++ *
++ * Everything above works on one stream, because m1n1 drives those devices
++ * itself and only cares about the SID it mapped.  Handing a DART to a guest OS
++ * that has no DART driver needs the opposite property: every stream has to end
++ * up in a state the guest can rely on, and the caller has to be able to check
++ * that afterwards.  These two do that, and they never touch the ADT.
++ */
++int dart_report_adt(const char *path);
++int dart_bypass_adt(const char *path);
++
+ #endif
+diff --git a/src/hv.c b/src/hv.c
+index 77d5dbbf..783d04b2 100644
+--- a/src/hv.c
++++ b/src/hv.c
+@@ -7,6 +7,7 @@
+ #include "gxf.h"
+ #include "memory.h"
+ #include "pcie.h"
++#include "pcie_guest.h"
+ #include "smp.h"
+ #include "string.h"
+ #include "usb.h"
+@@ -57,7 +58,6 @@ static struct hv_secondary_info_t hv_secondary_info;
+ 
+ void hv_init(void)
+ {
+-    pcie_shutdown();
+     // Make sure we wake up DCP if we put it to sleep, just quiesce it to match ADT
+     if (display_is_external && display_start_dcp() >= 0)
+         display_shutdown(DCP_QUIESCED);
+@@ -69,6 +69,34 @@ void hv_init(void)
+ 
+     hv_pt_init();
+ 
++    /*
++     * PCIe hand-off for the guest.
++     *
++     * Upstream m1n1 calls pcie_shutdown() at the top of hv_init(), because the
++     * guest it was written for (macOS) has its own APCIE driver and wants a
++     * quiesced controller to bring up itself.  Our guest is Windows, whose PCIe
++     * support stops at the root complex: neither Windows nor the UEFI firmware
++     * that loads it contains an APCIE driver, so a quiesced controller would
++     * leave the guest with no PCIe at all -- no internal SSD, no WLAN, no USB4.
++     *
++     * Instead m1n1 does the two things the guest's generic stack assumes have
++     * already been done: the controllers' MMIO (their ECAM and the host windows
++     * BARs are assigned from) is mapped into the guest's stage 2, and their
++     * DARTs are put into bypass so device DMA reaches memory at the addresses
++     * the guest programs.  Both steps report what they found, so this is also
++     * the record of the machine's PCIe topology.
++     *
++     * This has to run after hv_pt_init(), which creates the stage 2 tables, and
++     * before hv_start(), which enters the guest.  Define HV_QUIESCE_PCIE in
++     * config.h to get the upstream behaviour back for a guest that owns the
++     * controller itself.
++     */
++#ifdef HV_QUIESCE_PCIE
++    pcie_shutdown();
++#else
++    pcie_guest_prepare();
++#endif
++
+     // Configure hypervisor defaults
+ 
+     //
+diff --git a/src/pcie_guest.c b/src/pcie_guest.c
+new file mode 100644
+index 00000000..376abdc7
+--- /dev/null
++++ b/src/pcie_guest.c
+@@ -0,0 +1,371 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "adt.h"
++#include "dart.h"
++#include "hv.h"
++#include "pcie_guest.h"
++#include "soc.h"
++#include "string.h"
++#include "types.h"
++#include "utils.h"
++
++/*
++ * PCIe hand-off to a guest OS that has no APCIE, DART or SART driver.
++ *
++ * m1n1's usual answer for PCIe is pcie_shutdown(): m1n1 uses the controllers
++ * itself and then quiesces them so that the guest's own APCIE driver can bring
++ * them up from a clean state.  That works for macOS (and for Linux, which
++ * drives the controller the same way), and it is exactly wrong for Windows:
++ * neither Windows nor the UEFI firmware that loads it contains a single line of
++ * code that touches an APCIE register.  For those guests m1n1 has to leave the
++ * controllers in the state iBoot left them in and do the two things that the
++ * guest's PCIe stack assumes have already happened:
++ *
++ *  1. The guest's stage 2 has to contain the controller's MMIO.  A guest access
++ *     to an unmapped IPA is fatal (hv_handle_dabort() prints "HV: Unmapped IPA"
++ *     and returns an unhandled exception), so the ECAM -- which the guest's PCI
++ *     bus driver polls from the first line of PCI enumeration -- and the host
++ *     windows that device BARs are assigned from both have to be mapped before
++ *     the guest starts.
++ *
++ *  2. The controller's DARTs have to let device DMA through.  The guest runs
++ *     with an identity stage 2 (IPA == PA), so the state that matches it is
++ *     bypass: the device DMAs to the raw physical address its driver
++ *     programmed.  See dart_bypass_adt().
++ *
++ * Everything here is read-only towards the ADT, and the report it prints is the
++ * only place where the captured constants this repository's firmware and ACPI
++ * tables are built from (docs/pcie.md) meet the machine that is actually
++ * running.  Every value it prints is prefixed with "pcie:" so a bring-up log
++ * can be read with grep.
++ */
++
++extern uint64_t vaddr_bits;
++
++/* Deep enough for /arm-io/apciec0/dart-apciec0; the ADT is shallower than this. */
++#define PCIE_ADT_MAX_DEPTH 6
++#define PCIE_PATH_LEN      128
++
++/*
++ * Guest BAR windows.
++ *
++ * The ADT describes the controllers themselves (ECAM, PHY and port registers),
++ * but not the host side of their outbound windows -- and that is the space a
++ * device BAR is assigned from and the space the guest has to be able to reach.
++ * The values below are the captured J624 (Mac16,3) windows that this
++ * repository's platform PCDs and ACPI tables are built from (docs/pcie.md,
++ * docs/hardware-values.md).  They are host addresses, which is what the guest
++ * uses for both config space and BARs.
++ *
++ * A SoC without an entry gets its ECAM mapped and a warning: the windows cannot
++ * be guessed, and mapping the wrong ones would only move the failure.
++ */
++struct pcie_window {
++    u32 chip;
++    u64 base;
++    u64 size;
++    const char *name;
++};
++
++static const struct pcie_window pcie_windows[] = {
++    {T8132, 0xB80000000ULL, 0x40000000ULL, "32-bit non-prefetchable window"},
++    {T8132, 0xBC0000000ULL, 0x20000000ULL, "prefetchable window"},
++};
++
++struct pcie_state {
++    bool apply;
++    int controllers;
++    int darts;
++    int bypassed;
++    int mapped;
++};
++
++/*
++ * The ADT stores `compatible` as a list of NUL-terminated strings and a node
++ * commonly carries several.  Matching a prefix covers every APCIE generation
++ * with one rule: "apcie,t8103", "apcie,t6020", "apcie-ge,t6020" and
++ * "apcie,t8132" all start with "apcie".
++ */
++static bool compatible_has_prefix(int node, const char *prefix)
++{
++    u32 len = 0;
++    const char *list = adt_getprop(adt, node, "compatible", &len);
++
++    if (!list)
++        return false;
++
++    size_t prefix_len = strlen(prefix);
++
++    for (u32 offset = 0; offset < len;) {
++        const char *entry = list + offset;
++        size_t entry_len = strlen(entry);
++
++        if (entry_len >= prefix_len && !strncmp(entry, prefix, prefix_len))
++            return true;
++
++        offset += entry_len + 1;
++    }
++
++    return false;
++}
++
++/*
++ * A property that may or may not be a 64-bit value: the ADT is all 32-bit cells,
++ * but addresses are written as two cells on some SoCs and one on others, so
++ * accept both instead of guessing per property.
++ */
++static bool prop_u64(int node, const char *name, u64 *out)
++{
++    u32 len = 0;
++    const void *prop = adt_getprop(adt, node, name, &len);
++
++    if (!prop)
++        return false;
++
++    if (len == sizeof(u32)) {
++        u32 val;
++        memcpy(&val, prop, sizeof(val));
++        *out = val;
++        return true;
++    }
++
++    if (len == sizeof(u64)) {
++        memcpy(out, prop, sizeof(*out));
++        return true;
++    }
++
++    return false;
++}
++
++static bool prop_u64_any(int node, const char *const *names, u64 *out)
++{
++    for (int i = 0; names[i]; i++)
++        if (prop_u64(node, names[i], out))
++            return true;
++
++    return false;
++}
++
++/*
++ * Map one host region into the guest's stage 2 unless it is mapped already.
++ * Returns 1 when this call created the mapping, 0 when it was already there and
++ * -1 when it could not be mapped at all.
++ */
++static int map_guest_region(u64 base, u64 size, const char *what)
++{
++    size = ALIGN_DOWN(size, SZ_16K);
++
++    if (!base || !size)
++        return -1;
++
++    if (base + size > (1ULL << vaddr_bits)) {
++        printf("pcie: %s at 0x%lx+0x%lx does not fit the guest's %lu-bit address space\n", what,
++               base, size, vaddr_bits);
++        return -1;
++    }
++
++    if (hv_pt_walk(base)) {
++        printf("pcie: %s at 0x%lx+0x%lx is already mapped in the guest\n", what, base, size);
++        return 0;
++    }
++
++    if (hv_map_hw(base, base, size)) {
++        printf("pcie: failed to map %s at 0x%lx+0x%lx in the guest\n", what, base, size);
++        return -1;
++    }
++
++    printf("pcie: mapped %s for the guest: 0x%lx+0x%lx\n", what, base, size);
++
++    return 1;
++}
++
++static int pcie_controller_cb(int node, const char *path, void *arg)
++{
++    static const char *const msi_address_props[] = {"msi-address", NULL};
++    static const char *const msi_vector_count_props[] = {"msi-vectors", "#msi-vectors", NULL};
++    struct pcie_state *state = arg;
++    int offsets[8];
++    u64 ecam, ecam_size, val;
++    u32 ports;
++
++    if (!compatible_has_prefix(node, "apcie"))
++        return 0;
++
++    state->controllers++;
++
++    if (adt_path_offset_trace(adt, path, offsets) < 0) {
++        printf("pcie: cannot trace %s\n", path);
++        return 0;
++    }
++
++    if (adt_get_reg(adt, offsets, "reg", 0, &ecam, &ecam_size)) {
++        printf("pcie: %s has no ECAM (reg[0])\n", path);
++        return 0;
++    }
++
++    printf("pcie: controller %s: ECAM 0x%lx+0x%lx\n", path, ecam, ecam_size);
++
++    if (ADT_GETPROP(adt, node, "#ports", &ports) >= 0)
++        printf("pcie: controller %s: %d port(s)\n", path, ports);
++
++    /*
++     * MSI.  A device writes (msi-address, msi-vector-offset + vector) into its
++     * MSI or MSI-X capability, the controller turns that into an AIC interrupt
++     * and the vGIC passes it on to the guest.  Those two numbers are what an
++     * MSI-capable guest OS needs, and nothing else in the system publishes
++     * them, so they belong in the boot log next to the ECAM.
++     */
++    if (prop_u64_any(node, msi_address_props, &val))
++        printf("pcie: controller %s: msi-address 0x%lx\n", path, val);
++
++    if (prop_u64(node, "msi-vector-offset", &val))
++        printf("pcie: controller %s: msi-vector-offset 0x%lx\n", path, val);
++
++    if (prop_u64_any(node, msi_vector_count_props, &val))
++        printf("pcie: controller %s: %lu MSI vector(s)\n", path, val);
++
++    if (state->apply && map_guest_region(ecam, ecam_size, "APCIE ECAM") > 0)
++        state->mapped++;
++
++    return 0;
++}
++
++static int pcie_dart_cb(int node, const char *path, void *arg)
++{
++    struct pcie_state *state = arg;
++
++    if (!compatible_has_prefix(node, "dart,"))
++        return 0;
++
++    /*
++     * Only the controllers' own DARTs.  The display, ISP, AOP and USB DARTs
++     * belong to m1n1 or to the firmware, and bypassing those would take their
++     * translation away from the code that is using them.  Newer SoCs name the
++     * controllers apciec0-3 and their DARTs dart-apciecN; earlier ones use
++     * apcie and dart-apcieN.  Either way the DART's path contains "apcie".
++     */
++    if (!strstr(path, "apcie"))
++        return 0;
++
++    state->darts++;
++
++    if (!state->apply) {
++        dart_report_adt(path);
++        return 0;
++    }
++
++    if (!dart_bypass_adt(path))
++        state->bypassed++;
++
++    return 0;
++}
++
++static void pcie_map_windows(struct pcie_state *state)
++{
++    int found = 0;
++
++    for (size_t i = 0; i < ARRAY_SIZE(pcie_windows); i++) {
++        const struct pcie_window *win = &pcie_windows[i];
++
++        if (win->chip != chip_id)
++            continue;
++
++        found++;
++
++        if (map_guest_region(win->base, win->size, win->name) > 0)
++            state->mapped++;
++    }
++
++    if (!found)
++        printf("pcie: no captured host window for chip 0x%x; only the ECAMs are mapped.\n"
++               "      Add the windows from this machine's device tree to pcie_windows[] "
++               "before devices can be reached.\n",
++               chip_id);
++}
++
++/*
++ * Walk the ADT, calling `cb` for every node, and hand it the node's absolute
++ * path.  The path is built in place: the ADT has no back pointers, and the
++ * property helpers below take a path rather than an offset, so this keeps the
++ * two views of the same node consistent.
++ */
++typedef int (*pcie_walk_cb)(int node, const char *path, void *arg);
++
++static int pcie_walk(int node, char *path, size_t path_len, size_t depth, pcie_walk_cb cb,
++                     void *arg)
++{
++    int ret = cb(node, path, arg);
++
++    if (ret || depth >= PCIE_ADT_MAX_DEPTH)
++        return ret;
++
++    ADT_FOREACH_CHILD(adt, node)
++    {
++        const char *name = adt_get_name(adt, node);
++        size_t used = strlen(path);
++        size_t name_len;
++
++        if (!name)
++            continue;
++
++        name_len = strlen(name);
++
++        if (used + name_len + 2 > path_len)
++            continue;
++
++        path[used] = '/';
++        memcpy(path + used + 1, name, name_len + 1);
++
++        ret = pcie_walk(node, path, path_len, depth + 1, cb, arg);
++
++        /* Restore the parent path for the next sibling. */
++        path[used] = 0;
++
++        if (ret)
++            return ret;
++    }
++
++    return 0;
++}
++
++int pcie_guest_handoff(bool apply)
++{
++    struct pcie_state state = {.apply = apply};
++    char path[PCIE_PATH_LEN] = "";
++    int root = adt_path_offset(adt, "/");
++
++    if (root < 0) {
++        printf("pcie: no ADT, nothing to hand off\n");
++        return -1;
++    }
++
++    printf("pcie: %s the ADT for APCIE controllers and DARTs\n",
++           apply ? "preparing a guest hand-off from" : "reporting");
++
++    pcie_walk(root, path, sizeof(path), 0, pcie_controller_cb, &state);
++    pcie_walk(root, path, sizeof(path), 0, pcie_dart_cb, &state);
++
++    if (apply)
++        pcie_map_windows(&state);
++
++    printf("pcie: %d controller(s), %d mapped region(s), %d DART(s), %d bypassed\n",
++           state.controllers, state.mapped, state.darts, state.bypassed);
++
++    if (!state.controllers) {
++        printf("pcie: no APCIE controller in the ADT; the guest will not see PCIe\n");
++        return -1;
++    }
++
++    if (apply && state.darts != state.bypassed) {
++        printf("pcie: %d of %d APCIE DART(s) are not bypassed; device DMA will not work\n",
++               state.darts - state.bypassed, state.darts);
++        return -2;
++    }
++
++    return 0;
++}
++
++int pcie_guest_prepare(void)
++{
++    return pcie_guest_handoff(true);
++}
+diff --git a/src/pcie_guest.h b/src/pcie_guest.h
+new file mode 100644
+index 00000000..c52f4489
+--- /dev/null
++++ b/src/pcie_guest.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: MIT */
++
++#ifndef PCIE_GUEST_H
++#define PCIE_GUEST_H
++
++#include "types.h"
++
++/*
++ * PCIe hand-off for a guest OS that has no APCIE, DART or SART driver.
++ *
++ * `pcie_guest_handoff(false)` only inspects the ADT and the hardware and prints
++ * what it found; `pcie_guest_handoff(true)`, which is what hv_init() calls, also
++ * maps the controllers' MMIO into the guest's stage 2 and puts their DARTs into
++ * bypass.  See src/pcie_guest.c for why each of those is necessary.
++ */
++int pcie_guest_handoff(bool apply);
++int pcie_guest_prepare(void);
++
++#endif
+diff --git a/src/proxy.c b/src/proxy.c
+index 182af104..1215606b 100644
+--- a/src/proxy.c
++++ b/src/proxy.c
+@@ -17,6 +17,7 @@
+ #include "memory.h"
+ #include "nvme.h"
+ #include "pcie.h"
++#include "pcie_guest.h"
+ #include "pmgr.h"
+ #include "smp.h"
+ #include "string.h"
+@@ -612,6 +613,9 @@ int proxy_process(ProxyRequest *request, ProxyReply *reply)
+         case P_PCIE_SHUTDOWN:
+             pcie_shutdown();
+             break;
++        case P_PCIE_GUEST_HANDOFF:
++            reply->retval = pcie_guest_handoff(request->args[0] != 0);
++            break;
+ 
+         case P_NVME_INIT:
+             reply->retval = nvme_init();
+diff --git a/src/proxy.h b/src/proxy.h
+index e7064b2d..4566440c 100644
+--- a/src/proxy.h
++++ b/src/proxy.h
+@@ -167,6 +167,7 @@ typedef enum {
+ 
+     P_PCIE_INIT = 0xe00,
+     P_PCIE_SHUTDOWN,
++    P_PCIE_GUEST_HANDOFF,
+ 
+     P_NVME_INIT = 0xf00,
+     P_NVME_SHUTDOWN,

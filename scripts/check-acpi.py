@@ -6,6 +6,10 @@ count and MPIDRs, the efficiency classes, the vGIC window, the UART address and
 IRQ, and the firmware device size.  Compiling does not check any of that, so this
 script parses the tables the build emits and asserts the platform's contract.
 
+The same windows are described twice -- once in the ACPI tables and once in the
+platform's PCIe PCDs -- so the platform configuration is parsed as well and the
+two descriptions are checked against each other.
+
 Expectations live in the PLATFORMS table below, one entry per platform package
 that has been validated.  There is deliberately no "close enough" path: an
 unvalidated platform is an error, not a pass, because a checker that guesses is
@@ -30,6 +34,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 import struct
 import sys
 from dataclasses import dataclass
@@ -61,6 +66,10 @@ class Platform:
     pcie_mmio32_size: int = 0
     pcie_prefetch: int = 0
     pcie_prefetch_size: int = 0
+    #: Firmware sources, relative to the firmware submodule root, that set the
+    #: PCIe PCDs.  The same windows appear in the ACPI tables; both are checked
+    #: against the captured values so they cannot drift apart.
+    pcd_sources: tuple[str, ...] = ()
 
 
 # Sources for every value are recorded in docs/hardware-values.md.
@@ -88,6 +97,10 @@ PLATFORMS: dict[str, Platform] = {
         pcie_mmio32_size=0x40000000,
         pcie_prefetch=0xBC0000000,
         pcie_prefetch_size=0x20000000,
+        pcd_sources=(
+            "Platform/Mac16_3Pkg/Mac16_3.dsc",
+            "Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc",
+        ),
     ),
 }
 
@@ -435,6 +448,87 @@ def acpi_header(data: bytes, name: str, ck: Checker) -> bool:
     ck.note(f"{name}: rev {revision}, OEM {oem_id}/{oem_table}, "
             f"oem rev 0x{oem_rev:x}")
     return True
+
+
+PCD_RE = re.compile(
+    r"^\s*([A-Za-z0-9_.]+\.Pcd[A-Za-z0-9_]+)\s*\|\s*(0[xX][0-9A-Fa-f]+)\s*$")
+
+
+def read_pcds(paths: list[str]) -> dict[str, list[int]]:
+    """Map every PCD name in the given DSC files to the values set for it."""
+    pcds: dict[str, list[int]] = {}
+    for path in paths:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # Inline comments are common in the family includes.
+                match = PCD_RE.match(line.split("#", 1)[0])
+                if match:
+                    pcds.setdefault(match.group(1), []).append(int(match.group(2), 16))
+    return pcds
+
+
+def check_pcie_pcds(root: str, plat: Platform, ck: Checker) -> None:
+    """Cross-check the platform's PCIe PCDs against the captured windows.
+
+    The tables and the PCDs describe the same two windows from opposite ends:
+    the host bridge library builds its apertures from the PCDs, and the guest's
+    PCI bus driver assigns BARs out of the DSDT _CRS.  When they disagree, PCI
+    configuration space still enumerates, so the mistake survives any check that
+    looks at only one of them -- and then no device BAR decodes.
+
+    The sign of PcdPciMmio32Translation is the specific trap: the PCD carries
+    host - bus, AppleSiliconPciHostBridgeLib negates it into the aperture's
+    bus - host translation, and both signs build and boot.  See the derivation
+    in T8132FamilyPkg.dsc.inc.
+    """
+    if not plat.pcd_sources:
+        ck.note("PCD: this platform has no PCD sources recorded, nothing to check")
+        return
+
+    paths = [os.path.join(root, rel) for rel in plat.pcd_sources]
+    missing = [rel for rel, path in zip(plat.pcd_sources, paths)
+               if not os.path.isfile(path)]
+    if missing:
+        # Only possible when the firmware submodule is not checked out; the
+        # parser and the arithmetic are covered by tests/test_check_acpi.py.
+        ck.note(f"PCD: {', '.join(missing)} not found, skipping the PCIe PCD check")
+        return
+
+    pcds = read_pcds(paths)
+
+    def pcd(name: str) -> int | None:
+        values = pcds.get(name)
+        if not values:
+            ck.check(False, f"PCD: {name} is set for this platform")
+            return None
+        if len(set(values)) != 1:
+            ck.check(False, f"PCD: {name} has {len(set(values))} different values "
+                            f"({', '.join(hex(v) for v in sorted(set(values)))}); "
+                            f"the later DSC section wins")
+            return None
+        return values[0]
+
+    def want(name: str, value: int, why: str = "") -> None:
+        got = pcd(name)
+        if got is None:
+            return
+        note = f" ({why})" if why else ""
+        ck.check(got == value, f"PCD: {name} = 0x{got:x} == 0x{value:x}{note}")
+
+    want("gArmTokenSpaceGuid.PcdPciBusMin", plat.pcie_bus_min)
+    want("gArmTokenSpaceGuid.PcdPciBusMax", plat.pcie_bus_max)
+    want("gArmTokenSpaceGuid.PcdPciMmio32Base", plat.pcie_mmio32_bus, "bus address")
+    want("gArmTokenSpaceGuid.PcdPciMmio32Size", plat.pcie_mmio32_size)
+    want("gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation",
+         plat.pcie_mmio32_host - plat.pcie_mmio32_bus,
+         "host - bus; the host bridge library negates it")
+    want("gArmTokenSpaceGuid.PcdPciMmio64Base", plat.pcie_prefetch)
+    want("gArmTokenSpaceGuid.PcdPciMmio64Size", plat.pcie_prefetch_size)
+    want("gEfiMdePkgTokenSpaceGuid.PcdPciMmio64Translation", 0)
+    want("gEfiMdePkgTokenSpaceGuid.PcdPciExpressBaseAddress", plat.pcie_ecam)
+    want("gAppleSiliconPkgTokenSpaceGuid.PcdPciExpressBarSize", plat.pcie_ecam_size)
+    want("gAppleSiliconPkgTokenSpaceGuid.PcdPciExpressBarLimit",
+         plat.pcie_ecam + plat.pcie_ecam_size - 1)
 
 
 def find_tables(build_dir: str) -> dict[str, str]:
@@ -831,12 +925,17 @@ def print_topology(build_dir: str, tables: dict[str, str]) -> int:
     return 0
 
 
+def firmware_root() -> str:
+    """The firmware submodule, or the tree NTASP_ROOT points at."""
+    return os.environ.get("NTASP_ROOT") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "third_party", "ntasp-firmware")
+
+
 def resolve_build_dir(platform: str, build_dir: str | None) -> str:
     if build_dir:
         return build_dir
-    root = os.environ.get("NTASP_ROOT") or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "third_party", "ntasp-firmware")
+    root = firmware_root()
     pattern = os.path.join(root, "Build", f"{platform}-AARCH64", "*", "AARCH64")
     found = sorted(glob.glob(pattern), key=os.path.getmtime)
     if not found:
@@ -851,6 +950,9 @@ def main() -> int:
     parser.add_argument("--build-dir", default=None,
                         help="the AARCH64 build output directory, e.g. "
                              "Build/<platform>-AARCH64/<tag>/AARCH64")
+    parser.add_argument("--firmware-root", default=None,
+                        help="the firmware tree the PCIe PCDs are read from "
+                             "(default: the third_party/ntasp-firmware submodule)")
     parser.add_argument("--print-topology", action="store_true",
                         help="print a PLATFORMS entry for the build tree")
     parser.add_argument("--unvalidated-ok", action="store_true",
@@ -912,6 +1014,10 @@ def main() -> int:
         elif sig == "GTDT":
             check_gtdt(data, ck)
         print()
+
+    print("platform configuration")
+    check_pcie_pcds(args.firmware_root or firmware_root(), plat, ck)
+    print()
 
     print("image")
     check_image(build_dir, ck, plat)

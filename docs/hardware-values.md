@@ -96,7 +96,7 @@ node's ECAM as:
 | APCIE ECAM | `0x1cb0000000`, 256 MB |
 | `apcie` bus range | 0–8 |
 | PCIe 32-bit window | bus `0x80000000` → host `0xb80000000`, 1 GB |
-| PCIe host offset | `0xb00000000` (`PcdPciMmio32Translation` = `-0xb00000000`) |
+| PCIe host offset | `0xb00000000` (`PcdPciMmio32Translation` = `0xb00000000` = host − bus, same value as the DSDT `_TRA`) |
 | PCIe prefetch window | `0xbc0000000` → `0xbc0000000`, 512 MB |
 | PCIe MSI doorbell | `0xfffff000`, vector offset 1506 |
 | ANS mailbox | `0x81600000` |
@@ -117,10 +117,11 @@ page tables map the host addresses (`0xb80000000`+1 GB).
 The DSDT now carries `PCI0` and the MCFG table: `_CRS` exposes buses 0–8, the
 32-bit window (bus `0x80000000`+1 GB, translation `0xb00000000`), the prefetch
 window (`0xbc0000000`+512 MB), and `RES0` reserves the 256 MB ECAM at
-`0x1cb0000000`. The APCIE DARTs are still not programmed, so Windows can
-enumerate the root complex but a device cannot DMA. The four `apciec` root
-complexes are a separate matter: the single host-bridge descriptor does not
-describe them.
+`0x1cb0000000`. The APCIE DARTs are put into bypass by the m1n1 hand-off (patch
+0003, all streams with read-back verification), so a guest that gets past m1n1
+has an identity-mapped, untranslated DMA path. What is still missing for PCIe is
+MSI (`docs/pcie.md`), and the four `apciec` root complexes: the single
+host-bridge descriptor does not describe them.
 
 The internal SSD is an **Apple ANS2** controller, not a standard PCIe NVMe device.
 `AppleNANDStorageDxe` is a 22-line stub and no DSC includes it, so there is no

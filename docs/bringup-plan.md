@@ -66,8 +66,9 @@ Next:
 - Capture the UEFI serial log and check the memory map, CPU count, and ACPI
   table addresses at runtime.
 - Bring up the USB DWC3/XHCI path so a USB keyboard and USB installer are usable.
-- Program the APCIE DARTs so PCIe devices can DMA (MCFG and `PCI0`/`_CRS` are
-  already in the firmware).
+- Give the guest an MSI path: the doors and the DARTs are done (m1n1 maps the
+  windows and bypasses the APCIE DARTs; MCFG and `PCI0`/`_CRS` are in the
+  firmware), so the next blocker is interrupts, not enumeration or DMA.
 
 **Exit criteria:** the UEFI boot menu appears on the M4's display or over serial, and the firmware reports the correct CPU count and memory map.
 

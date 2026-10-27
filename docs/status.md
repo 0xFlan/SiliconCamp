@@ -16,14 +16,16 @@ firmware `18000.161.10`.
 | QEMU | 11.1.2 |
 | upstream m1n1 build | success, `third_party/m1n1/build/m1n1.bin` |
 | NTASP m1n1-windows build | success, `third_party/m1n1-windows/build/m1n1.bin` |
-| M4 vGIC + PSCI patches | applied; both build |
+| M4 vGIC + PSCI + PCIe patches | applied; all three build |
 | M4 PSCI topology | T8132 tree is 2 clusters (6E+4P); ADT core count checked at init |
-| Patch integrity | the m1n1-windows patches reproduce the submodule's whole working-tree diff from a clean checkout; the firmware patches still apply to their pinned commits (2026-10-26) |
-| NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB) |
+| m1n1 PCIe hand-off | `src/pcie_guest.c` maps ECAM + BAR windows into stage 2 and bypasses every APCIE DART, verifying each stream by read-back |
+| Patch integrity | all five patches apply to their pinned commits (checked 2026-10-27); the m1n1-windows patches reproduce the submodule's whole working-tree diff, and a clean-tree + patches build reproduces the artifact hash bit-for-bit |
+| NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB), published as release `v0.6.0` |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 40 pass (`python3 -m unittest discover -s tests`) |
+| Checker regression tests | 47 pass (`python3 -m unittest discover -s tests`) |
 | M4 ACPI tables | disassembled and checked (below) |
 | MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
+| PCIe translation sign | `PcdPciMmio32Translation` = `0xb00000000` = host − bus == DSDT `_TRA`; checked in both directions, and a wrong sign fails the build |
 
 The `m1n1-windows` build uses `ENABLE_VGIC_MODULE` from `config.h` and produces a
 1.1 MB raw image.
@@ -85,7 +87,9 @@ them compressed inside the Project Mu FV), and enforced by
 | SMMU/DART abstraction | Stub | `hv_smmu.c` is 45 lines; not a real IOMMU. |
 | vTPM | Stub | `hv_vtpm.c` is 16 lines; no TPM 2.0. |
 | NTASP UEFI firmware | Builds | M2 reference and M4 `Mac16_3` package both build in the Lima VM. |
-| M4 platform package | Builds, ACPI checked | `Silicon/Apple/T8132FamilyPkg` + `Platform/Mac16_3Pkg`; CPU/RAM/UART/PPTT match the J624 hardware. PCIe uses the captured J624 ECAM, bus window and host offset (`docs/pcie.md`); MCFG and `PCI0`/`_CRS` are in the firmware, but the APCIE DARTs, `apciec` complexes and ANS2 driver are still missing. |
+| M4 platform package | Builds, ACPI checked | `Silicon/Apple/T8132FamilyPkg` + `Platform/Mac16_3Pkg`; CPU/RAM/UART/PPTT match the J624 hardware. PCIe uses the captured J624 ECAM, bus window and host offset (`docs/pcie.md`); MCFG and `PCI0`/`_CRS` are in the firmware. The `apciec` complexes and the ANS2 driver are still missing. |
+| m1n1 PCIe guest hand-off | Patched, builds | Patch 0003 adds `pcie_guest.c`: ADT walk for controllers/DARTs/MSI, stage-2 mapping of ECAM and BAR windows, DART bypass with per-stream verification, and a one-line failure if any stream cannot be bypassed. Not hardware-tested. |
+| PCIe MSI to a guest | Missing | Apple's doorbell (`0xfffff000`, vector offset 1506) turns a device write into an AIC interrupt, but nothing tells Windows about it; the vGIC's ITS window decodes only `GITS_CTLR`/`GITS_BASER*`, not the command queue. |
 | M4 USB path | Prepared, untested | Four DWC3 controllers are described by `PcdAppleNumDwc3Controllers`; the low 1 GB MMIO window (USB and USB DARTs) is mapped. The DWC3/XHCI stack still needs hardware validation. |
 | NTASP AIC DXE | Partial | AICv1/v2; AICv3 is an explicit TODO. The M4 package uses the vGIC path. |
 | NTASP Windows drivers | Empty | Repository is README-only. |
@@ -99,18 +103,23 @@ them compressed inside the Project Mu FV), and enforced by
 1. **Hardware boot of m1n1 and the UEFI firmware.** The build and ACPI tables are
    coherent, but nothing has run on the M4. This is gated by `docs/safety.md`.
 2. **PCIe and storage.** The host bridge, page tables, MCFG and `PCI0` `_CRS`
-   now use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus
-   `0x80000000` → host `0xb80000000`, offset `0xb00000000`) and prefetch window
-   (`0xbc0000000`). What remains is code, not capture: the APCIE DARTs (so PCIe
-   devices can DMA), the four `apciec` complexes, and an ANS2 driver
-   (`AppleNANDStorageDxe` is a stub). Until the driver exists, USB storage is
-   the only installer target.
-3. **Windows kernel handoff.** This is the project-wide blocker; it is not
+   use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus
+   `0x80000000` → host `0xb80000000`, offset `0xb00000000`), and the m1n1 side
+   maps the windows and bypasses the APCIE DARTs. What remains is code, not
+   capture: MSI for the guest (below), the four `apciec` complexes, and an ANS2
+   driver (`AppleNANDStorageDxe` is a stub). Until the driver exists, USB
+   storage is the only installer target.
+3. **MSI.** A device behind `PCI0` can enumerate and DMA but has no way to
+   interrupt the guest: Apple's doorbell delivers an AIC interrupt that the
+   emulated GIC does forward, but Windows has no ACPI description of it, and the
+   vGIC ITS does not decode the command queue. See the MSI section of
+   `docs/pcie.md` for the two candidate mechanisms.
+4. **Windows kernel handoff.** This is the project-wide blocker; it is not
    M4-specific, but M4 cannot bypass it.
-4. **Drivers.** Even a booting kernel has no internal disk, display, input, or
+5. **Drivers.** Even a booting kernel has no internal disk, display, input, or
    network on Apple hardware.
-5. **GPU.** No path to a usable desktop or games without a WDDM driver.
-6. **Trust.** Anti-cheat is a platform-certification problem, not just a driver.
+6. **GPU.** No path to a usable desktop or games without a WDDM driver.
+7. **Trust.** Anti-cheat is a platform-certification problem, not just a driver.
 
 ## What each remaining epic needs first
 
@@ -120,7 +129,7 @@ Every item below is blocked on the machine, not on code:
 |---|---|---|
 | Windows handoff | Boot m1n1 + UEFI once and capture the serial log. `exception.c` already prints ESR/ELR/FAR and "Unhandled exception, rebooting...", which localises the fault to a trap class. | the Mac, a data-capable USB-C cable, a serial capture |
 | ANS2 storage | Port m1n1's `nvme.c` (581 lines: ANS mailbox, SART, Apple NVMe quirks) to a UEFI `BlockIo` driver, then to a Windows KMDF driver. | the machine to test against; the two drivers are separate projects |
-| PCIe | Program the APCIE DARTs (MCFG and `PCI0`/`_CRS` are in place), then describe `apciec0`–`apciec3`. | the machine to validate BAR assignment and DMA; MSI goes through the vGIC ITS, not Apple's doorbell |
+| PCIe | MSI for the guest, then `apciec0`–`apciec3`. MCFG, `PCI0`/`_CRS`, the stage-2 windows and DART bypass are in place. | the machine to validate BAR assignment, DMA and interrupt delivery |
 | Drivers (DCP, SPI, SMC, USB, Wi-Fi) | One KMDF driver per block; each needs the hardware. | the machine plus a Windows test-signing setup |
 | GPU | No public WDDM driver for AGX exists; this is research, not a port. | GPU documentation/reverse engineering plus a machine |
 | Trust | Secure Boot signing + iBoot key enrollment, TPM 2.0 (vTPM is a 16-line stub), SART/DART IOMMU. VBS/HVCI additionally needs Windows' hypervisor at EL2, which m1n1 occupies. | owner consent for boot-policy changes; `ID_AA64MMFR4_EL1` to check FEAT_NV/NV2 |
@@ -153,17 +162,22 @@ To rebuild m1n1 from a clean `m1n1-windows` checkout:
 
 ```bash
 git -C third_party/m1n1-windows checkout -- .
-./scripts/apply-patches.sh       # applies 0001 and 0002 in order
+./scripts/apply-patches.sh       # applies 0001-0003 in order
 ./scripts/build-m1n1.sh          # also applies them, idempotently
 ```
 
 ## Honest assessment
 
-The 2026-10-26 audit re-decoded the `apcie` properties with `-d 0` and found that
-both earlier revisions of the window were one hex digit short (`0xb8000000`
-instead of `0xb80000000`). The PCDs, page tables, artifact and docs are now
-consistent, and `docs/pcie.md` keeps the raw cells so the arithmetic is
-checkable rather than memorable.
+Two audits changed the PCIe code. The 2026-10-26 audit re-decoded the `apcie`
+properties with `-d 0` and found that both earlier revisions of the window were
+one hex digit short (`0xb8000000` instead of `0xb80000000`). The 2026-10-27 audit
+traced `TO_HOST_ADDRESS(dev, tra) = dev - tra` through `PciHostBridgeDxe` and
+found that the replacement had the translation sign backwards
+(`bus - host` instead of `host - bus`): every BAR would have been programmed at
+an address the hardware does not decode, and the mistake passes a build, a boot
+and enumeration. Both directions are now pinned by `check-acpi.py` against the
+DSDT `_CRS` and the captured cells, and `docs/pcie.md` keeps the raw cells and
+the three sign conventions so the arithmetic is checkable rather than memorable.
 
 This repository now has a reproducible M4 hypervisor build, the M4 vGIC/PSCI
 fixes, and a compiling M4 UEFI firmware whose CPU, UART, ACPI and PCIe root-bridge

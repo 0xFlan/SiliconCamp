@@ -39,8 +39,9 @@ Windows on Arm requires:
 - a GICv3-compatible interrupt controller (the vGIC);
 - PSCI CPU power management (m1n1);
 - ACPI tables describing CPUs, timers, interrupts, PCIe, and the IOMMU — the
-  M4 package now has MCFG and `PCI0` for the first APCIE root complex, but no
-  IORT and no programmed APCIE DARTs;
+  M4 package now has MCFG and `PCI0` for the first APCIE root complex and the
+  m1n1 hand-off maps its windows and bypasses the APCIE DARTs, but there is no
+  IORT, no described MSI path and no `apciec` description;
 - a WDDM display driver (or a basic framebuffer for bring-up);
 - storage and input drivers;
 - for anti-cheat, VBS/HVCI and a trusted platform.

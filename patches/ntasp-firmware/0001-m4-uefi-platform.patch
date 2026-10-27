@@ -3219,10 +3219,10 @@ index 0000000..3b6e2cb
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
 new file mode 100644
-index 0000000..628f348
+index 0000000..1cd2b37
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,163 @@
 +# T8132 SoC family DSC include file
 +#  Copyright (c) 2011-2015, ARM Limited. All rights reserved.
 +#  Copyright (c) 2014, Linaro Limited. All rights reserved.
@@ -3330,16 +3330,33 @@ index 0000000..628f348
 +  gArmTokenSpaceGuid.PcdPciIoSize|0x00010000
 +  #
 +  # The 32 bit PCIe MMIO is not prefetchable.  The DT ranges entry on this
-+  # machine maps bus 0x80000000 to host 0xb80000000, so the aperture base is
-+  # the bus address and the host offset is 0xb00000000.
-+  # AppleSiliconPciHostBridgeLib computes Translation = -PcdPciMmio32Translation,
-+  # so the PCD carries bus - host = -0xb00000000 (0xFFFFFFF500000000).
-+  # Dropping one hex digit (0xb8000000) silently hands devices BARs that nothing
-+  # decodes; docs/pcie.md's raw cells are the source of truth.
++  # machine maps bus 0x80000000 to host 0xb80000000, so the aperture base is the
++  # bus address and the host offset is 0xb00000000.
++  #
++  # The sign of PcdPciMmio32Translation matters, and it is easy to get backwards:
++  #
++  #   - MdeModulePkg/Include/Library/PciHostBridgeLib.h defines the aperture field
++  #     as "Device Address = Host Address + Translation", i.e. Translation is
++  #     bus - host.
++  #   - AppleSiliconPciHostBridgeLib has to produce that field from the PCD and
++  #     computes it as PcdPciMmio32Base - (PcdPciMmio32Base + Translation), which
++  #     is -PcdPciMmio32Translation.  The PCD therefore carries host - bus.
++  #   - The T602X (M2) platform uses the same convention: bus 0xc0000000, host
++  #     0x5c0000000, PCD 0x500000000 = host - bus.
++  #   - The ACPI side agrees: DynamicTablesPkg's SsdtPcieGenerator emits
++  #     _TRA = CpuAddress - PciAddress, which is the same host - bus value, and
++  #     that is what this platform's PCI0 _CRS uses.
++  #
++  # So: host - bus = 0xb80000000 - 0x80000000 = 0xb00000000.  Writing this as
++  # -0xb00000000 (0xFFFFFFF500000000, the first value used here) flips the window
++  # into a host range that does not exist and every device BAR access fails while
++  # config space still reads fine, which is a memorable way to lose a day.
++  # scripts/check-acpi.py enforces the arithmetic across this file, the DSDT and
++  # the captured machine values on every build.
 +  #
 +  gArmTokenSpaceGuid.PcdPciMmio32Base|0x80000000
 +  gArmTokenSpaceGuid.PcdPciMmio32Size|0x40000000
-+  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0xFFFFFFF500000000
++  gEfiMdePkgTokenSpaceGuid.PcdPciMmio32Translation|0xB00000000
 +  gEfiMdePkgTokenSpaceGuid.PcdPciMmio64Translation|0x0
 +  #
 +  # 64 bit PCIe MMIO *is* prefetchable; this window is not translated.

@@ -55,6 +55,10 @@ verify "$ROOT/third_party/m1n1-windows" \
        "$ROOT/patches/m1n1-windows/0002-psci-t8132.patch" \
        "m1n1-windows 0002 (M4 PSCI topology)"
 
+verify "$ROOT/third_party/m1n1-windows" \
+       "$ROOT/patches/m1n1-windows/0003-pcie-guest-handoff.patch" \
+       "m1n1-windows 0003 (PCIe guest hand-off)"
+
 verify "$ROOT/third_party/ntasp-firmware" \
        "$ROOT/patches/ntasp-firmware/0001-m4-uefi-platform.patch" \
        "ntasp-firmware 0001 (M4 UEFI platform)"

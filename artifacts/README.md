@@ -1,12 +1,19 @@
 # Build artifacts
 
-These are the outputs of the 2026-10-27 build on the `Mac16,3` / `J624` M4 iMac.
-The hypervisor is unchanged from v0.4.0 and still carries the M4 vGIC and PSCI
-topology patches (`0001-vgic-m4-topology.patch`, `0002-psci-t8132.patch`). The
-UEFI image is new: it adds an MCFG table and a `PCI0` root bridge whose `_CRS`
-is derived from the captured J624 windows, so Windows can find the APCIE ECAM
-and enumerate the first root complex. The APCIE DARTs are still not programmed,
-so devices can enumerate but cannot DMA yet.
+These are the outputs of the 2026-10-27 build on the `Mac16,3` / `J624` M4 iMac,
+published as release **v0.6.0**.
+
+Both images changed since v0.5.0:
+
+- the hypervisor now carries a third patch, `0003-pcie-guest-handoff.patch`
+  (`src/pcie_guest.c`): it maps the APCIE ECAM and BAR windows into the guest's
+  stage 2 and puts every APCIE DART into bypass, verifying each stream by
+  read-back, so a guest with no APCIE driver still gets a root complex whose
+  devices can DMA;
+- the UEFI image fixes the sign of `PcdPciMmio32Translation` (`0xb00000000` =
+  host − bus, not bus − host). The previous value builds, boots and enumerates
+  and then places every BAR at a host address no device decodes.
+
 They are provided for review and for a hardware experiment that has **not** been
 run yet. Read `../docs/safety.md` before installing anything on the machine.
 
@@ -26,14 +33,17 @@ checked against.
 ## SHA-256
 
 ```
-fad14536dc21528c78bf406a60fe703712302982426dacf7eec28b434e4e2870  MAC16_3_EFI.fd
-82f5372f8aa8f1c88806be1e36b62797954d2cb5d65fe000586e2f028c3f0258  m1n1-windows.bin
-cb13046385fb274188c10c00e38e800542669c526910a23f441181b39fd4ce38  m1n1-windows.macho
+3bc227d442e2ac6258a86f3a3db6c81d5a352dd817cb54d996b04c3c21a19e02  MAC16_3_EFI.fd
+ea4b4ba322d123dabfa127e9e7c70ee7b5aa1704c535e08b53c936703e641de7  m1n1-windows.bin
+b2595ac056b23eed623d9a50158325714173975d1e2983efad17148f01f49ad9  m1n1-windows.macho
 ```
 
-The m1n1 hashes were reproduced from a clean `m1n1-windows` checkout with
-`patches/m1n1-windows/0001` and `0002` applied, so they identify
-clean-checkout + patches, not a dirty tree.
+The m1n1 hashes come from a detached worktree of the pinned submodule commit
+with `patches/m1n1-windows/0001`–`0003` applied. A recursive `diff -r` of that
+tree against the working tree the patches were developed in reports no
+difference outside `.git`, `build/` and `target/`, and both trees build the same
+`m1n1.bin` byte for byte — so the hashes identify clean-checkout + patches, not
+a dirty tree.
 
 ## What the UEFI image contains
 
@@ -54,23 +64,42 @@ clean-checkout + patches, not a dirty tree.
 - PCIe: the first APCIE root complex (`apcie@B0000000`) is configured from the
   captured J624 values — ECAM `0x1cb0000000`+256 MB, bus range 0–8, host window
   `0xb80000000`+1 GB (offset `0xb00000000`), prefetch `0xbc0000000`+512 MB —
-  and all three regions are mapped. `PCI0` is now in the DSDT with `_HID`
-  `PNP0A08`, `_CID` `PNP0A03`, `_CRS` matching those windows, and `RES0`
-  reserving the 256 MB ECAM aperture. Devices can enumerate, but the APCIE
-  DARTs are not programmed, so they cannot DMA.
+  and all three regions are mapped. `PCI0` is in the DSDT with `_HID`
+  `PNP0A08`, `_CID` `PNP0A03`, an `_CRS` matching those windows, and `RES0`
+  reserving the 256 MB ECAM aperture.
 
 The final FD stores the ACPI tables compressed inside the Project Mu FV; the
 values above were checked from the build-tree `.aml`/`.acpi` files and the
 disassembled DSDT, and `scripts/check-acpi.py` re-checks them on every build —
-including each CPU's `_UID`, its containing cluster, and `COM0`'s `_HID`/`_CRS`.
-The FD's ARM64 Image header declares `image_size` `0x1E00000`, matching the FDF;
-upstream's value (`0x100E0000`) was larger than the whole image.
+including each CPU's `_UID`, its containing cluster, `COM0`'s `_HID`/`_CRS`, and
+the sign of the PCIe translation. The FD's ARM64 Image header declares
+`image_size` `0x1E00000`, matching the FDF; upstream's value (`0x100E0000`) was
+larger than the whole image.
 
-## What is not in this image
+## What the hypervisor image contains
 
-- No APCIE DART programming or driver, so PCIe devices cannot DMA yet.
+- M4 vGIC topology (patch 0001): the MMIO window comes from the guest PA size
+  and the redistributor count from the ADT, instead of a per-SoC switch that had
+  no `T8132` case.
+- M4 PSCI topology (patch 0002): two power domains (6 E-cores, 4 P-cores), the
+  T8132 PMGR CPU-start offset, ADT bounds and core-count checks.
+- PCIe hand-off (patch 0003): the ADT is walked for `apcie`/`apcie-ge`
+  controllers and `dart,*apcie*` DARTs; every controller is printed (path, ECAM,
+  `#ports`, MSI address/offset/vector count); the ECAM and the captured BAR
+  windows are mapped into the guest's stage 2; every DART stream is put into
+  bypass (`BYPASS_DART | BYPASS_DAPF`), the TLB is flushed, and every stream is
+  read back. A stream that is locked or ignores the write fails the hand-off.
+- `HV_QUIESCE_PCIE` in `config.h` restores upstream's `pcie_shutdown()` — it is
+  **not** defined in this build.
+
+## What is not in these images
+
+- No MSI path for the guest. Apple's doorbell (`0xfffff000`, vector offset
+  1506) works from the hardware's point of view, but nothing describes it to
+  Windows, and the vGIC's ITS window handles only `GITS_CTLR`/`GITS_BASER*`.
 - No description of the four `apciec0`–`apciec3` root complexes; `PCI0`
-  describes only the first `apcie` node.
+  describes only the first `apcie` node. Their DARTs are bypassed by the m1n1
+  hand-off, and the hand-off prints their ECAMs at boot for the next capture.
 - No ANS2/SART driver for the internal SSD.
 - No Windows drivers repository content; `third_party/ntasp-drivers` is still a
   skeleton.
@@ -93,6 +122,9 @@ cp third_party/ntasp-firmware/Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EF
 cd artifacts && shasum -a 256 MAC16_3_EFI.fd m1n1-windows.bin m1n1-windows.macho \
    > SHA256SUMS
 ```
+
+`build-uefi-linux.sh` finishes by running `scripts/check-acpi.py`, so an FD that
+reaches this directory has already passed the ACPI/image checks.
 
 ## First hardware experiment
 
