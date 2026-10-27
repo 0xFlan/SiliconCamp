@@ -24,6 +24,13 @@ jobs:
       - name: ACPI checker regression tests
         run: python3 -m unittest discover -s tests -v
 
+      # The vGIC contract is checked against the patch series, which is the
+      # artifact the repository ships, so this job needs no submodule and no
+      # compiler. It fails if a patch stops adding a fix or starts re-adding the
+      # defect that fix removed.
+      - name: vGIC guest contract
+        run: ./scripts/check-vgic.py
+
       - name: Python syntax
         run: python3 -m py_compile scripts/*.py tests/*.py
 
@@ -41,12 +48,22 @@ jobs:
         with:
           # Top-level submodules only.  MU_BASECORE is 337 MB, and its NASM
           # patch is checked by the same script locally; this job still fails
-          # if the ntasp-firmware 0001 or either m1n1-windows patch stops
+          # if the ntasp-firmware 0001 or any m1n1-windows patch stops
           # applying to its pinned commit.
           submodules: true
 
       - name: Patches still apply to the pinned submodules
         run: ./scripts/verify-patches.sh
+
+      # The vGIC checker's structural pass needs real sources, so the series is
+      # applied to the checked-out submodule first. This is the mode that catches
+      # a defect the line-oriented patch pass cannot see, such as which of two
+      # identical-looking aic_set_mask() sites masks and which unmasks.
+      - name: Apply the m1n1-windows patches
+        run: ./scripts/apply-patches.sh
+
+      - name: vGIC guest contract on the patched sources
+        run: ./scripts/check-vgic.py --tree third_party/m1n1-windows
 
       # The ANS driver lives in the firmware tree, which the platform patch
       # adds, so the patch has to be applied before its constants can be

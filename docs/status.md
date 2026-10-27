@@ -16,14 +16,14 @@ firmware `18000.161.10`.
 | QEMU | 11.1.2 |
 | upstream m1n1 build | success, `third_party/m1n1/build/m1n1.bin` |
 | NTASP m1n1-windows build | success, `third_party/m1n1-windows/build/m1n1.bin` |
-| M4 vGIC + PSCI + PCIe/MSI patches | applied; all three build |
+| M4 vGIC + PSCI + PCIe/MSI patches | applied in four cumulative patches; the series builds |
 | M4 PSCI topology | T8132 tree is 2 clusters (6E+4P); ADT core count checked at init |
 | m1n1 PCIe hand-off | `src/pcie_guest.c` maps ECAM + BAR windows into stage 2 and bypasses every APCIE DART, verifying each stream by read-back |
 | m1n1 guest MSI | `src/guest_msi.c` programs all 256 port MSIMAP entries with read-back, unmasks AIC 1506–1761, and `hv_vgic3_guest_vintid()` maps them to INTIDs 512–767; the firmware advertises the same window as a MADT GIC MSI Frame |
-| Patch integrity | all five patches apply to their pinned commits (checked 2026-10-27); the m1n1-windows patches reproduce the submodule's whole working-tree diff and a clean-tree + patches build reproduces the artifact hash bit-for-bit; the firmware platform patch applied to a clean checkout reproduces every file it owns, including the MADT MSI frame |
+| Patch integrity | the m1n1-windows series (0001-0004) and both firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-27); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from; the firmware platform patch reproduces every file it owns, including the MADT MSI frame |
 | NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB), published as release `v0.8.0` |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 67 pass (`python3 -m unittest discover -s tests`) |
+| Checker regression tests | 78 pass (`python3 -m unittest discover -s tests`), including 11 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect |
 | M4 ACPI tables | disassembled and checked (below) |
 | MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
 | GIC MSI Frame | MADT entry 0x0D: doorbell `0xfffff000`, SPIs 512–767; cross-checked against `src/guest_msi.h` and rejected if it runs past SPI 1019 |
@@ -83,12 +83,45 @@ them compressed inside the Project Mu FV), and enforced by
 - **FADT**: desktop profile, hardware-reduced ACPI, PSCI compliant, SMC conduit.
 - **DBG2**: points at `_SB.COM0`, using `PcdAppleUartBase` (`0x3ad200000`).
 
+## vGIC guest contract
+
+The firmware is a lenient GICv3 guest. EDK2's `ArmGicV3Dxe` finds a
+redistributor by walking `GICR_TYPER` until the affinity matches the boot CPU,
+never writes `GICR_WAKER`, and never polls `RWP`, so it can boot through a vGIC
+that an operating system cannot use. The 2026-10-27 audit compared the emulation
+against ARM IHI 0069 and against upstream Linux KVM and QEMU, and found nine
+defects. All are fixed in `patches/m1n1-windows/0004-vgic-guest-contract.patch`:
+
+| Defect | Effect on a strict guest |
+|---|---|
+| Redistributor decoded as `addr - redist_base` with `cpu_num = ctx->cpu_id` | Every frame but the first aborts; CPU 1's `GICR_WAKER` arrives at `0x20014` |
+| `GICR_WAKER` write stored verbatim | `ChildrenAsleep` never clears, so the wake poll never completes |
+| `GICD_CTLR.RWP` set on group disable and `GICD_ICENABLER`, never cleared | A guest polling `RWP` spins forever |
+| `GICR_CTLR` wrote bit 31 (`UWP`) instead of bit 3 (`RWP`) | `UWP` is RES0 with `VLPIS=0`; `RWP` never signalled |
+| `GICR_TYPER.PLPIS`/`DirectLPI`/`DPGS` set, `GICR_SETLPIR` a no-op | Guest builds an LPI table and waits for an interrupt that cannot arrive |
+| `GICD_TYPER.LPIS` set with no ITS | Guest looks for a command queue that does not exist |
+| `GICD_ICENABLER` unmasked while logging "masking" | Every interrupt the guest disables stays live |
+| Guest INTIDs passed to the AIC untranslated | SPI 512 touches AIC 512, not the APCIE source at 1506 |
+| `IROUTER` stored `smp_get_id()` in a `u32` | `-1` becomes `0xffffffff`, and `BIT(-1)` is undefined |
+
+Three related suspicions were checked and dismissed: the GTDT timer GSIVs 17/18
+match what `hv_exc.c` injects, `ICC_SGI1R_EL1` traps without `TALL1` because
+`ICH_HCR_EL2.En` is set, and `ICH_VMCR_EL2 = BIT(1)` leaves `VPMR` at its
+architectural reset. `docs/next-steps.md` records the reasoning and the sources.
+
+`scripts/check-vgic.py` is the gate. It asserts the contract against the patch
+series (no submodule, no compiler) and against patched sources, and
+`tests/test_check_vgic.py` puts each defect back and requires the checker to fail.
+None of this has run on hardware; a UEFI conformance self-test is the next
+milestone because it is the only way to observe the contract before Windows
+exists.
+
 ## Component status
 
 | Component | Status | Notes |
 |---|---|---|
 | m1n1 hardware init on M4 | Partial | Upstream has T8132 CPU, NVMe, PCIe, SPTM/GXF work; Asahi still calls M4 bring-up incomplete. |
-| m1n1-windows vGIC | Patched, builds | Original code lacked `T8132`; CPU count and PA window are now dynamic. Not hardware-tested. |
+| m1n1-windows vGIC | Patched, builds | Original code lacked `T8132`; CPU count and PA window are now dynamic. Patch 0004 makes the redistributor and distributor honour the guest contract: per-frame decode, `GICR_WAKER` wake completion, `RWP` always 0, no LPI capabilities, and INTID→AIC translation on every mask/unmask/routing path. `scripts/check-vgic.py` locks it. Not hardware-tested. |
 | PSCI | Patched, builds | `hv_psci.c` had no `T8132` case; it now has the 6E+4P power-domain tree, the T8132 CPU-start offset (`0x34000`, same as `smp.c`), ADT bounds/count checks, and Aff1:Aff0 MPIDR normalisation. Unknown SoCs are fatal instead of dereferencing an unset topology pointer. Not hardware-tested. |
 | SMMU/DART abstraction | Stub | `hv_smmu.c` is 45 lines; not a real IOMMU. |
 | vTPM | Stub | `hv_vtpm.c` is 16 lines; no TPM 2.0. |
@@ -108,7 +141,13 @@ them compressed inside the Project Mu FV), and enforced by
 
 1. **Hardware boot of m1n1 and the UEFI firmware.** The build and ACPI tables are
    coherent, but nothing has run on the M4. This is gated by `docs/safety.md`.
-2. **PCIe and storage.** The host bridge, page tables, MCFG and `PCI0` `_CRS`
+2. **vGIC conformance self-test.** The contract fixes are arguments about what a
+   strict guest does; the firmware never exercised them. A DXE application that
+   walks every redistributor frame, wakes each PE with a timeout, polls both
+   `RWP` bits, enables the GTDT timer PPI and sends a self-SGI converts them into
+   observations on the first boot. Its predecessor — compiling out the vGIC's
+   per-access logging — is pure code and can be done now (`docs/next-steps.md`).
+3. **PCIe and storage.** The host bridge, page tables, MCFG and `PCI0` `_CRS`
    use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus
    `0x80000000` → host `0xb80000000`, offset `0xb00000000`), the m1n1 side maps
    the windows and bypasses the APCIE DARTs, and MSI is now wired end to end
@@ -116,12 +155,12 @@ them compressed inside the Project Mu FV), and enforced by
    not design — and code for the four `apciec` complexes and `_PRT`/IORT. The
    ANS storage driver also needs its first hardware run; until then USB storage
    is the only installer target.
-3. **Windows kernel handoff.** This is the project-wide blocker; it is not
+4. **Windows kernel handoff.** This is the project-wide blocker; it is not
    M4-specific, but M4 cannot bypass it.
-4. **Drivers.** Even a booting kernel has no internal disk, display, input, or
+5. **Drivers.** Even a booting kernel has no internal disk, display, input, or
    network on Apple hardware.
-5. **GPU.** No path to a usable desktop or games without a WDDM driver.
-6. **Trust.** Anti-cheat is a platform-certification problem, not just a driver.
+6. **GPU.** No path to a usable desktop or games without a WDDM driver.
+7. **Trust.** Anti-cheat is a platform-certification problem, not just a driver.
 
 ## What each remaining epic needs first
 
@@ -164,7 +203,7 @@ To rebuild m1n1 from a clean `m1n1-windows` checkout:
 
 ```bash
 git -C third_party/m1n1-windows checkout -- .
-./scripts/apply-patches.sh       # applies 0001-0003 in order
+./scripts/apply-patches.sh       # applies 0001-0004 in order
 ./scripts/build-m1n1.sh          # also applies them, idempotently
 ```
 
@@ -201,10 +240,24 @@ translation rather than on an ITS the hardware cannot feed. The GIC MSI Frame is
 the one interrupt contract the firmware and the hypervisor both have to agree on,
 so `check-acpi.py` compares them.
 
-This repository now has a reproducible M4 hypervisor build, the M4 vGIC/PSCI/PCIe
-fixes, a working-offline MSI path, and a compiling M4 UEFI firmware whose CPU,
-UART, ACPI and PCIe root-bridge values match this exact J624 machine. It does
-**not** have a Windows boot, and none of it has run on the M4 hardware yet. The next meaningful milestone is not "Windows
-installer"; it is "m1n1 prints its vGIC/CPU topology on the M4, and the NTASP UEFI
-firmware reaches its boot menu on the M4 and enumerates the first PCIe root
-complex." Everything after that is debugging the handoff and writing drivers.
+A fourth audit, this one on the interrupt *controller* rather than the interrupt
+path, found a class of bug the first three did not: the vGIC was consistent with
+itself and with the firmware, and wrong against the architecture. The firmware is
+the reason nobody noticed, because EDK2's `ArmGicV3Dxe` touches one
+redistributor frame, never writes `GICR_WAKER` and never polls `RWP`. Nine
+defects followed from comparing the emulation against ARM IHI 0069 instead of
+against the guest that happened to run. The lesson worth keeping is that "it
+boots the firmware" is evidence about the firmware, not about the GIC.
+
+This repository now has a reproducible M4 hypervisor build, the M4
+vGIC/PSCI/PCIe fixes, a vGIC that honours the guest contract a real OS depends
+on (and a checker that fails if it stops doing so), a working-offline MSI path,
+and a compiling M4 UEFI firmware whose CPU, UART, ACPI and PCIe root-bridge
+values match this exact J624 machine. It does **not** have a Windows boot, and
+none of it has run on the M4 hardware yet. The next meaningful milestone is
+still "m1n1 prints its vGIC/CPU topology on the M4, and the NTASP UEFI firmware
+reaches its boot menu on the M4 and enumerates the first PCIe root complex" —
+but the step immediately before it, which needs no hardware, is a UEFI
+conformance self-test that makes the vGIC's behaviour observable instead of
+argued about (`docs/next-steps.md`). Everything after that is debugging the
+handoff and writing drivers.

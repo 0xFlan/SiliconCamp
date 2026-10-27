@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Regression tests for scripts/check-vgic.py.
+
+The checker's job is to fail when the m1n1-windows vGIC stops honouring the
+GICv3 contract Windows relies on, so every test here is either "the shipped
+artifact passes" or "this specific defect is rejected". The defects are the ones
+this project actually shipped: a redistributor keyed off the faulting CPU
+instead of the frame address, a GICR_WAKER write stored verbatim, RWP left set,
+LPI capabilities advertised without an ITS, and an inverted AIC mask polarity.
+
+Two kinds of subject:
+
+  * the patch series, which is the shipped artifact and needs no submodule, and
+  * the patched source tree, built here in a throwaway git worktree, which is
+    what a contributor edits before regenerating a patch.
+
+The tree tests skip when the submodule is not initialised, the same way the ANS2
+tests skip without the firmware tree.
+
+Run with: python3 -m unittest discover -s tests -v
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(TESTS_DIR)
+CHECKER = os.path.join(ROOT, "scripts", "check-vgic.py")
+PATCH_DIR = os.path.join(ROOT, "patches", "m1n1-windows")
+M1N1 = os.path.join(ROOT, "third_party", "m1n1-windows")
+
+#: The files the checker reads; a mutated copy only needs these.
+SOURCES = (
+    "src/hv_vgic.c",
+    "src/hv_vgic.h",
+    "src/hv_exc.c",
+    "src/guest_msi.c",
+    "src/guest_msi.h",
+)
+
+
+def run_checker(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, CHECKER, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+class PatchSeriesTests(unittest.TestCase):
+    """The series as shipped, and deliberately careless regenerations of it."""
+
+    def test_series_satisfies_the_contract(self) -> None:
+        result = run_checker("--patches", PATCH_DIR)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("vGIC contract: OK", result.stdout)
+
+    def _mutated_series(self, filename: str, old: str, new: str) -> str:
+        """Copy the series, replacing one string in one patch, and return the dir."""
+        tmp = tempfile.mkdtemp(prefix="vgic-patches-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name in os.listdir(PATCH_DIR):
+            if not name.endswith(".patch"):
+                continue
+            with open(os.path.join(PATCH_DIR, name), "r", encoding="utf-8") as handle:
+                text = handle.read()
+            if name == filename:
+                self.assertIn(old, text, f"fixture drifted: {old!r} not in {filename}")
+                text = text.replace(old, new)
+            with open(os.path.join(tmp, name), "w", encoding="utf-8") as handle:
+                handle.write(text)
+        return tmp
+
+    def test_series_that_stops_clearing_rwp_is_rejected(self) -> None:
+        # RWP is read-only and must read 0 once the write has been applied. A
+        # guest that polls it would hang, which is a silent boot stall.
+        series = self._mutated_series(
+            "0004-vgic-guest-contract.patch",
+            "gicd_ctlr_new_val &= ~BIT(31);",
+            "gicd_ctlr_new_val |= BIT(31);",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL", result.stdout)
+
+    def test_series_without_frame_decode_is_rejected(self) -> None:
+        series = self._mutated_series(
+            "0004-vgic-guest-contract.patch",
+            "relative_addr = frame_offset % GICR_FRAME_SIZE;",
+            "relative_addr = addr - redist_base;",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_series_that_readvertises_lpis_is_rejected(self) -> None:
+        # Nothing implements an ITS, so an LPIS bit sends the guest looking for
+        # command queues that are not there.
+        series = self._mutated_series(
+            "0004-vgic-guest-contract.patch",
+            "distributor->gicd_type_reg = (BIT(22) | BIT(21) | BIT(20) | BIT(19) | BIT(4)",
+            "distributor->gicd_type_reg = (BIT(22) | BIT(21) | BIT(20) | BIT(19) | BIT(17) | BIT(4)",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_series_that_unmasks_on_disable_is_rejected(self) -> None:
+        # A raw guest INTID at the AIC means SPI 512 masks AIC 512, not the
+        # APCIE source at 1506 that actually raises it.
+        series = self._mutated_series(
+            "0004-vgic-guest-contract.patch",
+            "aic_set_mask(aic_irq, true);",
+            "aic_set_mask(irq_num, true);",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL", result.stdout)
+
+
+class PatchedTreeTests(unittest.TestCase):
+    """The checker's structural pass, run against real patched sources."""
+
+    patched_tree: str | None = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not os.path.exists(os.path.join(M1N1, ".git")):
+            raise unittest.SkipTest("m1n1-windows submodule is not initialised")
+
+        cls.worktree_root = tempfile.mkdtemp(prefix="vgic-tree-")
+        cls.patched_tree = os.path.join(cls.worktree_root, "tree")
+        added = subprocess.run(
+            ["git", "-C", M1N1, "worktree", "add", "--quiet", "--detach",
+             cls.patched_tree, "HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        if added.returncode != 0:
+            shutil.rmtree(cls.worktree_root, True)
+            raise unittest.SkipTest(f"cannot create a worktree: {added.stderr.strip()}")
+
+        patches = sorted(
+            os.path.join(PATCH_DIR, name)
+            for name in os.listdir(PATCH_DIR)
+            if name.endswith(".patch")
+        )
+        for patch in patches:
+            applied = subprocess.run(
+                ["git", "-C", cls.patched_tree, "apply", patch],
+                capture_output=True, text=True, check=False,
+            )
+            if applied.returncode != 0:
+                cls._teardown_tree()
+                raise unittest.SkipTest(
+                    f"{os.path.basename(patch)} does not apply: {applied.stderr.strip()}"
+                )
+
+    @classmethod
+    def _teardown_tree(cls) -> None:
+        if cls.patched_tree:
+            subprocess.run(
+                ["git", "-C", M1N1, "worktree", "remove", "--force", cls.patched_tree],
+                capture_output=True, check=False,
+            )
+        if getattr(cls, "worktree_root", None):
+            shutil.rmtree(cls.worktree_root, True)
+        cls.patched_tree = None
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._teardown_tree()
+
+    def _copy_tree(self) -> str:
+        tmp = tempfile.mkdtemp(prefix="vgic-src-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for rel in SOURCES:
+            target = os.path.join(tmp, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(os.path.join(self.patched_tree, rel), target)
+        return tmp
+
+    def _mutate(self, tree: str, rel: str, old: str, new: str) -> None:
+        path = os.path.join(tree, rel)
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn(old, text, f"fixture drifted: {old!r} not in {rel}")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text.replace(old, new))
+
+    def test_patched_tree_satisfies_the_contract(self) -> None:
+        result = run_checker("--tree", self.patched_tree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("vGIC contract: OK", result.stdout)
+
+    def test_redistributor_keyed_off_faulting_cpu_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "cpu_num = (u8)frame;", "cpu_num = ctx->cpu_id;")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not the CPU that took the fault", result.stdout)
+
+    def test_verbatim_waker_store_is_rejected(self) -> None:
+        # Storing the write verbatim leaves ChildrenAsleep set, so a conforming
+        # wake sequence polls a bit that never clears.
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     """if (*val & GICR_WAKER_PROCESSOR_SLEEP)
+                    redistributors[cpu_num].rd_region.gicr_wake_reg =
+                        GICR_WAKER_PROCESSOR_SLEEP | GICR_WAKER_CHILDREN_ASLEEP;
+                else
+                    redistributors[cpu_num].rd_region.gicr_wake_reg = 0;""",
+                     "redistributors[cpu_num].rd_region.gicr_wake_reg = *val;")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GICR_WAKER", result.stdout)
+
+    def test_inverted_mask_polarity_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "aic_set_mask(aic_irq, true);",
+                     "aic_set_mask(aic_irq, false);")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GICD_ICENABLER", result.stdout)
+
+    def test_untranslated_affinity_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "aic_set_affinity(aic_irq, cpu_num);",
+                     "aic_set_affinity(reg_num + 32, cpu_num);")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_unsigned_cpu_number_is_rejected(self) -> None:
+        # smp_get_id() returns -1 for an affinity that is not in the ADT, and
+        # BIT(-1) is undefined; the type has to keep the sign.
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c", "int cpu_num;", "u32 cpu_num;")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cpu_num", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

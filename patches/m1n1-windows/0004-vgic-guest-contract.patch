@@ -1,0 +1,473 @@
+diff --git a/src/guest_msi.c b/src/guest_msi.c
+index 7446e4c7..ce97d617 100644
+--- a/src/guest_msi.c
++++ b/src/guest_msi.c
+@@ -356,3 +356,28 @@ u32 guest_msi_intid(u32 aic_irq)
+ 
+     return GUEST_MSI_SPI_BASE + (aic_irq - guest_msi.aic_base);
+ }
++
++/*
++ * Guest INTID -> AIC interrupt, for the paths that have to touch the physical
++ * interrupt controller (mask/unmask, affinity).  Keeping this the exact inverse
++ * of guest_msi_intid() is what makes the MSI window safe: a guest enable or
++ * disable of SPI 512+i names AIC aic_base+i, not AIC 512+i.
++ */
++u32 guest_msi_aic_irq(u32 intid)
++{
++    if (intid >= GUEST_MSI_SPI_BASE && intid <= GUEST_MSI_SPI_END) {
++        if (!guest_msi.valid)
++            return 0;
++        return guest_msi.aic_base + (intid - GUEST_MSI_SPI_BASE);
++    }
++
++    /*
++     * The AIC numbers its own interrupts the same way the GIC numbers SPIs up
++     * to the end of the architectural SPI range.  INTIDs 0-31 are SGIs/PPIs,
++     * which are private to the CPU interface and have no AIC line.
++     */
++    if (intid >= 32 && intid <= GIC_LAST_SPI)
++        return intid;
++
++    return 0;
++}
+diff --git a/src/guest_msi.h b/src/guest_msi.h
+index 96ed3e8b..dfd9b85c 100644
+--- a/src/guest_msi.h
++++ b/src/guest_msi.h
+@@ -68,4 +68,13 @@ void guest_msi_prepare(void);
+  */
+ u32 guest_msi_intid(u32 aic_irq);
+ 
++/*
++ * The inverse of guest_msi_intid() for the paths that operate on the AIC:
++ * masking or unmasking a guest INTID, or applying its affinity.  INTIDs 32-511
++ * are the AIC's own numbers; the MSI window (512-767) is backed by aic_base
++ * onwards.  Returns 0 for the SGI/PPI range and for any INTID that has no AIC
++ * source, so callers can skip the write instead of poking an unrelated line.
++ */
++u32 guest_msi_aic_irq(u32 intid);
++
+ #endif
+diff --git a/src/hv_exc.c b/src/hv_exc.c
+index b67e555e..3f2841f2 100644
+--- a/src/hv_exc.c
++++ b/src/hv_exc.c
+@@ -1237,8 +1237,17 @@ void hv_exc_irq(struct exc_info *ctx)
+                     u64 lr_val = hv_vgic3_read_lr(lr);
+                     u64 intd = (lr_val >> ICH_LR_VIRTUAL_SHIFT) & ICH_LR_VIRTUAL_MASK;
+                     hv_vgic3_write_lr(lr, 0);
+-                    if(intd > 31)
+-                        aic_set_mask(intd, false);//TODO: check distributor
++                    if(intd > 31) {
++                        //
++                        // intd is a guest INTID.  The MSI window lives at AIC
++                        // 1506-1761, not at AIC 512-767, so translating it
++                        // here is what keeps EOI from unmasking an unrelated
++                        // AIC source.  An INTID with no AIC line is skipped.
++                        //
++                        u32 aic_irq = guest_msi_aic_irq(intd);
++                        if (aic_irq)
++                            aic_set_mask(aic_irq, false);
++                    }
+                 }
+             }
+         }
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+index ef99c820..477d5333 100644
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -204,7 +204,6 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                 //
+                 u32 gicd_ctlr_new_val = (u32)(*val);
+                 vgic_log("HV vGIC DEBUG: guest writing GICD_CTLR = 0x%x, old value 0x%x\n", gicd_ctlr_new_val, distributor->gicd_ctl_reg);
+-                bool is_rwp_to_be_set = false;
+                 if(((gicd_ctlr_new_val & GENMASK(30, 8)) != 0) || ((gicd_ctlr_new_val & BIT(5)) != 0) || ((gicd_ctlr_new_val & GENMASK(3, 2)) != 0)) {
+                     //
+                     // these bits are RES0 - clear out this bitmask.
+@@ -234,47 +233,32 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                 if((((gicd_ctlr_new_val & BIT(7)) != 0) && ((distributor->gicd_ctl_reg & BIT(7)) == 0)) 
+                 || (((gicd_ctlr_new_val & BIT(7)) == 0) && ((distributor->gicd_ctl_reg & BIT(7)) != 0))) {
+                     //
+-                    // the guest is trying to set EN1WF either way. we need to know about any attempt to change this, as it affects IRQ behavior.
+-                    // we also need to flag that RWP needs to be set to 1.
++                    // the guest is changing EN1WF either way. we need to know about any attempt to change this, as it affects IRQ behavior.
+                     //
+-                    is_rwp_to_be_set = true;
+                     vgic_log("HV vGIC DEBUG [INFO]: guest is changing EN1WF\n");
+                 }
+                 if(((gicd_ctlr_new_val & BIT(1)) == 0) && ((distributor->gicd_ctl_reg & BIT(1)) != 0)) {
+                     //
+-                    // the guest is trying to set EnableGrp1 = 0. we need to know about any attempt to set this, as it affects IRQ behavior.
+-                    // we also need to flag that RWP needs to be set to 1.
++                    // the guest is clearing EnableGrp0.
+                     //
+-                    is_rwp_to_be_set = true;
+-                    vgic_log("HV vGIC DEBUG [INFO]: guest is setting EnableGrp1 = 0\n");
++                    vgic_log("HV vGIC DEBUG [INFO]: guest is clearing EnableGrp0\n");
+                 }
+                 if(((gicd_ctlr_new_val & BIT(0)) == 0) && ((distributor->gicd_ctl_reg & BIT(0)) != 0)) {
+                     //
+-                    // the guest is trying to set EnableGrp1 = 0. we need to know about any attempt to set this, as it affects IRQ behavior.
+-                    // we also need to flag that RWP needs to be set to 1.
++                    // the guest is clearing EnableGrp1.
+                     //
+-                    is_rwp_to_be_set = true;
+-                    vgic_log("HV vGIC DEBUG [INFO]: guest is setting EnableGrp0 = 0\n");
++                    vgic_log("HV vGIC DEBUG [INFO]: guest is clearing EnableGrp1\n");
+                 }
+ 
+                 //
+-                // RWP (Register Write Pending bit) - this bit is a tad bit special - it's RO, but it has to be set if bits 0 or 1 are transitioning
+-                // from 1 to 0.
++                // GICD_CTLR.RWP is RO and reads 1 only while a write to this
++                // register is in flight.  Every effect it waits for has already
++                // been applied by the time this handler returns, so RWP must
++                // read 0.  The previous code set BIT(31) and returned, which
++                // left a conforming guest polling a bit that never cleared.
+                 //
+-                if(is_rwp_to_be_set == true) {
+-                    //
+-                    // set RWP here - then start propagating the effects immediately after.
+-                    //
+-                    gicd_ctlr_new_val |= BIT(31);
+-                }
+-
++                gicd_ctlr_new_val &= ~BIT(31);
+                 distributor->gicd_ctl_reg = gicd_ctlr_new_val;
+-                if(is_rwp_to_be_set == true) {
+-                    //
+-                    // TODO: start the changes signaled by RWP.
+-                    //
+-                    //hv_vgicv3_apply_gic_dist_changes(gicd_ctlr_new_val);
+-                }
+                 register_handled = true;
+                 break;
+             case GIC_DIST_TYPER:
+@@ -336,7 +320,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+             case GIC_DIST_IROUTER32 ... GIC_DIST_IROUTER1019:
+                 u32 reg_num;
+                 u64 mpidr = 0;
+-                u32 cpu_num;
++                int cpu_num;
+                 reg_num = (relative_addr - GIC_DIST_IROUTER32) / 8;
+                 distributor->gicd_interrupt_router_regs[reg_num] = *val;
+                 
+@@ -346,8 +330,16 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                 mpidr |= (u64)MPIDR_AFF3(*val) << 32;
+                 cpu_num = smp_get_id(mpidr);
+ 
+-                aic_set_affinity(reg_num + 32, cpu_num);
+-                vgic_log("HV vGIC DEBUG [INFO] [Distributor]: interrupt routing register %d = %d\n", reg_num, cpu_num);
++                //
++                // The routing register names a guest INTID; the AIC needs its
++                // own interrupt number.  smp_get_id() returns -1 for an
++                // affinity that is not in the ADT, and BIT(-1) is undefined, so
++                // guard both before touching the AIC.
++                //
++                u32 aic_irq = guest_msi_aic_irq(reg_num + 32);
++                if (aic_irq && cpu_num >= 0)
++                    aic_set_affinity(aic_irq, cpu_num);
++                vgic_log("HV vGIC DEBUG [INFO] [Distributor]: interrupt routing register %d = %d (AIC %u)\n", reg_num, cpu_num, aic_irq);
+                 register_handled = true;
+                 break;
+             default:
+@@ -401,8 +393,16 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     value_ic_enabler |= BIT(i);      
+                     irq_num = (32 * reg_num) + i;
+ 
+-                    aic_set_mask(irq_num, false);
+-                    vgic_log("HV vGIC DEBUG [Info] [AIC]: unmasking irq %d\n", irq_num);
++                    //
++                    // irq_num is a guest INTID, not an AIC interrupt.  The MSI
++                    // window (512-767) is backed by AIC 1506-1761, and INTIDs
++                    // below 32 are SGIs/PPIs with no AIC line at all, so a raw
++                    // aic_set_mask(irq_num, ...) touched an unrelated source.
++                    //
++                    u32 aic_irq = guest_msi_aic_irq(irq_num);
++                    if (aic_irq)
++                        aic_set_mask(aic_irq, false);
++                    vgic_log("HV vGIC DEBUG [Info] [AIC]: unmasking irq %d (AIC %u)\n", irq_num, aic_irq);
+                 }
+             }
+             if(reg_num == 0) {
+@@ -440,8 +440,17 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     value_ic_enabler &= ~BIT(i);      
+                     irq_num = (32 * reg_num) + i;
+ 
+-                    aic_set_mask(irq_num, false);
+-                    vgic_log("HV vGIC DEBUG [Info] [AIC]: masking irq %d\n", irq_num);
++                    //
++                    // Disabling an INTID has to mask its AIC source (true), not
++                    // unmask it: the previous call passed false, so every
++                    // interrupt the guest disabled stayed live and was injected
++                    // again.  Translate the INTID first for the same reason as
++                    // the enable path above.
++                    //
++                    u32 aic_irq = guest_msi_aic_irq(irq_num);
++                    if (aic_irq)
++                        aic_set_mask(aic_irq, true);
++                    vgic_log("HV vGIC DEBUG [Info] [AIC]: masking irq %d (AIC %u)\n", irq_num, aic_irq);
+                 }
+             }
+             if(reg_num == 0) {
+@@ -453,11 +462,10 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+             }
+             register_handled = true;
+             //
+-            // ICENABLER register writes require RWP dependent things to be updated, set the bit.
+-            //
+-            distributor->gicd_ctl_reg |= BIT(31);
+-            //
+-            // TODO: propagate the changes
++            // The state change is complete here, so GICD_CTLR.RWP stays 0; see
++            // the GICD_CTLR case.  The hardware would clear RWP once the write
++            // had propagated, and a guest polls it on the assumption that it
++            // does.
+             //
+ 
+         }
+@@ -839,10 +847,25 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+ //
+ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
+ {
+-    u64 relative_addr;
++    u64 frame_offset, relative_addr;
++    u32 frame;
+     bool register_handled;
+     bool unimplemented_reg_accessed;
+-    relative_addr = addr - redist_base;
++    /*
++     * A redistributor is a 0x20000-byte frame, and the frame index -- not the
++     * CPU that happened to take the fault -- names the vCPU whose registers
++     * these are.  Subtracting only redist_base made every frame after the
++     * first decode as an unknown register (CPU 1's GICR_WAKER arrives as
++     * 0x20014, not 0x14), which is a data abort in the guest rather than a
++     * modelled register.  Software legitimately walks these frames to match
++     * an affinity, so the address has to select the state.
++     */
++    frame_offset = addr - redist_base;
++    frame = frame_offset / GICR_FRAME_SIZE;
++    if (frame >= num_cpus)
++        return false;
++    relative_addr = frame_offset % GICR_FRAME_SIZE;
++    (void)ctx;
+     register_handled = false;
+     unimplemented_reg_accessed = false;
+     u8 cpu_num;
+@@ -857,7 +880,7 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+     reg_num = 0;
+     reg_offset = 0;
+ 
+-    cpu_num = ctx->cpu_id;
++    cpu_num = (u8)frame;
+     if(write) {
+         //
+         // The guest attempted to write a register.
+@@ -873,13 +896,12 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+             case GIC_REDIST_CTLR:
+                 u32 gicr_ctlr_new_val = (u32)(*val);
+                 vgic_log("HV vGIC DEBUG: guest writing GICR_CTLR = 0x%x, old value 0x%x\n", gicr_ctlr_new_val, redistributors[cpu_num].rd_region.gicr_ctl_reg);
+-                bool is_uwp_to_be_set = false;
+-                bool is_rwp_to_be_set = false;
+                 //
+-                // like RWP in the distributor's case, the redistributor has it's own version of this type of bit (UWP),
+-                // where certain actions will trigger updates (IPIs in this case.)
+-                // we have to deal with this once the CPU interface is brought up.
+-                // the redistributors also have their own RWP bits which need to be handled similarly
++                // This vGIC reports no LPIs (GICR_TYPER.PLPIS=0) and has no
++                // ITS, so EnableLPIs (bit 0) is RAZ/WI.  Storing it would tell
++                // the guest that an LPI path exists when SETLPIR is a no-op.
++                //
++                gicr_ctlr_new_val &= ~BIT(0);
+ 
+                 //
+                 // bits 30-27 and 23-4 are RES0 so discard writes.
+@@ -894,27 +916,11 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 }
+ 
+                 //
+-                // since DS = 1 - bit 26 (DPG1S) is RAZ/WI
+-                //
+-                if( ( (gicr_ctlr_new_val) & BIT(26) ) != 0 ) {
+-                    //
+-                    // clear the bit
+-                    //
+-                    gicr_ctlr_new_val &= ~BIT(26);
+-                }
+-
+-                //
+-                // setting or clearing bits 25 and 24 (DPG1NS and DPG0) will trigger an RWP change.
++                // DPG1S, DPG1NS and DPG0 (bits 26, 25 and 24) only exist when
++                // GICR_TYPER.DPGS is 1.  This vGIC reports DPGS=0, so the bits
++                // are RES0 and SGI delivery is never gated by them.
+                 //
+-                if( ( ( (gicr_ctlr_new_val) & BIT(25) ) != 0 ) && ( (redistributors[cpu_num].rd_region.gicr_ctl_reg) & BIT(25) == 0 ) 
+-                 || ( ( (gicr_ctlr_new_val) & BIT(24) ) != 0 ) && ( (redistributors[cpu_num].rd_region.gicr_ctl_reg) & BIT(24) == 0 ) 
+-                 || ( ( (gicr_ctlr_new_val) & BIT(25) ) == 0 ) && ( (redistributors[cpu_num].rd_region.gicr_ctl_reg) & BIT(25) != 0 ) 
+-                 || ( ( (gicr_ctlr_new_val) & BIT(24) ) == 0 ) && ( (redistributors[cpu_num].rd_region.gicr_ctl_reg) & BIT(24) != 0 ) ) {
+-                    //
+-                    // signal that RWP is going to be changed.
+-                    //
+-                    is_rwp_to_be_set = true;
+-                }
++                gicr_ctlr_new_val &= ~(BIT(26) | BIT(25) | BIT(24));
+ 
+                 //
+                 // bits 2 and 1 are RO - so discard writes to those bits.
+@@ -928,30 +934,13 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 }
+ 
+                 //
+-                // EnableLPIs if cleared will trigger an RWP write.
+-                //
+-                if(((gicr_ctlr_new_val & BIT(0)) == 0) || ((redistributors[cpu_num].rd_region.gicr_ctl_reg & BIT(0)) != 0)) {
+-                    is_rwp_to_be_set = true;
+-                }
+-
+-                //
+-                // start propagating the effects of the RWP changes.
++                // RWP (bit 3) is RO and reads 1 only while a write is in
++                // flight.  The emulation applies the write before returning, so
++                // leave it clear; a guest that polls it must not spin forever.
++                // (The old code set bit 31, which is UWP, not RWP, and is RES0
++                // when VLPIS is 0.)
+                 //
+-                if(is_rwp_to_be_set == true) {
+-                    //
+-                    // set RWP here - then start propagating the effects immediately after.
+-                    //
+-                    gicr_ctlr_new_val |= BIT(31);
+-                }
+-
+-                redistributors[cpu_num].rd_region.gicr_ctl_reg = gicr_ctlr_new_val;
+-                if(is_rwp_to_be_set == true) {
+-                    //
+-                    // TODO: start the changes signaled by RWP.
+-                    //
+-                    //hv_vgicv3_apply_gic_redist_changes(gicr_ctlr_new_val);
+-                }
+-
++                gicr_ctlr_new_val &= ~BIT(3);
+                 redistributors[cpu_num].rd_region.gicr_ctl_reg = gicr_ctlr_new_val;
+                 register_handled = true;
+                 break;
+@@ -995,7 +984,20 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+                 register_handled = true;
+                 break;
+             case GIC_REDIST_WAKER:
+-                redistributors[cpu_num].rd_region.gicr_wake_reg = *val;
++                //
++                // ProcessorSleep (bit 1) is RW; ChildrenAsleep (bit 2) is RO.
++                // Software wakes a PE by clearing ProcessorSleep and polling
++                // ChildrenAsleep until it reads 0 (ARM IHI 0069, GICR_WAKER).
++                // Copying the write verbatim left ChildrenAsleep set forever,
++                // because a read-modify-write preserves it, so the poll never
++                // completed.  The emulated redistributor has no separate power
++                // domain, so the transition is immediate.
++                //
++                if (*val & GICR_WAKER_PROCESSOR_SLEEP)
++                    redistributors[cpu_num].rd_region.gicr_wake_reg =
++                        GICR_WAKER_PROCESSOR_SLEEP | GICR_WAKER_CHILDREN_ASLEEP;
++                else
++                    redistributors[cpu_num].rd_region.gicr_wake_reg = 0;
+                 register_handled = true;
+                 break;
+             case GIC_REDIST_PARTIDR:
+@@ -1471,9 +1473,10 @@ void hv_vgicv3_init_dist_registers(void)
+     // - 1 of N SPI interrupts are supported (kind of how AIC2 can behave?)
+     // - Affinity 3 invalid
+     // - 16 interrupt ID bits (to match what the CPU interface supports)
+-    // - LPIs/MSIs supported (MSIs not using an ITS)
++    // - No LPIs: there is no ITS, so MSIs are delivered through the ACPI GIC MSI
++    //   Frame (SPIs 512-767), not through GICD_TYPER.LPIS.
+     //
+-    distributor->gicd_type_reg = (BIT(22) | BIT(21) | BIT(20) | BIT(19) | BIT(17) | BIT(4) | BIT(3) | BIT(2) | BIT(1) | BIT(0));
++    distributor->gicd_type_reg = (BIT(22) | BIT(21) | BIT(20) | BIT(19) | BIT(4) | BIT(3) | BIT(2) | BIT(1) | BIT(0));
+     distributor->gicd_imp_id_reg = (BIT(10) | BIT(5) | BIT(4) | BIT(3) | BIT(1) | BIT(0));
+     distributor->gicd_type_reg_2 = 0; 
+     distributor->gicd_err_sts = 0;
+@@ -1518,10 +1521,13 @@ void hv_vgicv3_assign_redist_affinity_value(u16 cpu_num, bool last_cpu) {
+     gicr_typer |= (cpu_num << 8);
+ 
+     //
+-    // Leave out MPAM support for now - we can't assume the CPU supports it.
+-    // Let processors opt out of interrupts though. (bit 5, GICR_TYPER.DPGS bit)
++    // GICR_TYPER.PLPIS/VLPIS/DirectLPI/DPGS are all 0: this vGIC has no ITS, no
++    // LPI configuration table, and no GICR_SETLPIR implementation, so it must
++    // not advertise a feature the guest can then try to use.  MSIs reach the
++    // guest through the ACPI GIC MSI Frame instead.  (The old code set
++    // DirectLPI and PLPIS here while GICR_SETLPIR was a no-op, and DPGS while
++    // GICR_CTLR.DPG0/DPG1NS were not implemented.)
+     //
+-    gicr_typer |= BIT(5);
+     if(last_cpu == true) {
+         //
+         // this is the last redistributor, set bit 4 to indicate this.
+@@ -1529,16 +1535,6 @@ void hv_vgicv3_assign_redist_affinity_value(u16 cpu_num, bool last_cpu) {
+         gicr_typer |= BIT(4);
+     }
+ 
+-    //
+-    // If we need an ITS, we need to comment out the bottom line, since we wouldn't be supporting direct LPI injection to
+-    // redistributors.
+-    //
+-    gicr_typer |= BIT(3);
+-    //
+-    // say that we have physical LPIs to be safe.
+-    //
+-    gicr_typer |= BIT(0);
+-
+     //
+     // write back this feature set to our vGIC registers.
+     //
+@@ -1559,7 +1555,7 @@ void hv_vgicv3_init_redist_registers(void) {
+         //
+         hv_vgicv3_assign_redist_affinity_value(i, last_cpu);
+         redistributors[i].rd_region.gicr_status_reg = 0;
+-        redistributors[i].rd_region.gicr_wake_reg = (BIT(2) | BIT(1)); //GICR_WAKER reset values, currently not using bits 31 or 0.
++        redistributors[i].rd_region.gicr_wake_reg = (GICR_WAKER_PROCESSOR_SLEEP | GICR_WAKER_CHILDREN_ASLEEP); // architectural reset: PE offline
+         //
+         // Generate and set the LPI configuration table here.
+         // (Right now this is ignored just to test if stuff is working since we have no MSIs and LPIs are disabled right now.)
+@@ -1880,7 +1876,7 @@ void hv_vgicv3_init(void)
+     redistributors = heapblock_alloc(sizeof(vgicv3_vcpu_redist) * num_cpus);
+     hv_vgicv3_init_redist_registers();
+     printf("HV vGIC DEBUG: mapping redistributors into guest space\n");
+-    hv_map_hook(redist_base, handle_vgic_redist_access, ((0x20000) * num_cpus));
++    hv_map_hook(redist_base, handle_vgic_redist_access, (GICR_FRAME_SIZE * num_cpus));
+ 
+     //
+     // ITS setup (for MSIs - PCIe devices usually signal via these.)
+diff --git a/src/hv_vgic.h b/src/hv_vgic.h
+index 45e514e0..74db074b 100644
+--- a/src/hv_vgic.h
++++ b/src/hv_vgic.h
+@@ -119,11 +119,27 @@
+ // Redistributor offsets
+ //
+ 
++//
++// One redistributor owns a 64 KiB RD_base frame followed by a 64 KiB SGI_base
++// frame at offset 0x10000, so the next redistributor starts 0x20000 later.
++// GICv4 would double this to 0x40000 when GICR_TYPER.VLPIS is set; this vGIC
++// reports VLPIS=0, so 0x20000 is the contract it publishes.
++//
++#define GICR_FRAME_SIZE 0x20000
++
+ #define GIC_REDIST_CTLR 0x0
+ #define GIC_REDIST_IIDR 0x4
+ #define GIC_REDIST_TYPER 0x8
+ #define GIC_REDIST_STATUSR 0x10
+ #define GIC_REDIST_WAKER 0x14
++
++//
++// GICR_WAKER (ARM IHI 0069): ProcessorSleep is bit 1, ChildrenAsleep is bit 2.
++// ChildrenAsleep is read-only and a guest that wakes a PE clears ProcessorSleep
++// and then polls ChildrenAsleep until it reads 0.
++//
++#define GICR_WAKER_PROCESSOR_SLEEP BIT(1)
++#define GICR_WAKER_CHILDREN_ASLEEP BIT(2)
+ #define GIC_REDIST_MPAMIDR 0x18
+ #define GIC_REDIST_PARTIDR 0x1C
+ #define GIC_REDIST_SETLPIR 0x40

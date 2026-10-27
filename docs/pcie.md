@@ -231,6 +231,17 @@ returns the MSI INTID, passes AIC interrupts up to SPI 1019 through unchanged
 the source and logs it once — the UART (1046) and the APCIE root complexes
 (1231-1249) are in that last group, and delivering them was never going to work.
 
+That function only covers injection. The control path needs the inverse map:
+when the guest enables or disables SPI 512, or routes it, the hypervisor must
+touch AIC 1506 and not AIC 512. `0004-vgic-guest-contract.patch` adds
+`guest_msi_aic_irq()` for exactly that and uses it in `GICD_ISENABLER`,
+`GICD_ICENABLER`, `GICD_IROUTER` and the LR-EOI path. Before it, a guest
+disabling an MSI vector unmasked AIC 512 instead — an unrelated peripheral — and
+left the APCIE source masked or live at the wrong time. `scripts/check-vgic.py`
+asserts that every `aic_set_mask()`/`aic_set_affinity()` call site passes the
+translated number, and that the helper is the exact inverse of
+`guest_msi_intid()`.
+
 `scripts/check-acpi.py` compares the built MADT's frame against
 `src/guest_msi.h` and against the captured doorbell, because a mismatch has no
 symptom in the guest: it allocates SPIs the hypervisor does not translate, and

@@ -7,6 +7,8 @@ This is ordered by dependency, not by excitement. Do not start the GPU or anti-c
 - macOS arm64 host, Homebrew LLVM/LLD, Rust target, QEMU.
 - Upstream m1n1 and NTASP m1n1-windows both build.
 - M4 vGIC topology and PSCI T8132 patches applied (six E-cores, four P-cores).
+- The vGIC guest contract is fixed and checked offline (patch 0004,
+  `scripts/check-vgic.py`).
 
 **Exit criteria:** `./scripts/build-m1n1.sh` produces `m1n1.bin` and `m1n1.macho` with no errors.
 
@@ -67,6 +69,15 @@ Done:
 
 Next:
 
+- Compile out the vGIC's per-access logging (`ENABLE_VGIC_LOGGING` is 1 today, so
+  every emulated register access is a UART write) and replace it with bounded,
+  one-shot diagnostics. This is offline work and the cheapest way to keep the
+  first boot readable.
+- Add a vGIC conformance self-test to the firmware image: walk every
+  redistributor frame via `GICR_TYPER`, read-modify-write `GICR_WAKER` on each
+  and poll `ChildrenAsleep` with a timeout, confirm both `RWP` bits read 0,
+  enable the GTDT timer PPI, and send a self-SGI. It is the only way to observe
+  the contract before Windows exists (`docs/next-steps.md`).
 - Chainload the UEFI firmware from m1n1 on the M4 (gated by the safety checklist).
 - Capture the UEFI serial log and check the memory map, CPU count, and ACPI
   table addresses at runtime.
@@ -93,7 +104,9 @@ This is the existing project's unsolved problem. Expect to spend most of the eff
 - Use WinDbg over serial/USB; enable Windows kernel debugging early.
 - Investigate, in order:
   - EFI memory map and runtime services;
-  - ACPI MADT/GICR/GTDT correctness;
+  - ACPI MADT/GICR/GTDT correctness (the vGIC *contract* is already checked
+    offline; what remains is whether the guest's use of it matches — see
+    `docs/next-steps.md`);
   - PSCI CPU_ON and timer state;
   - vGIC maintenance interrupt and LR injection;
   - stage-2 mappings for the loader/kernel;
