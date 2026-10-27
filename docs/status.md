@@ -168,6 +168,14 @@ git -C third_party/m1n1-windows checkout -- .
 ./scripts/build-m1n1.sh          # also applies them, idempotently
 ```
 
+That build is macOS-only in practice. A Linux build of the same tree fails at
+the final link: the Rust library's `adt_get_reg` codegen references `wcslen`,
+which the Mach-O link resolves from libSystem and a freestanding ELF has no
+provider for. Running it in CI (`clang --target=aarch64-linux-gnu`, `ld.lld`)
+also needed `llvm-objcopy` rather than the runner's x86-only GNU `objcopy`. Both
+are fixable, but the fix belongs in the Rust side of the fork, so there is no
+Linux CI job for the hypervisor yet.
+
 ## Honest assessment
 
 Two audits changed the PCIe code. The 2026-10-26 audit re-decoded the `apcie`
