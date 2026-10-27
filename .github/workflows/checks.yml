@@ -71,6 +71,7 @@ jobs:
   # patches, on a machine that has never seen this project's macOS toolchain.
   m1n1-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,18 +80,23 @@ jobs:
       - name: Check out the pinned m1n1-windows submodule
         run: git submodule update --init --depth 1 third_party/m1n1-windows
 
-      - name: Install cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          rustup target add aarch64-unknown-none-softfloat
+      # The build uses clang + ld.lld on every host, because the image links a
+      # PIE with orphan sections that GNU ld.bfd rejects ("section has no
+      # contents").  Both are in the runner image; the Rust target is the only
+      # thing that has to be added.
+      - name: Install the bare-metal Rust target
+        run: rustup target add aarch64-unknown-none-softfloat
+
+      - name: Make sure lld is present
+        run: command -v ld.lld || sudo apt-get install --yes lld
 
       - name: Apply the m1n1-windows patches
         run: ./scripts/apply-patches.sh
 
       - name: Build the raw hypervisor image
-        run: make -C third_party/m1n1-windows -j"$(nproc)" build/m1n1.bin
+        run: |
+          make -C third_party/m1n1-windows -j"$(nproc)" \
+            USE_CLANG=1 ARCH=aarch64-linux-gnu build/m1n1.bin
 
       # A build that produces no image is not a build.  The Mach-O form is
       # deliberately not requested here: it needs ld64.lld and is only used on
