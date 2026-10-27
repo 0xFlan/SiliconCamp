@@ -48,12 +48,23 @@ jobs:
       - name: Patches still apply to the pinned submodules
         run: ./scripts/verify-patches.sh
 
+      # The ANS driver lives in the firmware tree, which the platform patch
+      # adds, so the patch has to be applied before its constants can be
+      # compared with the m1n1 sources they were ported from.
+      - name: Apply the firmware platform patch
+        run: ./scripts/apply-ntasp-patches.sh
+
       # The ANS driver is a port of m1n1's nvme.c/asc.c/sart.c/rtkit.c.  Every
       # register offset and bit position in it is compared against those files,
       # so a submodule bump that moves a register fails here instead of on
       # hardware, where a wrong offset is an unrecoverable hang.
       - name: ANS2 driver constants agree with m1n1
         run: ./scripts/check-ans2-constants.py
+
+      # The suite skips two ANS2 tests when the firmware tree is absent; here it
+      # is present and patched, so those paths run too.
+      - name: Checker regression tests with the patched firmware tree
+        run: python3 -m unittest discover -s tests
 
   # Applying a patch is not the same as the patched tree compiling.  This job
   # builds the hypervisor from a clean checkout plus the three m1n1-windows
