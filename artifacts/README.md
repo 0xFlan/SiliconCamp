@@ -1,8 +1,12 @@
 # Build artifacts
 
 These are the outputs of the 2026-10-26 build on the `Mac16,3` / `J624` M4 iMac.
-They replace the v0.3.0 images, whose PCIe window addresses were one hex digit
-short (`0xb8000000` instead of `0xb80000000`).
+They replace the v0.3.1 m1n1 images: the hypervisor now carries the M4 PSCI
+topology patch (`patches/m1n1-windows/0002-psci-t8132.patch`), without which
+`hv_psci_init()` had no `T8132` case and read an unset topology pointer. The
+UEFI image is unchanged from v0.3.1 and still has the corrected PCIe windows
+(the v0.3.0 images were one hex digit short: `0xb8000000` instead of
+`0xb80000000`).
 They are provided for review and for a hardware experiment that has **not** been
 run yet. Read `../docs/safety.md` before installing anything on the machine.
 
@@ -23,9 +27,13 @@ checked against.
 
 ```
 8b966b02fb9418b449d21209625265c7dae1edec4f25c768193020ba510c7c00  MAC16_3_EFI.fd
-78459bf90fe5dbbb072fb82040ff95b3612bbe59b9075700a480cd3aaa7afcdb  m1n1-windows.bin
-c518d05af33ed274ab4709daa084253ef947e1293aad37e08b38c97d202aac83  m1n1-windows.macho
+82f5372f8aa8f1c88806be1e36b62797954d2cb5d65fe000586e2f028c3f0258  m1n1-windows.bin
+cb13046385fb274188c10c00e38e800542669c526910a23f441181b39fd4ce38  m1n1-windows.macho
 ```
+
+The m1n1 hashes were reproduced from a clean `m1n1-windows` checkout with
+`patches/m1n1-windows/0001` and `0002` applied, so they identify
+clean-checkout + patches, not a dirty tree.
 
 ## What the UEFI image contains
 
@@ -66,7 +74,7 @@ upstream's value (`0x100E0000`) was larger than the whole image.
 ## Rebuild
 
 ```bash
-./scripts/build-m1n1.sh
+./scripts/build-m1n1.sh   # applies patches/m1n1-windows/*.patch first
 ./scripts/build-uefi-linux.sh Mac16_3
 ```
 

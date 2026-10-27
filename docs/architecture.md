@@ -11,7 +11,7 @@ Apple's first-stage bootloader is the only code that runs before a custom payloa
 `m1n1` is Asahi's bootloader/experimentation payload for Apple Silicon. The NTASP fork adds:
 
 - a **vGIC** emulation (`hv_vgic.c`) so a guest OS can see a GICv3 distributor/redistributor while the hardware uses Apple's AIC;
-- **PSCI** (`hv_psci.c`) because Windows expects PSCI and Apple has no EL3 firmware;
+- **PSCI** (`hv_psci.c`) because Windows expects PSCI and Apple has no EL3 firmware; the M4 patch adds the T8132 power-domain tree (two clusters, 6E+4P) and the T8132 CPU-start offset;
 - **SMMU** (`hv_smmu.c`) and **vTPM** (`hv_vtpm.c`) experiments;
 - Windows-friendly traps in the exception path.
 
@@ -64,6 +64,14 @@ The NTASP vGIC maps its emulated GIC at fixed guest-physical addresses:
 | 42-bit | `0x5000000000` | `0x5100000000` | `0x5200000000` |
 
 The UEFI MADT and the Windows ACPI expectations must match whichever window the hypervisor chooses. The original code selected the window from a per-chip `switch`; that switch had no `T8132` case and several missing `break`s. The patch in `patches/m1n1-windows/0001-vgic-m4-topology.patch` chooses the window from `vaddr_bits` and takes the redistributor count from the ADT CPU nodes.
+
+PSCI has a second per-SoC table of its own: `hv_psci.c` encodes the E/P core
+split so it can build the power-domain tree. T8132 is 6E+4P, not the T602X 4E+4P,
+and had no case at all. `0002-psci-t8132.patch` adds the tree and the PMGR
+CPU-start offset, checks the descriptor against the ADT core count, and makes an
+unknown SoC fatal instead of continuing with an unset topology pointer. The
+guest's `CPU_ON` is still serviced through the spintable (`PSCI_POWER_ON_CPUS_ENABLE`
+is off), but the affinity mapping and `CPU_OFF` path now use the right domains.
 
 ## 4. The interrupt path
 

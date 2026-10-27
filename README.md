@@ -6,7 +6,7 @@ This is a research and bring-up repository, not a working product. As of **2026-
 
 - `m1n1` upstream builds on this M4 host.
 - NTASP's `m1n1-windows` fork builds with the vGIC enabled, and its tree already contains T8132 NVMe, PCIe, and SMP support.
-- An original M4 vGIC topology fix is applied in `patches/m1n1-windows/0001-vgic-m4-topology.patch`.
+- Original M4 fixes are applied in two patches: `0001-vgic-m4-topology.patch` (vGIC window and redistributor count from the ADT) and `0002-psci-t8132.patch` (T8132 PSCI power-domain tree, 6E+4P). See `patches/m1n1-windows/README.md`.
 - The NTASP Project Mu UEFI firmware now has an original M4 platform package and **builds successfully** in the Linux build VM. The generated image (`MAC16_3_EFI.fd`, 30 MB) is attached to the GitHub release with its SHA-256, not committed to git.
 - The M4 values are derived from this exact `Mac16,3`/`J624` machine and Asahi's T8132 device tree: 6 E-cores + 4 P-cores, 24 GB DRAM at the 1 TB alias, UART `0x3ad200000` IRQ 1046, four USB DWC3 controllers, and the APCIE host windows decoded from `ioreg` (ECAM `0x1cb0000000`, bus `0x80000000` → host `0xb80000000`).
 - The generated M4 ACPI tables were checked: 10 GICC entries with the correct MPIDRs, GICD at `0x5000000000`, GICR at `0x5100000000` with a `0x140000` range, a 2-cluster/6E+4P PPTT, and a matching 10-device DSDT. `scripts/check-acpi.py` enforces this — including each CPU's `_UID`, its cluster, and `COM0`'s `_CRS` — on every build, so the values cannot drift silently.
@@ -36,6 +36,7 @@ Windows bootmgr -> winload -> Windows kernel  (EL1 guest)
 ```bash
 ./scripts/check-host.sh
 ./scripts/verify-patches.sh   # patches still apply to the pinned submodules
+./scripts/apply-patches.sh    # idempotent; build-m1n1.sh also does this
 ./scripts/build-m1n1.sh
 ./scripts/build-uefi-linux.sh Mac16_3   # requires the Lima VM; see docs/build-uefi.md
 ```
@@ -78,10 +79,12 @@ third_party/ntasp-drivers/   Windows drivers/HAL extensions (currently empty)
 - The M4 virtual memory map includes the low 1 GB window used by `usb-drd0`–`usb-drd3` and `dart-usb0`–`dart-usb3`.
 - The fork's `config.h` enables `ENABLE_VGIC_MODULE` and it has `hv_vgic.c`, `hv_psci.c`, `hv_smmu.c`, and `hv_vtpm.c`.
 - Upstream m1n1 has T8132 (`M4 Donan`) CPU support, T8132 NVMe, T8132 PCIe, and M4 SPTM/GXF emulation work.
-- The M4 patch replaces the old per-SoC vGIC switch with:
+- The M4 vGIC patch replaces the old per-SoC vGIC switch with:
   - a 36-bit vs 42-bit MMIO window chosen from `vaddr_bits`, and
   - a redistributor count taken from the actual ADT CPU topology.
   This fixes the missing `T8132` case and the old fall-through bugs in the `T6000`/`T6020` cases.
+- The M4 PSCI patch adds the T8132 power-domain tree (two clusters, 6E+4P), the T8132 PMGR CPU-start offset, ADT bounds and core-count checks, and normalises the ADT's MPIDR encoding to Aff1:Aff0. Before it, `hv_psci_init()` had no `T8132` case and passed an unset topology pointer to `psci_num_clusters = topology_tree[1]`.
+- The per-SMC PSCI trace is compiled out by default (`DEBUG_PSCI_SMC` in `config.h` turns it on), so the guest's timing is not distorted by a UART write on every PSCI call.
 
 ## What is still missing
 

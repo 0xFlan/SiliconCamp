@@ -562,11 +562,11 @@ index 0000000..9e44c64
 +  gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemModel|"iMac (24-inch, M4, 2024)"
 +  gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemModelNumber|"Mac16,3"
 +  gAppleSiliconPkgTokenSpaceGuid.PcdSmbiosSystemSku|"iMac (Mac16,3)"
-+  # J624 has four DWC3 controllers (usb-drd0..usb-drd3 in the ioreg); the
-+  # bring-up driver skips the two DFU controllers (0 and 2), leaving the two
-+  # host controllers (1 and 3).
++  # J624 has four DWC3 controllers (usb-drd0..usb-drd3 in the ioreg) and four
++  # matching USB DARTs (dart-usb0..dart-usb3); the bring-up driver skips the two
++  # DFU controllers (0 and 2), leaving the host controllers (1 and 3).
 +  gAppleSiliconPkgTokenSpaceGuid.PcdAppleNumDwc3Controllers|4
-+  gAppleSiliconPkgTokenSpaceGuid.PcdAppleNumDwc3Darts|8
++  gAppleSiliconPkgTokenSpaceGuid.PcdAppleNumDwc3Darts|4
 +  #will be changed later on, default values
 +  # gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferWidth|1920
 +  # gAppleSiliconPkgTokenSpaceGuid.PcdFrameBufferHeight|1080

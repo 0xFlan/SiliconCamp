@@ -1,0 +1,232 @@
+diff --git a/src/hv_exc.c b/src/hv_exc.c
+index e82b14b5..81382561 100644
+--- a/src/hv_exc.c
++++ b/src/hv_exc.c
+@@ -1022,9 +1022,16 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
+ }
+ 
+ static bool hv_handle_smc(struct exc_info *ctx) {
+-    printf("PSCI SMC DEBUG: handling PSCI request 0x%lx\n", ctx->regs[0]);
+-    bool handled_smc = hv_handle_psci_smc(ctx);
+-    return handled_smc;
++    //
++    // This runs for every SMC the guest makes.  A UART write per PSCI call is
++    // slow enough to distort guest timing (and it floods the console during
++    // smp bring-up), so tracing is opt-in.  Define DEBUG_PSCI_SMC in config.h
++    // when a PSCI return value needs to be diagnosed on hardware.
++    //
++#ifdef DEBUG_PSCI_SMC
++    printf("PSCI SMC: function 0x%lx\n", ctx->regs[0]);
++#endif
++    return hv_handle_psci_smc(ctx);
+ }
+ 
+ static bool hv_handle_msr(struct exc_info *ctx, u64 iss)
+diff --git a/src/hv_psci.c b/src/hv_psci.c
+index 495622fd..86c2f97e 100644
+--- a/src/hv_psci.c
++++ b/src/hv_psci.c
+@@ -230,6 +230,31 @@ static const unsigned char apple_t6021_power_domain_tree_descriptor[] = {
+    T602X_P_CLUSTER_CORE_COUNT
+ };
+ 
++//
++// M4 (T8132): one die, one 6-core E-cluster and one 4-core P-cluster.
++// This must match the MADT/PPTT/DSDT topology and the ADT CPU count; a
++// mismatch means the guest's affinity numbers no longer select the right
++// power domain, so hv_psci_init() warns when the two disagree.
++//
++static const unsigned char apple_t8132_power_domain_tree_descriptor[] = {
++   //
++   // Root node. There is only one.
++   //
++   NUM_SYSTEMS_ACTIVE,
++   //
++   // Number of clusters active on the system.
++   //
++   T8132_NUM_CLUSTERS,
++   //
++   // Number of cores in the E-core cluster (E core clusters are first)
++   //
++   T8132_E_CLUSTER_CORE_COUNT,
++   //
++   // Number of cores in the P-core cluster.
++   //
++   T8132_P_CLUSTER_CORE_COUNT
++};
++
+ //
+ // A table of valid idle states. Anything else is considered invalid.
+ // The states will be listed as this: (system state, cluster state, core state)
+@@ -328,7 +353,7 @@ void hv_psci_init(void) {
+     // from ADT/board id.
+     //
+ 
+-    const unsigned char *topology_tree;
++    const unsigned char *topology_tree = NULL;
+ 
+     //
+     // Get the platform's PSCI topology map.
+@@ -355,6 +380,19 @@ void hv_psci_init(void) {
+       case T6021:
+          topology_tree = apple_t6021_power_domain_tree_descriptor;
+          break;
++      case T8132:
++         topology_tree = apple_t8132_power_domain_tree_descriptor;
++         break;
++      default:
++         break;
++    }
++    if (!topology_tree) {
++        //
++        // Never continue with an unset pointer: psci_num_clusters is read from
++        // the descriptor before anything else, and the resulting garbage size
++        // turns into a wild malloc.  An unsupported SoC is fatal.
++        //
++        hv_panic("PSCI: no power domain topology for chip 0x%x\n", chip_id);
+     }
+     printf("PSCI DEBUG: topology tree selected\n");
+     psci_num_clusters = topology_tree[1];
+@@ -386,9 +424,24 @@ void hv_psci_init(void) {
+         if(ADT_GETPROP(adt, node, "cpu-id", &cpu_identifier) < 0) {
+             continue;
+         }
++        if (cpu_identifier >= MAX_CPUS) {
++            printf("PSCI: cpu-id %u exceeds MAX_CPUS (%d), ignoring\n", cpu_identifier, MAX_CPUS);
++            continue;
++        }
+       //   psci_num_cores++;
+         adt_cpu_nodes[cpu_identifier] = node;
+     }
++
++    unsigned int adt_core_count = 0;
++    for (int i = 0; i < MAX_CPUS; i++) {
++        if (adt_cpu_nodes[i]) {
++            adt_core_count++;
++        }
++    }
++    if (adt_core_count != psci_num_cores) {
++        printf("PSCI: topology has %u cores but the ADT has %u; affinity mapping is wrong\n",
++               psci_num_cores, adt_core_count);
++    }
+     switch (chip_id) {
+         case T8103:
+         case T6000:
+@@ -403,8 +456,13 @@ void hv_psci_init(void) {
+         case T6021:
+             cpu_start_off = CPU_START_OFF_T6020;
+             break;
++        case T8132:
++            // Same PMGR CPU-start window as T8112; smp.c already uses this
++            // value for T8132, so the PSCI CPU_OFF path must agree.
++            cpu_start_off = CPU_START_OFF_T8132;
++            break;
+         default:
+-            printf("PSCI setup fatal error: CPU start offset is unknown for this SoC!\n");
++            hv_panic("PSCI: CPU start offset unknown for chip 0x%x\n", chip_id);
+     }
+     printf("PSCI DEBUG: Number of cores for PSCI nodes is %d\n", psci_num_cores);
+ 
+@@ -440,9 +498,21 @@ void hv_psci_init(void) {
+         if(ADT_GETPROP(adt, current_node, "cpu-id", &cpu_identifier) < 0) {
+             continue;
+         }
++        if (cpu_identifier >= MAX_CPUS) {
++            printf("PSCI: cpu-id %u exceeds MAX_CPUS (%d), ignoring\n", cpu_identifier, MAX_CPUS);
++            continue;
++        }
+         if(ADT_GETPROP(adt, current_node, "reg", &reg_identifier) < 0) {
+             continue;
+         }
++        //
++        // PSCI identifies a core through Aff1:Aff0.  Depending on the ADT
++        // revision, the P-core "reg" either carries the Aff2 bit (0x10000)
++        // or not; normalise it away and rebuild it explicitly below.  The
++        // guest always passes the architectural MPIDR (0x10100), and the
++        // translation helpers compare against Aff1:Aff0.
++        //
++        reg_identifier &= 0xffff;
+         if(ADT_GETPROP(adt, current_node, "die-cluster-id", &cluster_num) < 0) {
+             //TODO: this does not exist on T810X
+             //continue;
+@@ -545,7 +615,12 @@ void hv_psci_initialize_power_domain_node(uint16_t node_index, unsigned int pare
+       psci_cpu_nodes[node_index].parent_node = parent_index;
+       //printf("PSCI DEBUG: setting CPU node MPIDR to 0\n");
+       psci_cpu_nodes[node_index].mpidr = 0;
+-      cpu_data = psci_cpu_data_array;
++      //
++      // node_index is the CPU index at this level (the parser resets it to 0
++      // when it descends to PSCI_CPU_POWER_LEVEL).  Using element 0 here made
++      // every CPU's initial state alias CPU 0's.
++      //
++      cpu_data = &psci_cpu_data_array[node_index];
+       //printf("PSCI DEBUG: setting CPU node affinity state to OFF\n");
+       cpu_data->affinity_state = AFFINITY_STATE_OFF;
+       //printf("PSCI DEBUG: setting CPU node targeted suspend level to default level\n");
+@@ -710,13 +785,21 @@ unsigned int hv_psci_get_core_position(void) {
+       if(ADT_GETPROP(adt, current_node, "cpu-id", &cpu_identifier) < 0) {
+          continue;
+       }
++      if (cpu_identifier >= MAX_CPUS) {
++         continue;
++      }
+       if(psci_cpu_data_array[cpu_identifier].reg_value == reg_value_calculated) {
+          core_position = cpu_identifier;
+          break;
+       }
+     }
+     if(core_position == 0xfe) {
+-      printf("Core position was not found! (Or there's a bug in the code.)\n");
++      //
++      // Every caller uses the result as a psci_cpu_data_array index.  Returning
++      // 0xfe here used to turn a mapping bug into a wild write; fail loudly
++      // instead.
++      //
++      hv_panic("PSCI: current CPU MPIDR 0x%x not found in the ADT\n", mpidr_calculated);
+     }
+     return core_position;
+ 
+@@ -1233,7 +1316,11 @@ int hv_psci_validate_mpidr_exists(uint64_t mpidr) {
+       // Iterate through the cpu power domain nodes, if we find the MPIDR in here, return success.
+       //
+       unsigned long mpidr_to_test = psci_cpu_nodes[i].mpidr;
+-      if(mpidr == mpidr_to_test) {
++      //
++      // The guest strips the U bit (31) and Aff3 from the value it passes to
++      // CPU_ON; compare affinities 2:0 instead of the whole register.
++      //
++      if((mpidr & 0xFFFFFF) == (mpidr_to_test & 0xFFFFFF)) {
+          return PSCI_STATUS_SUCCESS;
+       }
+    }
+diff --git a/src/hv_psci.h b/src/hv_psci.h
+index b2d98e80..8603d82d 100644
+--- a/src/hv_psci.h
++++ b/src/hv_psci.h
+@@ -388,6 +388,7 @@ static inline void hv_psci_lock_init(non_cpu_power_domain_node_t *non_cpu_pd_nod
+ #define CPU_START_OFF_T8103 0x54000
+ #define CPU_START_OFF_T8112 0x34000
+ #define CPU_START_OFF_T6020 0x28000
++#define CPU_START_OFF_T8132 0x34000
+ 
+ #define CPU_REG_CORE    GENMASK(7, 0)
+ #define CPU_REG_CLUSTER GENMASK(10, 8)
+@@ -412,11 +413,17 @@ static inline void write_sctlr(u64 val)
+ #define T6002_NUM_CLUSTERS T6001_NUM_CLUSTERS * 2
+ #define T6020_NUM_CLUSTERS 3
+ #define T6021_NUM_CLUSTERS T6020_NUM_CLUSTERS
++#define T8132_NUM_CLUSTERS 2
+ #define T8103_CORES_PER_CLUSTER 4
+ #define T8112_CORES_PER_CLUSTER 4
+ #define T600X_E_CLUSTER_CORE_COUNT 2
+ #define T602X_E_CLUSTER_CORE_COUNT 4
+ #define T600X_P_CLUSTER_CORE_COUNT 4
+ #define T602X_P_CLUSTER_CORE_COUNT 4
++// M4 (T8132) is a 10-core part: six E-cores in cluster 0, four P-cores in
++// cluster 1.  The E/P split is the reverse of the T602X layout above, which is
++// why it gets its own defines instead of reusing T602X_*.
++#define T8132_E_CLUSTER_CORE_COUNT 6
++#define T8132_P_CLUSTER_CORE_COUNT 4
+ 
+ #endif //HV_PSCI_H
+\ No newline at end of file
