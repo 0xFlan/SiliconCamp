@@ -23,7 +23,7 @@ firmware `18000.161.10`.
 | Patch integrity | all five patches apply to their pinned commits (checked 2026-10-27); the m1n1-windows patches reproduce the submodule's whole working-tree diff and a clean-tree + patches build reproduces the artifact hash bit-for-bit; the firmware platform patch applied to a clean checkout reproduces every file it owns, including the MADT MSI frame |
 | NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB), published as release `v0.8.0` |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 66 pass (`python3 -m unittest discover -s tests`) |
+| Checker regression tests | 67 pass (`python3 -m unittest discover -s tests`) |
 | M4 ACPI tables | disassembled and checked (below) |
 | MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
 | GIC MSI Frame | MADT entry 0x0D: doorbell `0xfffff000`, SPIs 512–767; cross-checked against `src/guest_msi.h` and rejected if it runs past SPI 1019 |

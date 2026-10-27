@@ -139,6 +139,16 @@ class TestCheckerPasses(FixtureCase):
         self.assertIn("MADT: MSI SPIs 0x200+256", result.stdout)
         self.assertIn("window ends at SPI 767 (<= 1019)", result.stdout)
 
+    def test_msi_range_is_checked_without_the_hypervisor_tree(self) -> None:
+        # The SPI and INTID limits are ACPI/GIC facts, not m1n1 constants.  The
+        # CI "checks" job does not check out the hypervisor submodule; the
+        # architectural checks must not disappear with it.
+        env = dict(os.environ, M1N1_ROOT=os.path.join(self.tmp, "no-such-tree"))
+        result = run_checker(self.build_dir, env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("hypervisor tree not checked out", result.stdout)
+        self.assertIn("window ends at SPI 767 (<= 1019)", result.stdout)
+
 
 class TestTopologyDump(FixtureCase):
     def test_dump_describes_the_build(self) -> None:
@@ -220,11 +230,13 @@ class TestCheckerRejects(FixtureCase):
 
     def test_msi_window_past_the_spi_range(self) -> None:
         # 512 + 512 = 1024 would run past SPI 1019 and into the reserved range,
-        # where the guest's interrupt controller has no state.
+        # where the guest's interrupt controller has no state.  This has to be
+        # rejected without the hypervisor tree: the limit is architectural.
         self.edit_msi_frame(count=512)
-        result = run_checker(self.build_dir)
+        env = dict(os.environ, M1N1_ROOT=os.path.join(self.tmp, "no-such-tree"))
+        result = run_checker(self.build_dir, env=env)
         self.assertEqual(result.returncode, 1, result.stdout)
-        self.assertIn("window ends at SPI", result.stdout)
+        self.assertIn("window ends at SPI 1023 (<= 1019)", result.stdout)
 
     def test_missing_msi_frame(self) -> None:
         madt = self.table("*MADT*")
