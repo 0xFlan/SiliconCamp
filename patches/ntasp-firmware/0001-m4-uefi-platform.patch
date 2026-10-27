@@ -114,10 +114,10 @@ index 0000000..3060ab9
 \ No newline at end of file
 diff --git a/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl b/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl
 new file mode 100644
-index 0000000..2bfe2e7
+index 0000000..181a137
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/AcpiTables/DSDT.asl
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,331 @@
 +/**
 + * Copyright (c) 2023, amarioguy (AppleWOA authors).
 + * 
@@ -128,7 +128,9 @@ index 0000000..2bfe2e7
 + *     Differentiated System Description Table. This source file implements the DSDT table
 + *     for the iMac M4 (Mac16,3 / J624) platform.  The processor topology,
 + *     UART base, and UART interrupt are taken from the J624 ioreg and the
-+ *     Asahi t8132.dtsi; PCIe is deliberately left out until it is validated.
++ *     Asahi t8132.dtsi.  PCI0 describes the first APCIE root complex from
++ *     the same captured device-tree windows; the APCIE DARTs are not yet
++ *     programmed, so devices can enumerate but not DMA.
 + * 
 + * Environment:
 + *     UEFI firmware/runtime services.
@@ -229,14 +231,119 @@ index 0000000..2bfe2e7
 +            },
 +        })
 +
-+        // Device(PCI0) {
-+        //     Name (_HID, EISAID ("PNP0A08")) // PCI Express Root Bridge
-+        //     Name (_CID, EISAID ("PNP0A03")) // Compatible PCI Root Bridge
-+        //     Name (_SEG, Zero) // PCI Segment Group number
-+        //     Name (_BBN, Zero) // PCI Base Bus Number
-+        //     Name (_ADR, Zero)
-+        //     Name (_UID, "PCI0")
-+        // }
++        //
++        // PCIe root complex for the first APCIE node (`apcie@B0000000`).
++        // Every number here is from this machine's device tree; docs/pcie.md
++        // records the raw ranges cells.  _CRS uses bus addresses plus a
++        // translation, matching what PciHostBridgeDxe derives from the
++        // PcdPci* values:
++        //   bus 0x80000000..0xbfffffff + 0xb00000000 = host 0xb80000000..0xbbfffffff
++        //   prefetchable 0xbc0000000..0xbdfffffff, no translation
++        // The 0xb00000000 translation is host - bus.  PcdPciMmio32Translation
++        // carries the opposite sign (bus - host) for the host-bridge library;
++        // check-acpi.py pins both representations to the captured values.
++        //
++        Device(PCI0) {
++            Name (_HID, "PNP0A08") // PCI Express Root Bridge
++            Name (_CID, "PNP0A03") // Compatible PCI Root Bridge
++            Name (_SEG, Zero) // PCI Segment Group number
++            Name (_BBN, Zero) // PCI Base Bus Number
++            Name (_ADR, Zero)
++            Name (_UID, "PCI0")
++            Name (_CCA, One) // Apple PCIe is DMA coherent per the device tree
++
++            Method (_STA) {
++                Return (0xF)
++            }
++
++            //
++            // ECAM base for this segment.  MCFG carries the same value; this
++            // method is what Windows uses when it maps configuration space.
++            //
++            Method (_CBA, 0, NotSerialized) {
++                Return (FixedPcdGet64 (PcdPciExpressBaseAddress))
++            }
++
++            Name (_CRS, ResourceTemplate () {
++                    WordBusNumber (
++                        ResourceProducer, // ResourceUsage
++                        MinFixed,         // IsMinFixed
++                        MaxFixed,         // IsMaxFixed
++                        PosDecode,        // Decode
++                        0x00000000,       // AddressGranularity
++                        0x00000000,       // AddressMinimum
++                        0x00000008,       // AddressMaximum
++                        0x00000000,       // AddressTranslation
++                        0x00000009        // RangeLength: buses 0-8
++                    )
++
++                    //
++                    // 32-bit non-prefetchable device window.  The bus base is
++                    // 0x80000000 and the host base is 0xb80000000.
++                    //
++                    QWordMemory (
++                        ResourceProducer,
++                        PosDecode,
++                        MinFixed,
++                        MaxFixed,
++                        NonCacheable,
++                        ReadWrite,
++                        0x0000000000000000, // AddressGranularity
++                        0x0000000080000000, // AddressMinimum (bus)
++                        0x00000000BFFFFFFF, // AddressMaximum (bus)
++                        0x0000000B00000000, // AddressTranslation (host - bus)
++                        0x0000000040000000  // RangeLength: 1 GB
++                    )
++
++                    //
++                    // 64-bit prefetchable window, no translation.  The host
++                    // bridge library currently exposes this as MemAbove4G,
++                    // so Windows may treat it as non-prefetchable; the
++                    // descriptor is still the captured hardware window.
++                    //
++                    QWordMemory (
++                        ResourceProducer,
++                        PosDecode,
++                        MinFixed,
++                        MaxFixed,
++                        Prefetchable,
++                        ReadWrite,
++                        0x0000000000000000, // AddressGranularity
++                        0x0000000BC0000000, // AddressMinimum
++                        0x0000000BDFFFFFFF, // AddressMaximum
++                        0x0000000000000000, // AddressTranslation
++                        0x0000000020000000  // RangeLength: 512 MB
++                    )
++            })
++
++            //
++            // Reserve the ECAM range so Windows does not assign a device BAR
++            // on top of it.  PcdPciExpressBarLimit/Size are set for T8132 in
++            // T8132FamilyPkg.dsc.inc.
++            //
++            Device (RES0) {
++                Name (_HID, "PNP0C02") // PNP Motherboard Resources
++                Name (_CRS, ResourceTemplate () {
++                    QWordMemory (
++                        ResourceProducer,
++                        PosDecode,
++                        MinFixed,
++                        MaxFixed,
++                        NonCacheable,
++                        ReadWrite,
++                        0x0000000000000000,
++                        FixedPcdGet64 (PcdPciExpressBaseAddress),
++                        FixedPcdGet64 (PcdPciExpressBarLimit),
++                        0x0000000000000000,
++                        FixedPcdGet64 (PcdPciExpressBarSize)
++                    )
++                })
++
++                Method (_STA) {
++                    Return (0xF)
++                }
++            }
++        }
 +
 +        //
 +        // M4 serial0: Apple's S5L8900-compatible UART at 0x3ad200000.
@@ -340,21 +447,14 @@ index 0000000..2bfe2e7
 +            }
 +        }
 +
-+        //
-+        // PCIe root complex is intentionally not described yet.  The host
-+        // bridge and page tables already use the captured APCIE ECAM
-+        // (0x1cb0000000) and windows, but the APCIE DARTs are not enabled, so
-+        // a device enumerated here could not DMA.  PCI0 waits for that, and
-+        // for a _CRS checked against the captured windows.
-+        //
 +    }
 +}
 diff --git a/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf b/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
 new file mode 100644
-index 0000000..3a0d8fd
+index 0000000..35e1dad
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/AcpiTables/DeviceAcpiTables.inf
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,50 @@
 +## @file
 +#  Borrowed from edk2-platforms/JunoPkg and AmpereAltraPkg, original header below.
 +#  Copyright (c) 2023, amarioguy (AppleWOA authors)
@@ -377,6 +477,7 @@ index 0000000..3a0d8fd
 +  DBG2.aslc
 +  FADT.aslc
 +  DSDT.asl
++  MCFG.aslc
 +
 +[Packages]
 +  ArmPkg/ArmPkg.dec
@@ -509,9 +610,79 @@ index 0000000..7805648
 +//
 +VOID* CONST ReferenceAcpiTable = &Fadt;
 \ No newline at end of file
+diff --git a/Platform/Mac16_3Pkg/AcpiTables/MCFG.aslc b/Platform/Mac16_3Pkg/AcpiTables/MCFG.aslc
+new file mode 100644
+index 0000000..2789783
+--- /dev/null
++++ b/Platform/Mac16_3Pkg/AcpiTables/MCFG.aslc
+@@ -0,0 +1,64 @@
++/**
++ * Copyright (c) 2025 NTASP authors.
++ *
++ * Module Name:
++ *     MCFG.aslc
++ *
++ * Abstract:
++ *     Memory Mapped Configuration Space Access Table for the iMac M4
++ *     (Mac16,3 / J624).  The APCIE root complex exposes 256 MB of ECAM at
++ *     0x1cb0000000 and forwards buses 0-8; docs/pcie.md records the raw
++ *     device-tree cells this came from.
++ *
++ *     This table only tells the OS where configuration space is.  It does
++ *     not enable PCIe by itself: PCI0 in the DSDT describes the same
++ *     aperture, and the APCIE DARTs still have to be programmed before a
++ *     device can DMA.
++ *
++ * Environment:
++ *     UEFI firmware/runtime services.
++ *
++ * License:
++ *     SPDX-License-Identifier: BSD-2-Clause-Patent OR MIT
++ *
++ **/
++
++#include <Library/AcpiLib.h>
++#include <Library/PcdLib.h>
++#include <IndustryStandard/MemoryMappedConfigurationSpaceAccessTable.h>
++#include <Acpi/AcpiHeader.h>
++
++#pragma pack (1)
++
++typedef struct {
++  EFI_ACPI_MEMORY_MAPPED_CONFIGURATION_BASE_ADDRESS_TABLE_HEADER    Header;
++  EFI_ACPI_MEMORY_MAPPED_ENHANCED_CONFIGURATION_SPACE_BASE_ADDRESS_ALLOCATION_STRUCTURE Allocation[1];
++} MCFG_TABLE;
++
++#pragma pack ()
++
++STATIC MCFG_TABLE Mcfg = {
++  {
++    __ACPI_HEADER (
++      EFI_ACPI_2_0_MEMORY_MAPPED_CONFIGURATION_BASE_ADDRESS_TABLE_SIGNATURE,
++      MCFG_TABLE,
++      EFI_ACPI_MEMORY_MAPPED_CONFIGURATION_SPACE_ACCESS_TABLE_REVISION
++    ),
++    0, // Reserved
++  },
++  {
++    {
++      FixedPcdGet64 (PcdPciExpressBaseAddress),
++      0, // PciSegmentGroupNumber, one segment on this platform
++      (UINT8)FixedPcdGet32 (PcdPciBusMin),
++      (UINT8)FixedPcdGet32 (PcdPciBusMax),
++      0  // Reserved
++    }
++  }
++};
++
++//
++// Reference the table being generated to prevent the optimizer from removing
++// the data structure from the executable.
++//
++VOID* CONST ReferenceAcpiTable = &Mcfg;
 diff --git a/Platform/Mac16_3Pkg/Mac16_3.dsc b/Platform/Mac16_3Pkg/Mac16_3.dsc
 new file mode 100644
-index 0000000..9e44c64
+index 0000000..5408a55
 --- /dev/null
 +++ b/Platform/Mac16_3Pkg/Mac16_3.dsc
 @@ -0,0 +1,82 @@
@@ -3048,10 +3219,10 @@ index 0000000..3b6e2cb
 \ No newline at end of file
 diff --git a/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
 new file mode 100644
-index 0000000..9f00724
+index 0000000..628f348
 --- /dev/null
 +++ b/Silicon/Apple/T8132FamilyPkg/T8132FamilyPkg.dsc.inc
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,146 @@
 +# T8132 SoC family DSC include file
 +#  Copyright (c) 2011-2015, ARM Limited. All rights reserved.
 +#  Copyright (c) 2014, Linaro Limited. All rights reserved.
@@ -3177,6 +3348,14 @@ index 0000000..9f00724
 +  gArmTokenSpaceGuid.PcdPciMmio64Size|0x20000000
 +
 +  gEfiMdePkgTokenSpaceGuid.PcdPciExpressBaseAddress|0x1CB0000000
++  #
++  # The ECAM aperture is 256 MB, so the DSDT's RES0 descriptor can reserve
++  # exactly 0x1cb0000000..0x1cb0ffffff.  These were zero (the inherited
++  # AppleSiliconPkg.dec defaults) until PCI0 was added; check-acpi.py pins
++  # the resulting MCFG and _CRS to the captured J624 values.
++  #
++  gAppleSiliconPkgTokenSpaceGuid.PcdPciExpressBarSize|0x10000000
++  gAppleSiliconPkgTokenSpaceGuid.PcdPciExpressBarLimit|0x1CBFFFFFFF
 +  #
 +  # This shouldn't get used.
 +  #

@@ -1,4 +1,4 @@
-# Status — 2026-10-26
+# Status — 2026-10-27
 
 Host and target are the same machine: `Mac16,3` iMac (`target-type J624`), Apple M4
 (`T8132`), 10 cores (6 efficiency + 4 performance), 24 GB, macOS 26.6.2 (Darwin 25.6.0),
@@ -21,8 +21,9 @@ firmware `18000.161.10`.
 | Patch integrity | the m1n1-windows patches reproduce the submodule's whole working-tree diff from a clean checkout; the firmware patches still apply to their pinned commits (2026-10-26) |
 | NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB) |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 35 pass (`python3 -m unittest discover -s tests`) |
+| Checker regression tests | 40 pass (`python3 -m unittest discover -s tests`) |
 | M4 ACPI tables | disassembled and checked (below) |
+| MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
 
 The `m1n1-windows` build uses `ENABLE_VGIC_MODULE` from `config.h` and produces a
 1.1 MB raw image.
@@ -66,7 +67,11 @@ them compressed inside the Project Mu FV), and enforced by
   UID order.
 - **DSDT**: one `DIE0` container, `CLU0` with CPU0–CPU5 and `CLU1` with CPU6–CPU9;
   all ten `ACPI0007` processor devices have `_UID` 0–9. `COM0` is
-  `APPL8900` at `0x3ad200000` with interrupt 1046.
+  `APPL8900` at `0x3ad200000` with interrupt 1046. `PCI0` is `PNP0A08` with
+  `_CID` `PNP0A03`, bus 0–8, the 32-bit window bus `0x80000000`–`0xbfffffff`
+  with translation `0xb00000000`, the prefetch window `0xbc0000000`–
+  `0xbdfffffff`, and `RES0` reserving the 256 MB ECAM at `0x1cb0000000`.
+- **MCFG**: one allocation entry, ECAM `0x1cb0000000`, segment 0, buses 0–8.
 - **FADT**: desktop profile, hardware-reduced ACPI, PSCI compliant, SMC conduit.
 - **DBG2**: points at `_SB.COM0`, using `PcdAppleUartBase` (`0x3ad200000`).
 
@@ -80,7 +85,7 @@ them compressed inside the Project Mu FV), and enforced by
 | SMMU/DART abstraction | Stub | `hv_smmu.c` is 45 lines; not a real IOMMU. |
 | vTPM | Stub | `hv_vtpm.c` is 16 lines; no TPM 2.0. |
 | NTASP UEFI firmware | Builds | M2 reference and M4 `Mac16_3` package both build in the Lima VM. |
-| M4 platform package | Builds, ACPI checked | `Silicon/Apple/T8132FamilyPkg` + `Platform/Mac16_3Pkg`; CPU/RAM/UART/PPTT match the J624 hardware. PCIe uses the captured J624 ECAM, bus window and host offset (`docs/pcie.md`); the DSDT root bridge, APCIE DARTs and ANS2 driver are still missing. |
+| M4 platform package | Builds, ACPI checked | `Silicon/Apple/T8132FamilyPkg` + `Platform/Mac16_3Pkg`; CPU/RAM/UART/PPTT match the J624 hardware. PCIe uses the captured J624 ECAM, bus window and host offset (`docs/pcie.md`); MCFG and `PCI0`/`_CRS` are in the firmware, but the APCIE DARTs, `apciec` complexes and ANS2 driver are still missing. |
 | M4 USB path | Prepared, untested | Four DWC3 controllers are described by `PcdAppleNumDwc3Controllers`; the low 1 GB MMIO window (USB and USB DARTs) is mapped. The DWC3/XHCI stack still needs hardware validation. |
 | NTASP AIC DXE | Partial | AICv1/v2; AICv3 is an explicit TODO. The M4 package uses the vGIC path. |
 | NTASP Windows drivers | Empty | Repository is README-only. |
@@ -93,11 +98,11 @@ them compressed inside the Project Mu FV), and enforced by
 
 1. **Hardware boot of m1n1 and the UEFI firmware.** The build and ACPI tables are
    coherent, but nothing has run on the M4. This is gated by `docs/safety.md`.
-2. **PCIe and storage.** The host bridge and page tables now use the captured
-   J624 ECAM (`0x1cb0000000`), 32-bit window (bus `0x80000000` → host
-   `0xb80000000`, offset `0xb00000000`) and prefetch window (`0xbc0000000`).
-   What remains is code, not capture: `PCI0`/`_CRS` in the DSDT, the APCIE
-   DARTs, the four `apciec` complexes, and an ANS2 driver
+2. **PCIe and storage.** The host bridge, page tables, MCFG and `PCI0` `_CRS`
+   now use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus
+   `0x80000000` → host `0xb80000000`, offset `0xb00000000`) and prefetch window
+   (`0xbc0000000`). What remains is code, not capture: the APCIE DARTs (so PCIe
+   devices can DMA), the four `apciec` complexes, and an ANS2 driver
    (`AppleNANDStorageDxe` is a stub). Until the driver exists, USB storage is
    the only installer target.
 3. **Windows kernel handoff.** This is the project-wide blocker; it is not
@@ -115,7 +120,7 @@ Every item below is blocked on the machine, not on code:
 |---|---|---|
 | Windows handoff | Boot m1n1 + UEFI once and capture the serial log. `exception.c` already prints ESR/ELR/FAR and "Unhandled exception, rebooting...", which localises the fault to a trap class. | the Mac, a data-capable USB-C cable, a serial capture |
 | ANS2 storage | Port m1n1's `nvme.c` (581 lines: ANS mailbox, SART, Apple NVMe quirks) to a UEFI `BlockIo` driver, then to a Windows KMDF driver. | the machine to test against; the two drivers are separate projects |
-| PCIe | Add `PCI0`/`_CRS` from the captured windows, enable the APCIE DARTs, then describe `apciec0`–`apciec3`. | the machine to validate BAR assignment and DMA; MSI goes through the vGIC ITS, not Apple's doorbell |
+| PCIe | Program the APCIE DARTs (MCFG and `PCI0`/`_CRS` are in place), then describe `apciec0`–`apciec3`. | the machine to validate BAR assignment and DMA; MSI goes through the vGIC ITS, not Apple's doorbell |
 | Drivers (DCP, SPI, SMC, USB, Wi-Fi) | One KMDF driver per block; each needs the hardware. | the machine plus a Windows test-signing setup |
 | GPU | No public WDDM driver for AGX exists; this is research, not a port. | GPU documentation/reverse engineering plus a machine |
 | Trust | Secure Boot signing + iBoot key enrollment, TPM 2.0 (vTPM is a 16-line stub), SART/DART IOMMU. VBS/HVCI additionally needs Windows' hypervisor at EL2, which m1n1 occupies. | owner consent for boot-policy changes; `ID_AA64MMFR4_EL1` to check FEAT_NV/NV2 |
@@ -160,10 +165,10 @@ instead of `0xb80000000`). The PCDs, page tables, artifact and docs are now
 consistent, and `docs/pcie.md` keeps the raw cells so the arithmetic is
 checkable rather than memorable.
 
-This repository now has a reproducible M4 hypervisor build, one concrete M4 vGIC
-fix, and a compiling M4 UEFI firmware whose CPU, UART, MADT, and PPTT values match
-this exact J624 machine. It does **not** have a Windows boot, and none of it has run
-on the M4 hardware yet. The next meaningful milestone is not "Windows installer";
-it is "m1n1 prints its vGIC/CPU topology on the M4, and the NTASP UEFI firmware
-reaches its boot menu on the M4." Everything after that is debugging the handoff
-and writing drivers.
+This repository now has a reproducible M4 hypervisor build, the M4 vGIC/PSCI
+fixes, and a compiling M4 UEFI firmware whose CPU, UART, ACPI and PCIe root-bridge
+values match this exact J624 machine. It does **not** have a Windows boot, and none
+of it has run on the M4 hardware yet. The next meaningful milestone is not "Windows
+installer"; it is "m1n1 prints its vGIC/CPU topology on the M4, and the NTASP UEFI
+firmware reaches its boot menu on the M4 and enumerates the first PCIe root
+complex." Everything after that is debugging the handoff and writing drivers.

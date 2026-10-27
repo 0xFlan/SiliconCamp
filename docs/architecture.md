@@ -23,8 +23,9 @@ The UEFI firmware is a Project Mu payload. It provides:
 
 - UEFI boot services and runtime services;
 - the ACPI tables its platform implements — this M4 package provides MADT,
-  GTDT, FADT, DSDT, PPTT and DBG2; IORT/SPCR only exist once a platform adds
-  them, and this one does not yet;
+  GTDT, FADT, DSDT, PPTT, MCFG and DBG2; the DSDT describes `PCI0` for the
+  first APCIE root complex. IORT/SPCR only exist once a platform adds them,
+  and this one does not yet;
 - AIC or vGIC interrupt support;
 - block I/O for the Windows installer and boot media;
 - a simple framebuffer for the Windows boot UI.
@@ -37,7 +38,9 @@ Windows on Arm requires:
 
 - a GICv3-compatible interrupt controller (the vGIC);
 - PSCI CPU power management (m1n1);
-- ACPI tables describing CPUs, timers, interrupts, PCIe, and the IOMMU;
+- ACPI tables describing CPUs, timers, interrupts, PCIe, and the IOMMU — the
+  M4 package now has MCFG and `PCI0` for the first APCIE root complex, but no
+  IORT and no programmed APCIE DARTs;
 - a WDDM display driver (or a basic framebuffer for bring-up);
 - storage and input drivers;
 - for anti-cheat, VBS/HVCI and a trusted platform.

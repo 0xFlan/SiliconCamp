@@ -81,12 +81,12 @@ not present in the T602X map.
 | USB DARTs | `dart-usb0@0x2f00000`, `dart-usb1@0xaf00000`, `dart-usb2@0x12f00000`, `dart-usb3@0x1af00000` |
 | Host controllers used by NTASP | DWC3 1 and 3; the driver skips 0 and 2 as DFU controllers |
 
-`PcdAppleNumDwc3Controllers` is 4 and `PcdAppleNumDwc3Darts` is 8 in
+`PcdAppleNumDwc3Controllers` is 4 and `PcdAppleNumDwc3Darts` is 4 in
 `Platform/Mac16_3Pkg/Mac16_3.dsc`. The low 1 GB mapping in
 `T8132FamilyVirtualMemoryMapDefines.h` covers both the DWC3 register blocks and
 the USB DARTs. The USB stack has not been run on hardware yet.
 
-## PCIe (host bridge wired; DSDT still off)
+## PCIe (host bridge, MCFG and PCI0 wired; DARTs off)
 
 The J624 has several APCIE root complexes. `ioreg` reports the first `apcie`
 node's ECAM as:
@@ -112,9 +112,13 @@ are appended to the virtual memory map. That map still carries the descriptors
 inherited from the T602X package; they cover no J624 device, and pruning them is
 a follow-up that needs the machine to validate. The 32-bit aperture is
 the bus window; the host offset is carried in `PcdPciMmio32Translation`, and the
-page tables map the host addresses (`0xb80000000`+1 GB). PCIe is still omitted
-from the DSDT: no `_CRS` is exposed to Windows until the APCIE DARTs are enabled
-and the ECAM/windows have been exercised on hardware. The four `apciec` root
+page tables map the host addresses (`0xb80000000`+1 GB).
+
+The DSDT now carries `PCI0` and the MCFG table: `_CRS` exposes buses 0–8, the
+32-bit window (bus `0x80000000`+1 GB, translation `0xb00000000`), the prefetch
+window (`0xbc0000000`+512 MB), and `RES0` reserves the 256 MB ECAM at
+`0x1cb0000000`. The APCIE DARTs are still not programmed, so Windows can
+enumerate the root complex but a device cannot DMA. The four `apciec` root
 complexes are a separate matter: the single host-bridge descriptor does not
 describe them.
 

@@ -42,7 +42,7 @@ the descriptor and the machine disagree; stop and fix before proceeding.
 
 ## Phase 2 — NTASP UEFI on the M4
 
-**Status:** the M4 firmware builds. Its CPU topology, memory alias, UART, MADT, PPTT, and DSDT processor containers have been checked against the J624 ioreg and Asahi's `t8132.dtsi`. It has not run on hardware.
+**Status:** the M4 firmware builds. Its CPU topology, memory alias, UART, MADT, PPTT, DSDT processor containers, MCFG and `PCI0` `_CRS` have been checked against the J624 ioreg and Asahi's `t8132.dtsi`. It has not run on hardware.
 
 Done:
 
@@ -56,6 +56,9 @@ Done:
 - Set the APCIE host bridge and page tables from the captured J624 windows
   (ECAM `0x1cb0000000`, bus `0x80000000` → host `0xb80000000`, prefetch
   `0xbc0000000`); see `docs/pcie.md`.
+- Added MCFG and `PCI0`/`_CRS` for the first APCIE root complex, with `RES0`
+  reserving the 256 MB ECAM. `check-acpi.py` pins the bus range, both windows,
+  the translation, and the ECAM reservation.
 
 Next:
 
@@ -63,8 +66,8 @@ Next:
 - Capture the UEFI serial log and check the memory map, CPU count, and ACPI
   table addresses at runtime.
 - Bring up the USB DWC3/XHCI path so a USB keyboard and USB installer are usable.
-- Add `PCI0`/`_CRS` and enable the APCIE DARTs once the USB path proves the
-  memory map on hardware.
+- Program the APCIE DARTs so PCIe devices can DMA (MCFG and `PCI0`/`_CRS` are
+  already in the firmware).
 
 **Exit criteria:** the UEFI boot menu appears on the M4's display or over serial, and the firmware reports the correct CPU count and memory map.
 

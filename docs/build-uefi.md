@@ -1,6 +1,6 @@
 # Building the NTASP UEFI firmware
 
-**Status (2026-10-26):** both the M2 reference package and the new M4 `Mac16_3` package build successfully. The M4 image is `Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EFI.fd` (30 MB). Its MADT, PPTT, FADT, DSDT, DBG2, and GTDT are checked automatically by `scripts/check-acpi.py`, which the build script runs (10 cores, 2 clusters, vGIC bases, PSCI/SMC, UART, DSDT `_UID` tree and `COM0` `_CRS`, FD header).
+**Status (2026-10-27):** both the M2 reference package and the new M4 `Mac16_3` package build successfully. The M4 image is `Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EFI.fd` (30 MB). Its MADT, PPTT, FADT, DSDT, MCFG, DBG2, and GTDT are checked automatically by `scripts/check-acpi.py`, which the build script runs (10 cores, 2 clusters, vGIC bases, PSCI/SMC, UART, DSDT `_UID` tree and `COM0` `_CRS`, `PCI0` bus/window/ECAM contract, FD header).
 
 The NTASP firmware uses Project Mu's `stuart` build system. The project's own documentation says it is tested on Linux, not macOS, so this repo uses a Lima Ubuntu 24.04 VM on the M4 host.
 
@@ -122,6 +122,9 @@ an invariant breaks. It parses the tables the build emits and checks:
   each `_UID` matching the MADT order, every CPU `ACPI0007`, and `COM0` an
   `APPL8900` whose `_CRS` is the platform UART base, length and IRQ (parsed from
   the AML, not found by string search);
+- DSDT `PCI0`: `PNP0A08`/`PNP0A03`, bus 0–8, the 32-bit bus window with its
+  host translation, the prefetch window, and `RES0`'s 256 MB ECAM reservation;
+- MCFG: one ECAM entry at `0x1cb0000000`, segment 0, buses 0–8;
 - FADT: desktop PM profile, hardware-reduced, PSCI over SMC;
 - DBG2: debug UART at `0x3ad200000`;
 - GTDT: EL1 timer 17, virtual timer 18, no memory-mapped frames;
@@ -165,9 +168,9 @@ python3 -m unittest discover -s tests -v
 The M4 package now uses values taken from this exact J624 machine:
 
 - `Silicon/Apple/T8132FamilyPkg` — T8132 SoC PCDs, 10-core MADT, 6E+4P PPTT,
-  M4 virtual memory map with the low 1 GB USB window.
-- `Platform/Mac16_3Pkg` — Mac16,3/J624 platform DSC/FDF, 6E+4P DSDT, ACPI
-  device tables, vGIC build.
+  M4 virtual memory map with the low 1 GB USB window and the J624 PCIe windows.
+- `Platform/Mac16_3Pkg` — Mac16,3/J624 platform DSC/FDF, 6E+4P DSDT with
+  `PCI0`, MCFG, ACPI device tables, vGIC build.
 
 Verified values:
 
@@ -175,20 +178,22 @@ Verified values:
 - 24 GB DRAM at the 1 TB alias; FD at 1 TB + 3 GB; boot args/ADT at 1 TB + 8.5 GB.
 - UART `0x3ad200000` with AIC IRQ 1046.
 - Four DWC3 controllers; the low 1 GB MMIO window covers the USB blocks and DARTs.
+- PCIe ECAM `0x1cb0000000` (256 MB), buses 0–8, 32-bit window bus `0x80000000`
+  → host `0xb80000000`, prefetch `0xbc0000000`+512 MB. MCFG and `PCI0` `_CRS`
+  carry the same values, and `check-acpi.py` fails the build if they diverge.
 
 The ARM64 Image header in `Mac16_3.fdf` carried upstream's `image_size`
 (`0x100E0000`, larger than the entire FD). It now matches the declared FD size
 (`0x1E00000`). m1n1 ignores the field, but a loader that trusts it does not, and
 `scripts/check-acpi.py` fails the build if the field stops covering the payload.
 
-The following remain provisional and must be checked on hardware or before PCIe is
-exposed to Windows:
+The following remain provisional and must be checked on hardware:
 
 - PCIe beyond the first root complex. The `apcie@B0000000` ECAM, bus window,
-  host offset and prefetch window are captured (`docs/pcie.md`), but `PCI0` is
-  still omitted from the DSDT, the APCIE DARTs are not enabled, and the four
-  `apciec` complexes have their own apertures that a single host-bridge
-  descriptor cannot represent.
+  host offset and prefetch window are captured and described (`docs/pcie.md`),
+  but the APCIE DARTs are not programmed, so devices can enumerate but cannot
+  DMA. The four `apciec` complexes have their own apertures that a single
+  host-bridge descriptor cannot represent.
 - ANS2/SART storage for the internal SSD; USB storage is the current install path.
 - DCP/display handoff beyond the iBoot framebuffer.
 
