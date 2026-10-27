@@ -39,10 +39,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Top-level submodules only.  MU_BASECORE is 337 MB, and its patch
-          # (0002) is checked by the same script locally; this job still fails
-          # if 0001 stops applying to the pinned ntasp-firmware commit or the
-          # m1n1-windows patch goes stale.
+          # Top-level submodules only.  MU_BASECORE is 337 MB, and its NASM
+          # patch is checked by the same script locally; this job still fails
+          # if the ntasp-firmware 0001 or either m1n1-windows patch stops
+          # applying to its pinned commit.
           submodules: true
 
       - name: Patches still apply to the pinned submodules
