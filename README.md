@@ -66,6 +66,21 @@ third_party/ntasp-firmware/Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EFI.f
 
 `m1n1.bin` is the raw image used by the modern `kmutil configure-boot --raw` path. **Do not install it on the M4 yet.** Read `docs/safety.md` first.
 
+## User interface
+
+`tools/siliconcamp-assistant/` is the first user-facing piece: a loopback-only
+readiness panel, not an installer.
+
+```bash
+python3 tools/siliconcamp-assistant/server.py   # http://127.0.0.1:8770/
+```
+
+It reports this Mac, the pinned image hashes and build commands, the safety
+gates, the diagnostic checks and the Boot Camp-shaped gaps. The install control
+is disabled because Windows has no boot path yet, and the panel says so instead
+of offering an install that cannot work. See
+`tools/siliconcamp-assistant/README.md`.
+
 ## Layout
 
 ```
@@ -76,6 +91,7 @@ patches/m1n1-windows/   original patches against the NTASP m1n1 fork
 patches/ntasp-firmware/ M4 UEFI platform, the ANS storage driver and build patches
 scripts/                host check, build, patch application, ACPI and ANS2 constant
                         checkers, SoC coverage
+tools/                  SiliconCamp Assistant, the local readiness panel
 tests/                  checker regression tests and real M4 ACPI fixtures
 third_party/m1n1/            upstream Asahi m1n1 (reference)
 third_party/m1n1-windows/    NTASP vGIC/PSCI Windows fork (build target)
