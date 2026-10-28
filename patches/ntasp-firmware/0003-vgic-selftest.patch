@@ -1,0 +1,2051 @@
+diff --git a/Platform/Mac16_3Pkg/Mac16_3.dsc b/Platform/Mac16_3Pkg/Mac16_3.dsc
+index 5408a55..9354e39 100644
+--- a/Platform/Mac16_3Pkg/Mac16_3.dsc
++++ b/Platform/Mac16_3Pkg/Mac16_3.dsc
+@@ -76,6 +76,16 @@
+   #
+   #AppleSiliconPkg/Drivers/AppleBootTimeEmbeddedFirmwareHelperDxe/AppleBootTimeEmbeddedFirmwareHelperDxe.inf
+ 
++  #
++  # The vGIC conformance self-test.  It only makes sense on the GIC build: the
++  # AIC build has no vGIC to test.  It must be dispatched after ArmGicDxe (it
++  # uses the interrupt protocol) and before TimerDxe (the virtual timer PPI has
++  # to be free), which is expressed by the depex and the FV order.
++  #
++!if $(AIC_BUILD) == FALSE
++  AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.inf
++!endif
++
+ 
+ !include T8132FamilyPkg/T8132FamilyPkg.dsc.inc
+ !include AppleSiliconPkg/AppleSiliconPkg.dsc.inc
+diff --git a/Platform/Mac16_3Pkg/Mac16_3.fdf b/Platform/Mac16_3Pkg/Mac16_3.fdf
+index 88934cd..d51fa41 100644
+--- a/Platform/Mac16_3Pkg/Mac16_3.fdf
++++ b/Platform/Mac16_3Pkg/Mac16_3.fdf
+@@ -139,6 +139,14 @@ FvNameGuid         = 84c90f2e-22a5-4c84-a199-a17f7ea7cf6d
+   INF MdeModulePkg/Universal/Console/ConSplitterDxe/ConSplitterDxe.inf
+   INF MdeModulePkg/Universal/Console/GraphicsConsoleDxe/GraphicsConsoleDxe.inf
+   INF MdeModulePkg/Universal/Console/TerminalDxe/TerminalDxe.inf
++!if $(AIC_BUILD) == FALSE
++  #
++  # Before TimerDxe in the FV so it is dispatched first once ArmGicDxe has
++  # installed the interrupt protocol.  It needs the virtual timer PPI to be
++  # free, which it is not once TimerDxe has registered a handler for it.
++  #
++  INF AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.inf
++!endif
+   INF ArmPkg/Drivers/TimerDxe/TimerDxe.inf
+ !if $(AIC_BUILD) == FALSE
+   INF ArmPkg/Drivers/ArmGicDxe/ArmGicDxe.inf
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
+new file mode 100644
+index 0000000..1420574
+--- /dev/null
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
+@@ -0,0 +1,1932 @@
++/** @file
++  Conformance self-test for the NTASP m1n1 vGIC.
++
++  The platform's ACPI tables promise a GICv3 distributor with 1024 INTIDs, one
++  redistributor frame per PE, single-security-state operation, and an MSI window
++  at SPIs 512-767.  Nothing in the image ever checked that the device m1n1
++  emulates actually behaves that way: a build that links is not a contract that
++  holds.
++
++  This driver walks the device the way a guest OS does and then delivers real
++  interrupts through the architected CPU interface.  It runs after ArmGicDxe,
++  because that is what installs the IRQ exception handler and the interrupt
++  protocol, and before TimerDxe, because the virtual timer PPI has to be free.
++
++  Design rules:
++
++    * Every wait is bounded.  A self-test that can hang is worse than no test.
++    * Every check prints and continues.  This runs before there is any way to
++      diagnose a stop.
++    * A deviation is reported as GAP, not FAIL.  Some properties are knowingly
++      unimplemented in the hypervisor today; the point is to measure them on
++      hardware rather than to assert them from a code read.
++    * The driver restores every register it writes.  It is a test, not a
++      configuration.
++    * It only touches registers the vGIC models.  An unmodelled redistributor
++      register is a fatal guest abort in this hypervisor (the distributor
++      tolerates unknown offsets, the redistributor does not), so probing one
++      would turn a conformance test into a boot stop.  That asymmetry is
++      reported in docs/vgic-selftest.md rather than exercised here.
++
++  Copyright (c) 2026, SiliconCamp contributors. All rights reserved.
++
++  SPDX-License-Identifier: BSD-2-Clause-Patent
++
++**/
++
++#include <Uefi.h>
++
++#include <Library/ArmLib.h>
++#include <Library/BaseLib.h>
++#include <Library/BaseMemoryLib.h>
++#include <Library/DebugLib.h>
++#include <Library/IoLib.h>
++#include <Library/PcdLib.h>
++#include <Library/PrintLib.h>
++#include <Library/TimerLib.h>
++#include <Library/UefiBootServicesTableLib.h>
++#include <Library/UefiDriverEntryPoint.h>
++
++#include <Protocol/Cpu.h>
++#include <Protocol/HardwareInterrupt.h>
++
++//
++// Distributor registers, ARM IHI 0069.  Offsets are from the distributor base.
++// They are spelled out here rather than taken from ArmGicLib because that
++// library carries the GICv2 register names, and this test has to be written
++// against the architecture rather than against the header it shares with the
++// driver it is testing.
++//
++#define GICD_CTLR        0x0000
++#define GICD_TYPER       0x0004
++#define GICD_IIDR        0x0008
++#define GICD_TYPER2      0x000C
++#define GICD_IGROUPR     0x0080
++#define GICD_ISENABLER   0x0100
++#define GICD_ICENABLER   0x0180
++#define GICD_ISPENDR     0x0200
++#define GICD_ICPENDR     0x0280
++#define GICD_ISACTIVER   0x0300
++#define GICD_ICACTIVER   0x0380
++#define GICD_IPRIORITYR  0x0400
++#define GICD_IROUTER     0x6000
++
++#define GICD_CTLR_ENABLEGRP1NS  (1U << 0)
++#define GICD_CTLR_ARE           (1U << 4)
++#define GICD_CTLR_DS            (1U << 6)
++#define GICD_CTLR_RWP           (1U << 31)
++//
++// With DS = 1 the group-enable fields are bit 0 EnableGrp1, bit 1 EnableGrp0,
++// and bit 2 RAZ/WI (checked against QEMU's GICv3 model by
++// scripts/check-gicv3-oracle.py).  The name above is the two-security-state
++// name for the same bit; using bit 1 here would have tested Group 0 while the
++// message claimed Group 1, and both bits are set at reset, so the mistake
++// would have looked like a pass.
++//
++
++#define GICD_TYPER_ITLINES_MASK   (0x1FU << 0)
++#define GICD_TYPER_CPUNUMBER_MASK (0x1FU << 5)
++#define GICD_TYPER_SECURITYEXTN   (1U << 10)
++#define GICD_TYPER_LPIS           (1U << 17)
++#define GICD_TYPER_MBIS           (1U << 16)
++#define GICD_TYPER_IDBITS_MASK    (0x1FU << 19)
++#define GICD_TYPER_IDBITS_SHIFT   19
++#define GICD_TYPER_A3V            (1U << 24)
++#define GICD_TYPER_NO1N           (1U << 25)
++
++#define GICD_IROUTER_IRM  (1ULL << 31)
++
++//
++// Redistributor registers.  A redistributor is two 64 KB frames: the RD_base
++// frame at +0 and the SGI_base frame at +0x10000.
++//
++// There is no GICR_TYPER2.  Offset 0xC is the upper half of the 64-bit
++// GICR_TYPER, and a 32-bit access there is not a register of its own, so this
++// file never touches it.
++//
++#define GICR_CTLR    0x0000
++#define GICR_TYPER   0x0008
++#define GICR_WAKER   0x0014
++
++#define GICR_TYPER_PLPIS         (1ULL << 0)
++#define GICR_TYPER_VLPIS         (1ULL << 1)
++#define GICR_TYPER_DIRECTLPI     (1ULL << 3)
++#define GICR_TYPER_LAST          (1ULL << 4)
++#define GICR_TYPER_DPGS          (1ULL << 5)
++#define GICR_TYPER_PROCNUM_SHIFT 8
++#define GICR_TYPER_PROCNUM_MASK  (0xFFFFULL << 8)
++#define GICR_TYPER_AFFINITY_MASK (0xFFFFFFFFULL << 32)
++
++#define GICR_FRAME_SIZE  0x20000
++#define GICR_SGI_IGROUPR0   0x10080
++#define GICR_SGI_ISENABLER  0x10100
++#define GICR_SGI_ICENABLER  0x10180
++#define GICR_SGI_ISPENDR    0x10200
++#define GICR_SGI_ICPENDR    0x10280
++#define GICR_SGI_ISACTIVER  0x10300
++#define GICR_SGI_ICACTIVER  0x10380
++
++#define GICR_WAKER_PROCESSOR_SLEEP (1U << 1)
++#define GICR_WAKER_CHILDREN_ASLEEP (1U << 2)
++
++//
++// GICR_CTLR bits that must read as zero on this device: EnableLPIs (no LPIs),
++// RWP (the emulation applies writes before returning), and DPG0/DPG1NS/DPG1S
++// (RES0 because GICR_TYPER.DPGS is 0).
++//
++#define GICR_CTLR_RESERVED_WRITE_MASK \
++  ((1U << 0) | (1U << 3) | (1U << 24) | (1U << 25) | (1U << 26))
++
++//
++// The MSI window this platform's MADT GIC MSI Frame describes.  The ACPI half of
++// the claim is pinned by scripts/check-acpi.py, which compares the table against
++// src/guest_msi.h; this driver checks the other end, that the window fits inside
++// the INTID space the distributor reports.
++//
++#define VGIC_MSI_SPI_BASE 512
++#define VGIC_MSI_VECTORS  256
++#define VGIC_MSI_BANKS    (VGIC_MSI_VECTORS / 32)
++
++#define VGIC_SPURIOUS_INTID 1023
++
++//
++// A guest may not assume more redistributor frames than the platform declares,
++// and a test may not assume more than it can hold on the stack.
++//
++#define VGIC_MAX_FRAMES 64
++
++//
++// Timeouts, in microseconds.  Everything the vGIC does is synchronous, so these
++// are generous; a conforming device answers in the first poll.
++//
++#define VGIC_WAIT_REGISTER_US  10000
++#define VGIC_WAIT_IRQ_US      100000
++
++//
++// The window used for the negative delivery test.  It only has to be longer
++// than the working path takes (well under a millisecond), and keeping it short
++// keeps a passing boot quick.
++//
++#define VGIC_GATE_WINDOW_US  20000
++
++//
++// Which interrupt IDs the delivery tests use.  SGIs 9 and 10 are in the range
++// the GIC leaves to software; the PPI number comes from the same PCD the GTDT
++// is built from, so the two cannot drift.
++//
++#define VGIC_TEST_SGI        9
++#define VGIC_TEST_SGI_2      10
++//
++// The bank-semantics probe uses an SGI none of the delivery tests touch, so it
++// can save and restore a single bit without disturbing them.
++//
++#define VGIC_TEST_SGI_BANKS  13
++
++//
++// ICC_* and CNTV_* system registers, named by their generic encodings so this
++// file does not depend on a header that may not define them.
++//
++STATIC
++UINT64
++IccHppir1 (
++  VOID
++  )
++{
++  UINT64  Value;
++
++  __asm__ volatile ("mrs %0, S3_0_C12_C12_2" : "=r" (Value) :: "memory");
++  return Value;
++}
++
++STATIC
++UINT64
++IccCtlr (
++  VOID
++  )
++{
++  UINT64  Value;
++
++  __asm__ volatile ("mrs %0, S3_0_C12_C12_4" : "=r" (Value) :: "memory");
++  return Value;
++}
++
++STATIC
++UINT64
++IccIgrpen1 (
++  VOID
++  )
++{
++  UINT64  Value;
++
++  __asm__ volatile ("mrs %0, S3_0_C12_C12_7" : "=r" (Value) :: "memory");
++  return Value;
++}
++
++STATIC
++UINT64
++IccPmr (
++  VOID
++  )
++{
++  UINT64  Value;
++
++  __asm__ volatile ("mrs %0, S3_0_C4_C6_0" : "=r" (Value) :: "memory");
++  return Value;
++}
++
++STATIC
++VOID
++IccSetPmr (
++  IN UINT64  Value
++  )
++{
++  __asm__ volatile ("msr S3_0_C4_C6_0, %0" :: "r" (Value) : "memory");
++}
++
++STATIC
++VOID
++IccSgi1r (
++  IN UINT64  Value
++  )
++{
++  __asm__ volatile ("msr S3_0_C12_C11_5, %0" :: "r" (Value) : "memory");
++}
++
++STATIC
++VOID
++CntvSetCtl (
++  IN UINT64  Value
++  )
++{
++  __asm__ volatile ("msr S3_3_C14_C3_1, %0" :: "r" (Value) : "memory");
++}
++
++STATIC
++VOID
++CntvSetTval (
++  IN UINT32  Value
++  )
++{
++  __asm__ volatile ("msr S3_3_C14_C3_0, %0" :: "r" ((UINT64)Value) : "memory");
++}
++
++STATIC UINTN  mPassed;
++STATIC UINTN  mFailed;
++STATIC UINTN  mGaps;
++STATIC UINTN  mSkipped;
++
++STATIC CHAR8  mDetail[192];
++
++///
++/// Cached so the delivery handler can end the interrupt itself.  ArmGicDxe only
++/// writes ICC_EOIR1_EL1 on the caller's behalf when no handler is registered for
++/// the acknowledged INTID; a registered handler owns the EOI.
++///
++STATIC EFI_HARDWARE_INTERRUPT_PROTOCOL  *mInterrupt;
++
++/**
++  Print one result line and count it.
++
++  The log format is deliberately fixed and line-oriented so a captured serial
++  log can be diffed between boots and checked by a script:
++
++    vgic: [PASS] <name>: <detail>
++
++**/
++STATIC
++VOID
++VgicReport (
++  IN CONST CHAR8  *Kind,
++  IN CONST CHAR8  *Name,
++  IN CONST CHAR8  *Format,
++  IN VA_LIST       Marker
++  )
++{
++  AsciiVSPrint (mDetail, sizeof (mDetail), Format, Marker);
++  DEBUG ((DEBUG_INFO, "vgic: %a %a: %a\n", Kind, Name, mDetail));
++}
++
++STATIC
++VOID
++VgicPass (
++  IN CONST CHAR8  *Name,
++  IN CONST CHAR8  *Format,
++  ...
++  )
++{
++  VA_LIST  Marker;
++
++  mPassed++;
++  VA_START (Marker, Format);
++  VgicReport ("[PASS]", Name, Format, Marker);
++  VA_END (Marker);
++}
++
++STATIC
++VOID
++VgicFail (
++  IN CONST CHAR8  *Name,
++  IN CONST CHAR8  *Format,
++  ...
++  )
++{
++  VA_LIST  Marker;
++
++  mFailed++;
++  VA_START (Marker, Format);
++  VgicReport ("[FAIL]", Name, Format, Marker);
++  VA_END (Marker);
++}
++
++STATIC
++VOID
++VgicGap (
++  IN CONST CHAR8  *Name,
++  IN CONST CHAR8  *Format,
++  ...
++  )
++{
++  VA_LIST  Marker;
++
++  mGaps++;
++  VA_START (Marker, Format);
++  VgicReport ("[GAP ]", Name, Format, Marker);
++  VA_END (Marker);
++}
++
++STATIC
++VOID
++VgicSkip (
++  IN CONST CHAR8  *Name,
++  IN CONST CHAR8  *Format,
++  ...
++  )
++{
++  VA_LIST  Marker;
++
++  mSkipped++;
++  VA_START (Marker, Format);
++  VgicReport ("[SKIP]", Name, Format, Marker);
++  VA_END (Marker);
++}
++
++/**
++  Poll a counter until it reaches a target or the deadline expires.
++
++  Both loops in this file are bounded by a timeout, which is why it contains no
++  `while (TRUE)`: a device that turns out to be broken must not turn the
++  self-test into a hang.
++**/
++STATIC
++BOOLEAN
++VgicWaitCount (
++  IN volatile UINTN  *Counter,
++  IN UINTN            Target,
++  IN UINTN            TimeoutUs
++  )
++{
++  UINTN  Elapsed;
++
++  for (Elapsed = 0; Elapsed < TimeoutUs; Elapsed += 100) {
++    if (*Counter >= Target) {
++      return TRUE;
++    }
++
++    MicroSecondDelay (100);
++  }
++
++  return *Counter >= Target;
++}
++
++/**
++  Poll a register until a masked field matches, or the deadline expires.
++**/
++STATIC
++BOOLEAN
++VgicWaitRegister (
++  IN UINTN   Address,
++  IN UINT32  Mask,
++  IN UINT32  Expected,
++  IN UINTN   TimeoutUs
++  )
++{
++  UINTN  Elapsed;
++
++  for (Elapsed = 0; Elapsed < TimeoutUs; Elapsed += 100) {
++    if ((MmioRead32 (Address) & Mask) == Expected) {
++      return TRUE;
++    }
++
++    MicroSecondDelay (100);
++  }
++
++  return FALSE;
++}
++
++STATIC volatile UINTN  mIrqCount;
++STATIC volatile UINTN  mLastSource;
++
++STATIC
++VOID
++EFIAPI
++VgicTestHandler (
++  IN HARDWARE_INTERRUPT_SOURCE  Source,
++  IN EFI_SYSTEM_CONTEXT         SystemContext
++  )
++{
++  mLastSource = Source;
++  mIrqCount++;
++
++  //
++  // See the comment on mInterrupt: a registered handler must deactivate the
++  // interrupt itself, or the virtual CPU interface keeps it active and the next
++  // one never arrives.
++  //
++  if (mInterrupt != NULL) {
++    mInterrupt->EndOfInterrupt (mInterrupt, Source);
++  }
++}
++
++STATIC
++UINT64
++VgicSelfSgi1r (
++  IN UINT64  Mpidr,
++  IN UINTN   IntId
++  )
++{
++  UINT64  Value;
++
++  //
++  // ICC_SGI1R_EL1: [15:0] TargetList, [23:16] Aff1, [31:24] INTID,
++  // [39:32] Aff2, [47:40] IRM, [55:48] Aff3.  TargetList is a bit per Aff0 in
++  // the cluster named by Aff1-Aff3, so a PE targets itself with its own Aff0.
++  //
++  Value  = (UINT64)((IntId & 0xF) << 24);
++  Value |= (UINT64)((Mpidr >> 8) & 0xFF) << 16;
++  Value |= (UINT64)((Mpidr >> 16) & 0xFF) << 32;
++  Value |= (UINT64)((Mpidr >> 32) & 0xFF) << 48;
++  Value |= (UINT64)1 << (Mpidr & 0xF);
++
++  return Value;
++}
++
++/**
++  Check the distributor's identification and capability registers.
++
++  These are properties, not a copy of the hypervisor's constants: a guest
++  derives the shape of the device from them, so they have to agree with each
++  other, with the CPU interface, and with the tables.
++**/
++STATIC
++VOID
++VgicCheckDistributorCaps (
++  IN UINTN  Dist
++  )
++{
++  UINT32  Typer;
++  UINT32  Typer2;
++  UINT32  ItLines;
++  UINT32  IdBits;
++  UINTN   NumIntIds;
++
++  Typer   = MmioRead32 (Dist + GICD_TYPER);
++  Typer2  = MmioRead32 (Dist + GICD_TYPER2);
++  ItLines = Typer & GICD_TYPER_ITLINES_MASK;
++  IdBits  = (Typer & GICD_TYPER_IDBITS_MASK) >> GICD_TYPER_IDBITS_SHIFT;
++
++  NumIntIds = 32 * (ItLines + 1);
++
++  if (NumIntIds == 1024) {
++    VgicPass ("dist.intids", "GICD_TYPER describes %u INTIDs", NumIntIds);
++  } else {
++    VgicFail ("dist.intids", "GICD_TYPER describes %u INTIDs, expected 1024", NumIntIds);
++  }
++
++  if (IdBits == 0xF) {
++    VgicPass ("dist.idbits", "GICD_TYPER.IDbits = 16");
++  } else {
++    VgicFail ("dist.idbits", "GICD_TYPER.IDbits = %u, the CPU interface implements 16", IdBits + 1);
++  }
++
++  //
++  // GICD_TYPER.No1N.  Patch 0006 sets this because the vGIC cannot make the
++  // distributor choose a target PE.  If it is ever clear again, a guest is
++  // entitled to write GICD_IROUTER.IRM = 1 and expect routing this device does
++  // not perform.  This is the runtime half of that patch.
++  //
++  if ((Typer & GICD_TYPER_NO1N) != 0) {
++    VgicPass ("dist.no1n", "1-of-N routing is advertised as unsupported");
++  } else {
++    VgicFail ("dist.no1n", "GICD_TYPER.No1N is 0: the vGIC advertises 1-of-N routing it cannot perform");
++  }
++
++  //
++  // Affinity level 3 is not used: every MPIDR in the ADT has Aff3 == 0, so A3V
++  // must be 0.  With A3V == 0 the PE is selected by Aff0-Aff2.
++  //
++  if ((Typer & GICD_TYPER_A3V) == 0) {
++    VgicPass ("dist.a3v", "A3V = 0, matching a topology with no affinity level 3");
++  } else {
++    VgicFail ("dist.a3v", "A3V = 1 although every MPIDR in the ADT has Aff3 = 0");
++  }
++
++  //
++  // GICD_CTLR.DS = 1 means there is exactly one security state, so the
++  // distributor must report no security extensions.  A guest that sees
++  // SecurityExtn = 1 will try to configure Group 0/Group 1 Secure.
++  //
++  if ((Typer & GICD_TYPER_SECURITYEXTN) == 0) {
++    VgicPass ("dist.no-secure", "SecurityExtn = 0, consistent with DS = 1");
++  } else {
++    VgicFail ("dist.no-secure", "SecurityExtn = 1 although the device claims one security state");
++  }
++
++  //
++  // There is no ITS and no LPI space, so MBIS and LPIS must both be 0.  A guest
++  // that sees LPIS = 1 will look for GITS_TRANSLATER and never find an MSI.
++  //
++  if ((Typer & (GICD_TYPER_LPIS | GICD_TYPER_MBIS)) == 0) {
++    VgicPass ("dist.no-lpis", "LPIS = 0 and MBIS = 0, so MSIs come only from the GIC MSI Frame");
++  } else {
++    VgicFail (
++      "dist.no-lpis",
++      "TYPER = 0x%08x advertises an LPI or message-based SPI path this vGIC does not implement",
++      Typer
++      );
++  }
++
++  //
++  // With affinity routing enabled, CPUNumber is RES0 and must read as zero.
++  //
++  if ((Typer & GICD_TYPER_CPUNUMBER_MASK) == 0) {
++    VgicPass ("dist.cpunumber", "CPUNumber reads 0 with affinity routing enabled");
++  } else {
++    VgicFail ("dist.cpunumber", "CPUNumber = %u although ARE is set", (Typer >> 5) & 0x1F);
++  }
++
++  //
++  // GICD_TYPER2 only exists from GICv4.1.  Reading zero is how a v3 device
++  // answers, and it keeps a v4.1-aware guest from probing further.
++  //
++  if (Typer2 == 0) {
++    VgicPass ("dist.typer2", "GICD_TYPER2 reads 0, i.e. no GICv4.1 features");
++  } else {
++    VgicFail ("dist.typer2", "GICD_TYPER2 = 0x%08x on a GICv3-only device", Typer2);
++  }
++
++  //
++  // The MSI window has to be inside the INTID space, or the firmware is
++  // describing interrupts the distributor cannot represent.
++  //
++  if ((VGIC_MSI_SPI_BASE + VGIC_MSI_VECTORS) <= NumIntIds) {
++    VgicPass (
++      "dist.msi-window",
++      "SPIs %u-%u fit inside %u INTIDs",
++      VGIC_MSI_SPI_BASE,
++      VGIC_MSI_SPI_BASE + VGIC_MSI_VECTORS - 1,
++      NumIntIds
++      );
++  } else {
++    VgicFail (
++      "dist.msi-window",
++      "MSI window ends at SPI %u, past the %u INTIDs the distributor describes",
++      VGIC_MSI_SPI_BASE + VGIC_MSI_VECTORS - 1,
++      NumIntIds
++      );
++  }
++
++  DEBUG ((DEBUG_INFO, "vgic: dist.TYPER = 0x%08x, GICD_IIDR = 0x%08x\n", Typer, MmioRead32 (Dist + GICD_IIDR)));
++}
++
++/**
++  Check GICD_CTLR as a guest sees it with a single security state.
++
++  The platform claims DS = 1, which means there is one security state and ARE
++  is permanently set.  This vGIC injects every virtual interrupt with
++  ICH_LR_GRP1 set, so the distributor's group enables and group register have
++  to agree with that delivery path, not merely with the table.
++**/
++STATIC
++VOID
++VgicCheckDistributorControl (
++  IN UINTN  Dist
++  )
++{
++  UINT32  Original;
++  UINT32  ReadBack;
++
++  Original = MmioRead32 (Dist + GICD_CTLR);
++
++  if ((Original & GICD_CTLR_DS) != 0) {
++    VgicPass ("dist.ds", "GICD_CTLR.DS = 1, single security state");
++  } else {
++    VgicFail ("dist.ds", "GICD_CTLR.DS = 0 but the machine has one security state");
++  }
++
++  if ((Original & GICD_CTLR_ARE) != 0) {
++    VgicPass ("dist.are", "GICD_CTLR.ARE = 1, affinity routing enabled");
++  } else {
++    VgicFail ("dist.are", "GICD_CTLR.ARE = 0: legacy routing is not modelled");
++  }
++
++  if ((Original & GICD_CTLR_ENABLEGRP1NS) != 0) {
++    VgicPass ("dist.grp1", "GICD_CTLR.EnableGrp1NS = 1");
++  } else {
++    VgicFail ("dist.grp1", "GICD_CTLR.EnableGrp1NS = 0 at self-test time");
++  }
++
++  //
++  // A guest may not be able to clear DS or ARE, and RWP must never be left set
++  // once the write has been applied: a guest that polls it would spin.
++  //
++  MmioWrite32 (Dist + GICD_CTLR, 0);
++  ReadBack = MmioRead32 (Dist + GICD_CTLR);
++
++  if (((ReadBack & GICD_CTLR_DS) != 0) && ((ReadBack & GICD_CTLR_ARE) != 0)) {
++    VgicPass ("dist.ds-are-forced", "a write of 0 leaves DS and ARE set (read back 0x%08x)", ReadBack);
++  } else {
++    VgicFail ("dist.ds-are-forced", "a write of 0 cleared DS or ARE (read back 0x%08x)", ReadBack);
++  }
++
++  if ((ReadBack & GICD_CTLR_RWP) == 0) {
++    VgicPass ("dist.rwp", "RWP reads 0 once the write has been applied");
++  } else {
++    VgicFail ("dist.rwp", "RWP is stuck at 1: a guest polling it would hang");
++  }
++
++  MmioWrite32 (Dist + GICD_CTLR, Original);
++  ReadBack = MmioRead32 (Dist + GICD_CTLR);
++  if (ReadBack == Original) {
++    VgicPass ("dist.restore", "GICD_CTLR restored to 0x%08x", Original);
++  } else {
++    VgicFail ("dist.restore", "GICD_CTLR reads 0x%08x after restoring 0x%08x", ReadBack, Original);
++  }
++}
++
++/**
++  Check the per-interrupt banks for one SPI.
++
++  A guest OS programs each SPI with an enable, a pending state, an active state
++  and a priority, and reads back what it wrote.  Each of those is a separate
++  banked register in the emulation, so each is checked separately.
++**/
++STATIC
++VOID
++VgicCheckSpiRegisters (
++  IN UINTN  Dist,
++  IN UINTN  IntId
++  )
++{
++  UINTN   Index;
++  UINT32  Bit;
++  UINT32  Value;
++  UINT32  OriginalGroup;
++  UINT32  OriginalPriority;
++  UINT32  Shift;
++  UINTN   GroupAddress;
++  UINTN   PriorityWord;
++
++  Index = IntId / 32;
++  Bit   = (UINT32)(1U << (IntId % 32));
++
++  //
++  // Group.  This vGIC has no Group 0 delivery path: every virtual interrupt is
++  // injected with ICH_LR_GRP1 set.  GICD_IGROUPR must therefore report Group 1
++  // for the SPIs it models.  GICD_CTLR.DS = 1 does not require this by itself
++  // (the architecture leaves the group bitmap writable in the single-security
++  // state), but a register that reads 0 would describe a Group 0 path that does
++  // not exist, and a guest that acted on it would wait for an interrupt the
++  // vGIC delivers as Group 1.
++  //
++  GroupAddress  = Dist + GICD_IGROUPR + (4 * Index);
++  OriginalGroup = MmioRead32 (GroupAddress);
++  if ((OriginalGroup & Bit) != 0) {
++    VgicPass ("dist.igroupr", "SPI %u reads as Group 1 under DS = 1", IntId);
++  } else {
++    VgicGap (
++      "dist.igroupr",
++      "SPI %u reads as Group 0 (IGROUPR = 0x%08x) although DS = 1 requires all ones",
++      IntId,
++      OriginalGroup
++      );
++  }
++
++  //
++  // Enable, clear, and read back after each write.
++  //
++  MmioWrite32 (Dist + GICD_ICENABLER + (4 * Index), Bit);
++  MmioWrite32 (Dist + GICD_ISENABLER + (4 * Index), Bit);
++  Value = MmioRead32 (Dist + GICD_ISENABLER + (4 * Index));
++  if ((Value & Bit) != 0) {
++    VgicPass ("dist.enable", "SPI %u is enabled after a write to ISENABLER", IntId);
++  } else {
++    VgicFail ("dist.enable", "ISENABLER read back 0x%08x after setting bit %u", Value, IntId % 32);
++  }
++
++  MmioWrite32 (Dist + GICD_ICENABLER + (4 * Index), Bit);
++  Value = MmioRead32 (Dist + GICD_ISENABLER + (4 * Index));
++  if ((Value & Bit) == 0) {
++    VgicPass ("dist.disable", "SPI %u is disabled after a write to ICENABLER", IntId);
++  } else {
++    VgicFail ("dist.disable", "ISENABLER read back 0x%08x after clearing bit %u", Value, IntId % 32);
++  }
++
++  //
++  // Pending state, set and cleared from software.
++  //
++  MmioWrite32 (Dist + GICD_ISPENDR + (4 * Index), Bit);
++  Value = MmioRead32 (Dist + GICD_ISPENDR + (4 * Index));
++  if ((Value & Bit) != 0) {
++    VgicPass ("dist.pending", "SPI %u is pending after a write to ISPENDR", IntId);
++  } else {
++    VgicFail ("dist.pending", "ISPENDR read back 0x%08x after setting bit %u", Value, IntId % 32);
++  }
++
++  MmioWrite32 (Dist + GICD_ICPENDR + (4 * Index), Bit);
++  Value = MmioRead32 (Dist + GICD_ISPENDR + (4 * Index));
++  if ((Value & Bit) == 0) {
++    VgicPass ("dist.unpending", "SPI %u is not pending after a write to ICPENDR", IntId);
++  } else {
++    VgicFail ("dist.unpending", "ISPENDR read back 0x%08x after clearing bit %u", Value, IntId % 32);
++  }
++
++  //
++  // Active state, set and cleared from software.
++  //
++  MmioWrite32 (Dist + GICD_ISACTIVER + (4 * Index), Bit);
++  Value = MmioRead32 (Dist + GICD_ISACTIVER + (4 * Index));
++  if ((Value & Bit) != 0) {
++    VgicPass ("dist.active", "SPI %u is active after a write to ISACTIVER", IntId);
++  } else {
++    VgicFail ("dist.active", "ISACTIVER read back 0x%08x after setting bit %u", Value, IntId % 32);
++  }
++
++  MmioWrite32 (Dist + GICD_ICACTIVER + (4 * Index), Bit);
++  Value = MmioRead32 (Dist + GICD_ISACTIVER + (4 * Index));
++  if ((Value & Bit) == 0) {
++    VgicPass ("dist.unactive", "SPI %u is not active after a write to ICACTIVER", IntId);
++  } else {
++    VgicFail ("dist.unactive", "ISACTIVER read back 0x%08x after clearing bit %u", Value, IntId % 32);
++  }
++
++  //
++  // Priority.  The register is byte-addressable, but the emulation decodes hook
++  // accesses at the width the instruction used, so a 32-bit read-modify-write
++  // checks the same property without depending on byte-access emulation.
++  //
++  Shift          = (UINT32)((IntId & 3) * 8);
++  PriorityWord   = Dist + GICD_IPRIORITYR + (IntId & ~3U);
++  OriginalPriority = MmioRead32 (PriorityWord);
++  MmioWrite32 (PriorityWord, (OriginalPriority & ~(0xFFU << Shift)) | (0xA5U << Shift));
++
++  Value = (MmioRead32 (PriorityWord) >> Shift) & 0xFF;
++  if (Value == 0xA5) {
++    VgicPass ("dist.priority", "SPI %u priority reads back 0xa5", IntId);
++  } else {
++    VgicFail ("dist.priority", "SPI %u priority read back 0x%02x, expected 0xa5", IntId, Value);
++  }
++
++  MmioWrite32 (PriorityWord, OriginalPriority);
++}
++
++/**
++  Replay the distributor teardown a Windows ARM64 HAL performs before it
++  installs any interrupt handler.
++
++  This group is reverse-engineered, not vendor-documented.  Connor McGarr's
++  public analysis of the Windows ARM64 HAL ("Windows ARM64 Internals: Pardon
++  The Interruption!") reports that nt!HalpGic3InitializeIoUnit, before it
++  enables anything, clears GICD_CTLR.EnableGrp1NS, writes 0xFFFFFFFF to every
++  GICD_ICENABLER<n> bank and zeroes every GICD_IROUTER<n>.  It is one report on
++  one GICv3 machine, not a Microsoft contract, and the article itself contains
++  at least one register-name error (it calls ICC_SRE_EL1 bit 1 the SRE bit;
++  SRE is bit 0).  Its value here is narrower and real: these are the bulk
++  writes a real HAL issues, and this vGIC has never been asked to absorb them.
++  A guest that stops in the middle of this sequence prints nothing.
++
++  Only the MSI window is replayed.  "0xFFFFFFFF to every bank" across the
++  whole distributor would also disable lines the firmware's own USB and PCIe
++  stack may be using, and the interesting half is the translated MSI window:
++  every one of those 256 INTIDs has to map back to an AIC number before it can
++  be masked and again before it can be unmasked.  That is the inverse
++  translation patch 0004 added, exercised at full width for the first time.
++**/
++STATIC
++VOID
++VgicCheckWindowsHalSequence (
++  IN UINTN  Dist
++  )
++{
++  UINT32   SavedCtlr;
++  UINT32   SavedEnable[VGIC_MSI_BANKS];
++  UINT64   SavedRouteFirst;
++  UINT64   SavedRouteLast;
++  UINT32   FirstBank;
++  UINT32   ReadBack;
++  UINTN    Index;
++  BOOLEAN  AllDisabled;
++  BOOLEAN  RoutesCleared;
++  BOOLEAN  Restored;
++
++  FirstBank = VGIC_MSI_SPI_BASE / 32;
++
++  SavedCtlr = MmioRead32 (Dist + GICD_CTLR);
++  for (Index = 0; Index < VGIC_MSI_BANKS; Index++) {
++    SavedEnable[Index] = MmioRead32 (Dist + GICD_ISENABLER + 4 * (FirstBank + Index));
++  }
++
++  SavedRouteFirst = MmioRead64 (Dist + GICD_IROUTER + 8 * VGIC_MSI_SPI_BASE);
++  SavedRouteLast  = MmioRead64 (
++                      Dist + GICD_IROUTER +
++                      8 * (VGIC_MSI_SPI_BASE + VGIC_MSI_VECTORS - 1)
++                      );
++
++  //
++  // 1. The HAL's temporary group disable.  It does not read the bit back, but
++  //    a device that refuses the write is not the register the guest thinks it
++  //    is programming.  Patch 0007 makes the injection path consult this bit;
++  //    the replay measures that the register accepts the write and that the
++  //    subsequent enable/disable traffic leaves the window restored.
++  //
++  MmioWrite32 (Dist + GICD_CTLR, SavedCtlr & ~GICD_CTLR_ENABLEGRP1NS);
++  ReadBack = MmioRead32 (Dist + GICD_CTLR);
++  if ((ReadBack & GICD_CTLR_ENABLEGRP1NS) == 0) {
++    VgicPass ("windows.grp1", "EnableGrp1NS cleared while the distributor is reconfigured");
++  } else {
++    VgicGap (
++      "windows.grp1",
++      "EnableGrp1NS stayed set after the HAL's clear (read 0x%08x)",
++      ReadBack
++      );
++  }
++
++  //
++  // 2. 0xFFFFFFFF to every ICENABLER bank in the MSI window.  Write-one-to-
++  //    clear semantics, 256 bits, each one translating to an AIC vector.
++  //
++  for (Index = 0; Index < VGIC_MSI_BANKS; Index++) {
++    MmioWrite32 (Dist + GICD_ICENABLER + 4 * (FirstBank + Index), 0xFFFFFFFF);
++  }
++
++  VgicWaitRegister (Dist + GICD_CTLR, GICD_CTLR_RWP, 0, VGIC_WAIT_REGISTER_US);
++
++  AllDisabled = TRUE;
++  for (Index = 0; Index < VGIC_MSI_BANKS; Index++) {
++    if (MmioRead32 (Dist + GICD_ISENABLER + 4 * (FirstBank + Index)) != 0) {
++      AllDisabled = FALSE;
++    }
++  }
++
++  if (AllDisabled) {
++    VgicPass (
++      "windows.icenabler",
++      "the HAL's 0xFFFFFFFF teardown disabled all %u MSI-window SPIs",
++      VGIC_MSI_VECTORS
++      );
++  } else {
++    VgicFail (
++      "windows.icenabler",
++      "the %u MSI-window SPIs did not all disable through GICD_ICENABLER",
++      VGIC_MSI_VECTORS
++      );
++  }
++
++  //
++  // 3. The HAL zeroes every IROUTER.  Zero is not a neutral value -- it names
++  //    the PE with affinity 0 -- but it has to be accepted, because the HAL
++  //    writes it before it has described any line.
++  //
++  MmioWrite64 (Dist + GICD_IROUTER + 8 * VGIC_MSI_SPI_BASE, 0);
++  MmioWrite64 (
++    Dist + GICD_IROUTER + 8 * (VGIC_MSI_SPI_BASE + VGIC_MSI_VECTORS - 1),
++    0
++    );
++  RoutesCleared =
++    (MmioRead64 (Dist + GICD_IROUTER + 8 * VGIC_MSI_SPI_BASE) == 0) &&
++    (MmioRead64 (Dist + GICD_IROUTER + 8 * (VGIC_MSI_SPI_BASE + VGIC_MSI_VECTORS - 1)) == 0);
++
++  if (RoutesCleared) {
++    VgicPass ("windows.irouter-zero", "a zeroed IROUTER reads back as zero");
++  } else {
++    VgicFail ("windows.irouter-zero", "a zeroed IROUTER did not read back as zero");
++  }
++
++  //
++  // Restore everything: enables, routes, then the control register last.
++  // Writing an enabler sets bits, so the saved value is exactly what is needed.
++  //
++  for (Index = 0; Index < VGIC_MSI_BANKS; Index++) {
++    MmioWrite32 (Dist + GICD_ISENABLER + 4 * (FirstBank + Index), SavedEnable[Index]);
++  }
++
++  MmioWrite64 (Dist + GICD_IROUTER + 8 * VGIC_MSI_SPI_BASE, SavedRouteFirst);
++  MmioWrite64 (
++    Dist + GICD_IROUTER + 8 * (VGIC_MSI_SPI_BASE + VGIC_MSI_VECTORS - 1),
++    SavedRouteLast
++    );
++  MmioWrite32 (Dist + GICD_CTLR, SavedCtlr);
++
++  Restored = MmioRead32 (Dist + GICD_CTLR) == SavedCtlr;
++  for (Index = 0; Index < VGIC_MSI_BANKS; Index++) {
++    if (MmioRead32 (Dist + GICD_ISENABLER + 4 * (FirstBank + Index)) != SavedEnable[Index]) {
++      Restored = FALSE;
++    }
++  }
++
++  if (Restored &&
++      (MmioRead64 (Dist + GICD_IROUTER + 8 * VGIC_MSI_SPI_BASE) == SavedRouteFirst) &&
++      (MmioRead64 (Dist + GICD_IROUTER + 8 * (VGIC_MSI_SPI_BASE + VGIC_MSI_VECTORS - 1)) == SavedRouteLast))
++  {
++    VgicPass ("windows.restore", "the MSI window and GICD_CTLR were restored after the replay");
++  } else {
++    VgicFail ("windows.restore", "the MSI window or GICD_CTLR changed state across the replay");
++  }
++}
++
++/**
++  Check GICD_IROUTER, including the No1N behaviour patch 0006 relies on.
++
++  A write of IRM = 1 is CONSTRAINED UNPREDICTABLE when No1N is set, and 0006
++  chooses the permitted reading "the field acts as if it were 0".  That has to
++  be true of the running device: a read-back that still says IRM = 1 would tell
++  a guest that distributor-side selection is in use.
++**/
++STATIC
++VOID
++VgicCheckIrouter (
++  IN UINTN    Dist,
++  IN UINTN    IntId,
++  IN UINT64   Mpidr,
++  IN BOOLEAN  HasOther,
++  IN UINT32   OtherAffinity
++  )
++{
++  UINTN   Address;
++  UINT64  Original;
++  UINT64  Affinity;
++  UINT64  ReadBack;
++
++  Address  = Dist + GICD_IROUTER + (8 * IntId);
++  Original = MmioRead64 (Address);
++
++  Affinity  = (UINT64)(Mpidr & 0xFF);
++  Affinity |= (UINT64)((Mpidr >> 8) & 0xFF) << 8;
++  Affinity |= (UINT64)((Mpidr >> 16) & 0xFF) << 16;
++
++  MmioWrite64 (Address, Affinity);
++  ReadBack = MmioRead64 (Address);
++  if ((ReadBack & ~GICD_IROUTER_IRM) == Affinity) {
++    VgicPass ("dist.irouter", "SPI %u routes to affinity 0x%06lx", IntId, Affinity);
++  } else {
++    VgicFail ("dist.irouter", "IROUTER read back 0x%016lx, expected 0x%06lx", ReadBack, Affinity);
++  }
++
++  MmioWrite64 (Address, Affinity | GICD_IROUTER_IRM);
++  ReadBack = MmioRead64 (Address);
++  if ((ReadBack & GICD_IROUTER_IRM) == 0) {
++    VgicPass ("dist.iroute-normalised", "a write of IRM = 1 reads back as IRM = 0");
++  } else {
++    VgicFail ("dist.iroute-normalised", "IRM survives a write although GICD_TYPER.No1N = 1");
++  }
++
++  //
++  // Affinity is recorded even though it cannot be honoured: the AIC decides
++  // which PE takes an SPI, so this value is a promise about bookkeeping, not
++  // about delivery.  Printing it makes the residual gap explicit rather than
++  // silent, and records that a cross-PE affinity does at least round-trip.
++  //
++  if (HasOther) {
++    MmioWrite64 (Address, OtherAffinity);
++    ReadBack = MmioRead64 (Address);
++    if ((ReadBack & ~GICD_IROUTER_IRM) == OtherAffinity) {
++      VgicGap (
++        "dist.irouter-affinity",
++        "SPI %u records affinity 0x%06x, but AICv3 picks the target PE and no software path can raise an SPI",
++        IntId,
++        OtherAffinity
++        );
++    } else {
++      VgicFail (
++        "dist.irouter-affinity",
++        "SPI %u did not retain a cross-PE affinity (read back 0x%016lx)",
++        IntId,
++        ReadBack
++        );
++    }
++  } else {
++    VgicSkip ("dist.irouter-affinity", "no other PE to route SPI %u to", IntId);
++  }
++
++  MmioWrite64 (Address, Original);
++}
++
++/**
++  Walk every redistributor frame and check its identity.
++
++  This is the part ArmGicV3Dxe does not do: it maps and wakes only the boot PE's
++  frame, so on this platform nothing has ever read the other nine.  A guest OS
++  walks all of them to match affinity, so a wrong TYPER here is a guest that
++  cannot find its own CPU.
++
++  The walk stops at GICR_TYPER.LAST, which is also the only safe stopping point:
++  a frame beyond the last one is not backed by the hypervisor's hook.
++**/
++STATIC
++UINTN
++VgicWalkRedistributors (
++  IN  UINTN     RedistBase,
++  IN  UINT32    CoreCount,
++  IN  UINT64    Mpidr,
++  OUT UINTN     *BootFrame,
++  OUT UINT16    ProcNum[],
++  OUT UINT32    Affinity[],
++  OUT BOOLEAN   *BootFrameFound
++  )
++{
++  UINTN    Index;
++  UINT64   Typer;
++  UINT64   AffinityValue;
++  UINT16   ProcNumber;
++  UINTN    Walked;
++  BOOLEAN  LastSeen;
++  BOOLEAN  Duplicate;
++  UINTN    Other;
++
++  Walked          = 0;
++  LastSeen        = FALSE;
++  *BootFrameFound = FALSE;
++  *BootFrame      = 0;
++
++  for (Index = 0; (Index < CoreCount) && (Index < VGIC_MAX_FRAMES); Index++) {
++    Typer = MmioRead64 (RedistBase + (Index * GICR_FRAME_SIZE) + GICR_TYPER);
++    Walked++;
++
++    AffinityValue = (Typer & GICR_TYPER_AFFINITY_MASK) >> 32;
++    ProcNumber    = (UINT16)((Typer & GICR_TYPER_PROCNUM_MASK) >> GICR_TYPER_PROCNUM_SHIFT);
++    Affinity[Index] = (UINT32)AffinityValue;
++    ProcNum[Index]  = ProcNumber;
++
++    if (AffinityValue == (UINT32)(Mpidr & 0xFFFFFFFF)) {
++      *BootFrameFound = TRUE;
++      *BootFrame      = Index;
++    }
++
++    if ((Typer & GICR_TYPER_LAST) != 0) {
++      LastSeen = TRUE;
++      break;
++    }
++  }
++
++  if (!LastSeen) {
++    VgicFail (
++      "redist.last",
++      "GICR_TYPER.LAST was not set in %u frames; a guest would walk past the end",
++      Walked
++      );
++  } else {
++    VgicPass ("redist.last", "GICR_TYPER.LAST set on frame %u of %u", Walked - 1, Walked);
++  }
++
++  //
++  // Every PE the firmware advertises has to have a frame, or the MADT and the
++  // device disagree about how many CPUs exist.
++  //
++  if (Walked != CoreCount) {
++    VgicFail ("redist.frames", "%u frames found for %u declared cores", Walked, CoreCount);
++  } else {
++    VgicPass ("redist.frames", "%u frames found for %u declared cores", Walked, CoreCount);
++  }
++
++  if (!*BootFrameFound) {
++    VgicFail (
++      "redist.affinity",
++      "no frame reports affinity 0x%08x, the MPIDR this PE is running on",
++      (UINT32)(Mpidr & 0xFFFFFFFF)
++      );
++  } else if (*BootFrame == 0) {
++    VgicPass ("redist.affinity", "frame 0 reports this PE's affinity 0x%08x", (UINT32)(Mpidr & 0xFFFFFFFF));
++  } else {
++    VgicPass (
++      "redist.affinity",
++      "frame %u reports this PE's affinity 0x%08x",
++      *BootFrame,
++      (UINT32)(Mpidr & 0xFFFFFFFF)
++      );
++  }
++
++  //
++  // Duplicate affinities would make a guest bind two redistributors to one PE.
++  //
++  Duplicate = FALSE;
++  for (Index = 0; Index < Walked; Index++) {
++    for (Other = 0; Other < Index; Other++) {
++      if (Affinity[Index] == Affinity[Other]) {
++        VgicFail (
++          "redist.affinity-unique",
++          "frames %u and %u both report affinity 0x%08x",
++          Other,
++          Index,
++          Affinity[Index]
++          );
++        Duplicate = TRUE;
++      }
++    }
++  }
++
++  if (!Duplicate) {
++    VgicPass ("redist.affinity-unique", "%u frames report %u distinct affinities", Walked, Walked);
++  }
++
++  //
++  // GICR_TYPER.Processor_Number is IMPLEMENTATION DEFINED, but an ITS uses it
++  // to identify a target, and a duplicate makes that ambiguous.  Uniqueness is
++  // the strongest statement that can be made without an ITS.
++  //
++  Duplicate = FALSE;
++  for (Index = 0; Index < Walked; Index++) {
++    for (Other = 0; Other < Index; Other++) {
++      if (ProcNum[Index] == ProcNum[Other]) {
++        VgicGap (
++          "redist.procnum-unique",
++          "frames %u and %u both report Processor_Number %u",
++          Other,
++          Index,
++          ProcNum[Index]
++          );
++        Duplicate = TRUE;
++      }
++    }
++  }
++
++  if (!Duplicate) {
++    VgicPass ("redist.procnum-unique", "Processor_Number is unique across %u frames", Walked);
++  }
++
++  //
++  // No frame may advertise an LPI or direct-LPI capability: there is no ITS and
++  // no LPI space, so a guest that believes one exists will program it and wait.
++  //
++  Duplicate = FALSE;
++  for (Index = 0; Index < Walked; Index++) {
++    Typer = MmioRead64 (RedistBase + (Index * GICR_FRAME_SIZE) + GICR_TYPER);
++
++    if ((Typer & (GICR_TYPER_VLPIS | GICR_TYPER_PLPIS | GICR_TYPER_DIRECTLPI | GICR_TYPER_DPGS)) != 0) {
++      VgicFail (
++        "redist.caps",
++        "frame %u advertises an LPI or DPG capability the vGIC does not implement (TYPER 0x%016lx)",
++        Index,
++        Typer
++        );
++      Duplicate = TRUE;
++    }
++  }
++
++  if (!Duplicate) {
++    VgicPass ("redist.caps", "no frame advertises VLPIS, PLPIS, DirectLPI or DPGS");
++  }
++
++  return Walked;
++}
++
++/**
++  Check GICR_CTLR and GICR_WAKER on every frame.
++
++  Waking a redistributor is exactly what a guest OS does before it can receive an
++  interrupt on that PE, and it is the sequence patch 0004 fixed: writing back the
++  value that was read used to leave ChildrenAsleep set for ever, so the guest's
++  poll never completed.  This performs the same read-modify-write a guest
++  performs, on every frame, and bounds the poll.
++**/
++STATIC
++VOID
++VgicCheckRedistributorFrames (
++  IN UINTN  RedistBase,
++  IN UINTN  FrameCount
++  )
++{
++  UINTN    Index;
++  UINTN    Base;
++  UINT32   Ctlr;
++  UINT32   Waker;
++  BOOLEAN  Bad;
++  BOOLEAN  Gapped;
++
++  if (FrameCount == 0) {
++    return;
++  }
++
++  Bad    = FALSE;
++  Gapped = FALSE;
++
++  for (Index = 0; Index < FrameCount; Index++) {
++    Base = RedistBase + (Index * GICR_FRAME_SIZE);
++
++    //
++    // GICR_CTLR: EnableLPIs is RAZ/WI, RWP must read 0 after a write, and the
++    // DPG bits are RES0 because DPGS is 0.
++    //
++    Ctlr = MmioRead32 (Base + GICR_CTLR);
++    MmioWrite32 (Base + GICR_CTLR, Ctlr | GICR_CTLR_RESERVED_WRITE_MASK);
++    Ctlr = MmioRead32 (Base + GICR_CTLR);
++
++    if ((Ctlr & GICR_CTLR_RESERVED_WRITE_MASK) != 0) {
++      VgicFail (
++        "redist.ctlr-razwi",
++        "frame %u kept a bit that must be RAZ/WI (CTLR = 0x%08x)",
++        Index,
++        Ctlr
++        );
++      Bad = TRUE;
++    }
++
++    //
++    // The guest's wake sequence: read, clear ProcessorSleep, write, poll
++    // ChildrenAsleep until it reads 0.
++    //
++    Waker = MmioRead32 (Base + GICR_WAKER);
++    MmioWrite32 (Base + GICR_WAKER, Waker & ~GICR_WAKER_PROCESSOR_SLEEP);
++    if (!VgicWaitRegister (Base + GICR_WAKER, GICR_WAKER_CHILDREN_ASLEEP, 0, VGIC_WAIT_REGISTER_US)) {
++      VgicFail (
++        "redist.waker-wake",
++        "frame %u kept ChildrenAsleep after ProcessorSleep was cleared (WAKER = 0x%08x)",
++        Index,
++        MmioRead32 (Base + GICR_WAKER)
++        );
++      Bad = TRUE;
++    }
++
++    //
++    // And back to sleep, which a guest does not normally do but which checks
++    // that the field is not stuck at zero.  Then leave the frame awake, because
++    // that is the state a guest expects to find it in.
++    //
++    Waker = MmioRead32 (Base + GICR_WAKER);
++    MmioWrite32 (Base + GICR_WAKER, Waker | GICR_WAKER_PROCESSOR_SLEEP);
++    if (!VgicWaitRegister (
++           Base + GICR_WAKER,
++           GICR_WAKER_PROCESSOR_SLEEP | GICR_WAKER_CHILDREN_ASLEEP,
++           GICR_WAKER_PROCESSOR_SLEEP | GICR_WAKER_CHILDREN_ASLEEP,
++           VGIC_WAIT_REGISTER_US
++           ))
++    {
++      VgicGap (
++        "redist.waker-sleep",
++        "frame %u did not report ProcessorSleep|ChildrenAsleep after ProcessorSleep was set (WAKER = 0x%08x)",
++        Index,
++        MmioRead32 (Base + GICR_WAKER)
++        );
++      Gapped = TRUE;
++    }
++
++    Waker = MmioRead32 (Base + GICR_WAKER);
++    MmioWrite32 (Base + GICR_WAKER, Waker & ~GICR_WAKER_PROCESSOR_SLEEP);
++    VgicWaitRegister (Base + GICR_WAKER, GICR_WAKER_CHILDREN_ASLEEP, 0, VGIC_WAIT_REGISTER_US);
++  }
++
++  if (!Bad) {
++    VgicPass (
++      "redist.ctlr-waker",
++      "%u frames accepted a guest wake within %u us and kept CTLR reserved bits clear",
++      FrameCount,
++      VGIC_WAIT_REGISTER_US
++      );
++  }
++
++  if (!Gapped && !Bad) {
++    VgicPass ("redist.waker-sleep", "every frame reports ProcessorSleep|ChildrenAsleep when set");
++  }
++}
++
++/**
++  Check the CPU interface as the guest sees it.
++**/
++STATIC
++VOID
++VgicCheckCpuInterface (
++  IN UINT32  VirtTimerIntId
++  )
++{
++  UINT64  Value;
++  UINT64  OriginalPmr;
++
++  Value = IccCtlr ();
++  if ((Value & (1ULL << 1)) == 0) {
++    VgicPass ("cpu.eoimode", "ICC_CTLR_EL1.EOImode = 0, combined priority drop and deactivate");
++  } else {
++    VgicGap ("cpu.eoimode", "ICC_CTLR_EL1.EOImode = 1; the vGIC assumes combined EOI");
++  }
++
++  Value = IccIgrpen1 ();
++  if ((Value & 0x1) != 0) {
++    VgicPass ("cpu.igrpen1", "ICC_IGRPEN1_EL1.EnableGrp1 = 1");
++  } else {
++    VgicFail ("cpu.igrpen1", "Group 1 is disabled at the CPU interface; no guest interrupt can be taken");
++  }
++
++  //
++  // PMR has to be writable, or the guest cannot mask by priority.
++  //
++  OriginalPmr = IccPmr ();
++  IccSetPmr (0xF0);
++  Value = IccPmr ();
++  IccSetPmr (OriginalPmr);
++
++  if (Value == 0xF0) {
++    VgicPass ("cpu.pmr", "ICC_PMR_EL1 is writable and read back 0xf0");
++  } else {
++    VgicFail ("cpu.pmr", "ICC_PMR_EL1 read back 0x%02lx after writing 0xf0", Value);
++  }
++
++  //
++  // Nothing is pending yet.  HPPIR1 is read-only, so asking it cannot consume an
++  // interrupt the way IAR1 would.
++  //
++  Value = IccHppir1 ();
++  if ((Value & 0xFFFFFF) == VGIC_SPURIOUS_INTID) {
++    VgicPass ("cpu.idle", "ICC_HPPIR1_EL1 reports 1023 before any test interrupt");
++  } else {
++    VgicGap (
++      "cpu.idle",
++      "ICC_HPPIR1_EL1 reports INTID %lu before any test interrupt was generated",
++      Value & 0xFFFFFF
++      );
++  }
++
++  DEBUG ((DEBUG_INFO, "vgic: cpu virt-timer PPI %u\n", VirtTimerIntId));
++}
++
++/**
++  Check the per-PE SGI/PPI bank semantics on one redistributor frame.
++
++  A guest does not read history from these registers: both halves of each
++  set/clear pair read back the current state.  That is what makes a guest able
++  to disable an interrupt and observe that it is disabled, and it is the part
++  of the redistributor Windows' HAL touches before it enables a line.  An
++  emulation that stores enable writes in its active bank, or that writes the
++  raw value to a write-1-to-set register, looks correct to a guest that only
++  writes and is wrong the moment the guest reads back.
++
++  Only the bits this test owns are changed, and they are restored before it
++  returns so a later driver sees the frame as it was.
++**/
++STATIC
++VOID
++VgicCheckRedistributorBanks (
++  IN UINTN  SgiBase,
++  IN UINTN  IntId
++  )
++{
++  UINT32  Bit;
++  UINT32  OriginalActive;
++  UINT32  OriginalEnable;
++  UINT32  OriginalGroup;
++  UINT32  OriginalPending;
++  UINT32  Value;
++
++  Bit             = (UINT32)(1U << IntId);
++  OriginalEnable  = MmioRead32 (SgiBase + GICR_SGI_ISENABLER);
++  OriginalPending = MmioRead32 (SgiBase + GICR_SGI_ISPENDR);
++  OriginalActive  = MmioRead32 (SgiBase + GICR_SGI_ISACTIVER);
++  OriginalGroup   = MmioRead32 (SgiBase + GICR_SGI_IGROUPR0);
++
++  //
++  // Enable: write-1-to-set, and a write of 0 must not clear it.
++  //
++  MmioWrite32 (SgiBase + GICR_SGI_ISENABLER, Bit);
++  Value = MmioRead32 (SgiBase + GICR_SGI_ISENABLER);
++  if ((Value & Bit) != 0) {
++    VgicPass ("redist.enable", "SGI %u is enabled after a write to GICR_ISENABLER0", IntId);
++  } else {
++    VgicFail ("redist.enable", "GICR_ISENABLER0 reads 0x%08x after setting bit %u", Value, IntId);
++  }
++
++  MmioWrite32 (SgiBase + GICR_SGI_ISENABLER, 0);
++  Value = MmioRead32 (SgiBase + GICR_SGI_ISENABLER);
++  if ((Value & Bit) != 0) {
++    VgicPass ("redist.enable-w0", "a write of 0 to GICR_ISENABLER0 leaves SGI %u enabled", IntId);
++  } else {
++    VgicFail ("redist.enable-w0", "a write of 0 to GICR_ISENABLER0 cleared SGI %u", IntId);
++  }
++
++  //
++  // Disable: write-1-to-clear, and both enable registers read the same state.
++  //
++  MmioWrite32 (SgiBase + GICR_SGI_ICENABLER, Bit);
++  Value = MmioRead32 (SgiBase + GICR_SGI_ISENABLER);
++  if ((Value & Bit) == 0) {
++    VgicPass ("redist.disable", "GICR_ICENABLER0 cleared SGI %u", IntId);
++  } else {
++    VgicFail ("redist.disable", "GICR_ISENABLER0 still reads bit %u after a write to GICR_ICENABLER0", IntId);
++  }
++
++  Value = MmioRead32 (SgiBase + GICR_SGI_ICENABLER);
++  if ((Value & Bit) == 0) {
++    VgicPass ("redist.disable-alias", "GICR_ICENABLER0 reads back the same enable state");
++  } else {
++    VgicFail ("redist.disable-alias", "GICR_ICENABLER0 reads 0x%08x after clearing bit %u", Value, IntId);
++  }
++
++  //
++  // Pending: set and cleared from software, and both aliases read the bitmap.
++  //
++  MmioWrite32 (SgiBase + GICR_SGI_ISPENDR, Bit);
++  Value = MmioRead32 (SgiBase + GICR_SGI_ISPENDR);
++  if ((Value & Bit) != 0) {
++    VgicPass ("redist.pending", "SGI %u is pending after a write to GICR_ISPENDR0", IntId);
++  } else {
++    VgicFail ("redist.pending", "GICR_ISPENDR0 reads 0x%08x after setting bit %u", Value, IntId);
++  }
++
++  Value = MmioRead32 (SgiBase + GICR_SGI_ICPENDR);
++  if ((Value & Bit) != 0) {
++    VgicPass ("redist.pending-alias", "GICR_ICPENDR0 reads back the pending bitmap");
++  } else {
++    VgicFail ("redist.pending-alias", "GICR_ICPENDR0 reads 0x%08x while bit %u is pending", Value, IntId);
++  }
++
++  MmioWrite32 (SgiBase + GICR_SGI_ICPENDR, Bit);
++  Value = MmioRead32 (SgiBase + GICR_SGI_ISPENDR);
++  if ((Value & Bit) == 0) {
++    VgicPass ("redist.unpending", "GICR_ICPENDR0 cleared the pending state of SGI %u", IntId);
++  } else {
++    VgicFail ("redist.unpending", "GICR_ISPENDR0 still reads bit %u after a write to GICR_ICPENDR0", IntId);
++  }
++
++  //
++  // Active: same pair, separate bank.  The old emulation confused this bank
++  // with the enable and pending ones, which is the defect this measures.
++  //
++  MmioWrite32 (SgiBase + GICR_SGI_ISACTIVER, Bit);
++  Value = MmioRead32 (SgiBase + GICR_SGI_ISACTIVER);
++  if ((Value & Bit) != 0) {
++    VgicPass ("redist.active", "SGI %u is active after a write to GICR_ISACTIVER0", IntId);
++  } else {
++    VgicFail ("redist.active", "GICR_ISACTIVER0 reads 0x%08x after setting bit %u", Value, IntId);
++  }
++
++  Value = MmioRead32 (SgiBase + GICR_SGI_ICACTIVER);
++  if ((Value & Bit) != 0) {
++    VgicPass ("redist.active-alias", "GICR_ICACTIVER0 reads back the active bitmap");
++  } else {
++    VgicFail ("redist.active-alias", "GICR_ICACTIVER0 reads 0x%08x while bit %u is active", Value, IntId);
++  }
++
++  MmioWrite32 (SgiBase + GICR_SGI_ICACTIVER, Bit);
++  Value = MmioRead32 (SgiBase + GICR_SGI_ISACTIVER);
++  if ((Value & Bit) == 0) {
++    VgicPass ("redist.deactivate", "GICR_ICACTIVER0 cleared the active state of SGI %u", IntId);
++  } else {
++    VgicFail ("redist.deactivate", "GICR_ISACTIVER0 still reads bit %u after a write to GICR_ICACTIVER0", IntId);
++  }
++
++  //
++  // Group.  Delivery is Group 1, so the SGI/PPI group register has to say so.
++  //
++  Value = MmioRead32 (SgiBase + GICR_SGI_IGROUPR0);
++  if ((Value & Bit) != 0) {
++    VgicPass ("redist.igroup", "SGI %u reads as Group 1, the group the vGIC delivers it as", IntId);
++  } else {
++    VgicFail (
++      "redist.igroup",
++      "SGI %u reads as Group 0 (GICR_IGROUPR0 = 0x%08x) while delivery sets ICH_LR_GRP1",
++      IntId,
++      Value
++      );
++  }
++
++  MmioWrite32 (SgiBase + GICR_SGI_IGROUPR0, 0);
++  Value = MmioRead32 (SgiBase + GICR_SGI_IGROUPR0);
++  if ((Value & Bit) != 0) {
++    VgicPass ("redist.igroup-forced", "a write selecting Group 0 is ignored: there is no Group 0 delivery path");
++  } else {
++    VgicGap (
++      "redist.igroup-forced",
++      "a write cleared the Group 1 bit, but delivery always injects ICH_LR_GRP1"
++      );
++  }
++
++  //
++  // Restore only the one bit this test owns.
++  //
++  MmioWrite32 (SgiBase + GICR_SGI_ICENABLER, Bit);
++  MmioWrite32 (SgiBase + GICR_SGI_ICPENDR, Bit);
++  MmioWrite32 (SgiBase + GICR_SGI_ICACTIVER, Bit);
++  if ((OriginalEnable & Bit) != 0) {
++    MmioWrite32 (SgiBase + GICR_SGI_ISENABLER, Bit);
++  }
++
++  if ((OriginalPending & Bit) != 0) {
++    MmioWrite32 (SgiBase + GICR_SGI_ISPENDR, Bit);
++  }
++
++  if ((OriginalActive & Bit) != 0) {
++    MmioWrite32 (SgiBase + GICR_SGI_ISACTIVER, Bit);
++  }
++
++  MmioWrite32 (SgiBase + GICR_SGI_IGROUPR0, OriginalGroup);
++}
++
++/**
++  Deliver a self-SGI through the real exception path.
++
++  ICC_SGI1R_EL1 traps to EL2, m1n1 queues the SGI and sends itself an Apple IPI,
++  the IPI's IRQ handler injects the SGI into a list register, and from there the
++  architected virtual CPU interface takes over: UEFI's IRQ vector reads
++  ICC_IAR1_EL1, calls the registered handler, and the handler writes
++  ICC_EOIR1_EL1.  If this works, the whole chain a guest OS depends on works.
++**/
++STATIC
++VOID
++VgicCheckSgiDelivery (
++  IN EFI_HARDWARE_INTERRUPT_PROTOCOL  *Interrupt,
++  IN UINT64                            Mpidr
++  )
++{
++  EFI_STATUS  Status;
++  UINTN       Round;
++  UINTN       Elapsed;
++  UINT64      Hppir;
++  BOOLEAN     Reclaimed;
++
++  Status = Interrupt->RegisterInterruptSource (Interrupt, VGIC_TEST_SGI, VgicTestHandler);
++  if (EFI_ERROR (Status)) {
++    VgicSkip ("delivery.sgi", "cannot register SGI %u: %r", VGIC_TEST_SGI, Status);
++    return;
++  }
++
++  for (Round = 1; Round <= 2; Round++) {
++    mIrqCount = 0;
++    IccSgi1r (VgicSelfSgi1r (Mpidr, VGIC_TEST_SGI));
++
++    if (VgicWaitCount (&mIrqCount, 1, VGIC_WAIT_IRQ_US)) {
++      VgicPass (
++        "delivery.sgi",
++        "self-SGI %u delivered as INTID %u on attempt %u",
++        VGIC_TEST_SGI,
++        (UINTN)mLastSource,
++        Round
++        );
++    } else {
++      VgicFail (
++        "delivery.sgi",
++        "self-SGI %u was not delivered within %u us on attempt %u",
++        VGIC_TEST_SGI,
++        VGIC_WAIT_IRQ_US,
++        Round
++        );
++      break;
++    }
++
++    //
++    // EOI has to reclaim the list register, or a second SGI has nowhere to go.
++    // Polling HPPIR1 until it reads spurious shows that happen without
++    // consuming an interrupt the way a read of IAR1 would.
++    //
++    Reclaimed = FALSE;
++    for (Elapsed = 0; Elapsed < VGIC_WAIT_IRQ_US; Elapsed += 100) {
++      Hppir = IccHppir1 ();
++      if ((Hppir & 0xFFFFFF) == VGIC_SPURIOUS_INTID) {
++        Reclaimed = TRUE;
++        break;
++      }
++
++      MicroSecondDelay (100);
++    }
++
++    if (Reclaimed) {
++      VgicPass ("delivery.sgi-eoi", "the list register was reclaimed after EOI (attempt %u)", Round);
++    } else {
++      VgicGap (
++        "delivery.sgi-eoi",
++        "INTID %lu is still the highest pending interrupt after EOI (attempt %u)",
++        IccHppir1 () & 0xFFFFFF,
++        Round
++        );
++    }
++  }
++
++  Interrupt->RegisterInterruptSource (Interrupt, VGIC_TEST_SGI, NULL);
++}
++
++/**
++  Measure whether the guest's enable bit gates delivery.
++
++  RegisterInterruptSource enables the source, so the only way to ask "does a
++  disabled INTID still arrive?" is to register a handler and then clear the bit
++  behind the protocol's back.  A conforming distributor drops the interrupt; a
++  model that injects from the physical interrupt without consulting
++  GICR_ISENABLER0 delivers it anyway.
++
++  The bit lives in the boot PE's SGI frame, which is not necessarily frame 0, so
++  the caller passes the frame the walk found for this PE.
++**/
++STATIC
++VOID
++VgicCheckSgiGating (
++  IN EFI_HARDWARE_INTERRUPT_PROTOCOL  *Interrupt,
++  IN UINT64                            Mpidr,
++  IN UINTN                             BootFrameBase
++  )
++{
++  EFI_STATUS  Status;
++  UINT32      Bit;
++
++  Status = Interrupt->RegisterInterruptSource (Interrupt, VGIC_TEST_SGI_2, VgicTestHandler);
++  if (EFI_ERROR (Status)) {
++    VgicSkip ("gating.sgi", "cannot register SGI %u: %r", VGIC_TEST_SGI_2, Status);
++    return;
++  }
++
++  Bit = (UINT32)(1U << VGIC_TEST_SGI_2);
++
++  MmioWrite32 (BootFrameBase + GICR_SGI_ICENABLER, Bit);
++  if ((MmioRead32 (BootFrameBase + GICR_SGI_ISENABLER) & Bit) != 0) {
++    VgicFail ("gating.sgi", "SGI %u could not be disabled in GICR_ISENABLER0", VGIC_TEST_SGI_2);
++  } else {
++    mIrqCount = 0;
++    IccSgi1r (VgicSelfSgi1r (Mpidr, VGIC_TEST_SGI_2));
++    VgicWaitCount (&mIrqCount, 1, VGIC_GATE_WINDOW_US);
++
++    if (mIrqCount == 0) {
++      VgicPass ("gating.sgi", "a disabled SGI %u was correctly not delivered", VGIC_TEST_SGI_2);
++    } else {
++      VgicGap (
++        "gating.sgi",
++        "a disabled SGI %u was delivered anyway: delivery ignores GICR_ISENABLER0",
++        VGIC_TEST_SGI_2
++        );
++    }
++  }
++
++  //
++  // Re-enable the bit without sending again.  The refused send above was
++  // queued inside the hypervisor, not dropped, so a vGIC that models pending
++  // state has to deliver it now.  A vGIC that consumed it leaves the guest
++  // waiting until some unrelated interrupt happens to arrive, which for an
++  // edge-triggered source can be never; this is the only probe that can tell
++  // the two apart.  The counter is cleared before the enabling write, because
++  // the delivery is expected to happen during that write (the hypervisor
++  // drains from the register handler, not from a timer).
++  //
++  mIrqCount = 0;
++  MmioWrite32 (BootFrameBase + GICR_SGI_ISENABLER, Bit);
++
++  if (VgicWaitCount (&mIrqCount, 1, VGIC_GATE_WINDOW_US)) {
++    VgicPass (
++      "gating.pending",
++      "an SGI %u sent while disabled was delivered when its bit was set",
++      VGIC_TEST_SGI_2
++      );
++  } else {
++    VgicFail (
++      "gating.pending",
++      "SGI %u sent while disabled was never delivered on enable: it was dropped "
++      "instead of staying pending",
++      VGIC_TEST_SGI_2
++      );
++  }
++
++  //
++  // Send again after the bit is set.  A gate that refused forever would be
++  // worse than no gate at all, and this is the failure a too-strict predicate
++  // produces: the bit is set, the guest is waiting, and nothing arrives.
++  //
++  mIrqCount = 0;
++  IccSgi1r (VgicSelfSgi1r (Mpidr, VGIC_TEST_SGI_2));
++
++  if (VgicWaitCount (&mIrqCount, 1, VGIC_GATE_WINDOW_US)) {
++    VgicPass ("gating.rearm", "SGI %u was delivered again after re-enabling its bit", VGIC_TEST_SGI_2);
++  } else {
++    VgicFail (
++      "gating.rearm",
++      "SGI %u stayed silent after GICR_ISENABLER0 was set again: the gate is too strict",
++      VGIC_TEST_SGI_2
++      );
++  }
++
++  //
++  // Unregistering disables the source again, so there is nothing else to
++  // restore: the enable bit was the only state this test changed.
++  //
++  Interrupt->RegisterInterruptSource (Interrupt, VGIC_TEST_SGI_2, NULL);
++}
++
++/**
++  Deliver the virtual timer PPI through m1n1's timer path and the architected
++  CPU interface.
++**/
++STATIC
++VOID
++VgicCheckPpiDelivery (
++  IN EFI_HARDWARE_INTERRUPT_PROTOCOL  *Interrupt,
++  IN UINT32                            VirtTimerIntId
++  )
++{
++  EFI_STATUS  Status;
++  UINT64      Frequency;
++  UINT32      Ticks;
++
++  Frequency = ArmReadCntFrq ();
++  if (Frequency == 0) {
++    VgicSkip ("delivery.ppi", "CNTFRQ_EL0 reads 0, cannot program the virtual timer");
++    return;
++  }
++
++  Status = Interrupt->RegisterInterruptSource (Interrupt, VirtTimerIntId, VgicTestHandler);
++  if (EFI_ERROR (Status)) {
++    VgicSkip ("delivery.ppi", "cannot register PPI %u: %r", VirtTimerIntId, Status);
++    return;
++  }
++
++  //
++  // 5 ms, in CNTV_TVAL_EL0 ticks.
++  //
++  Ticks = (UINT32)(Frequency / 200);
++
++  CntvSetCtl (0x2);           // IMASK = 1, ENABLE = 0
++  CntvSetTval (Ticks);
++  CntvSetCtl (0x1);           // ENABLE = 1, IMASK = 0
++
++  mIrqCount = 0;
++  if (VgicWaitCount (&mIrqCount, 1, VGIC_WAIT_IRQ_US)) {
++    VgicPass ("delivery.ppi", "virtual timer PPI %u delivered as INTID %u", VirtTimerIntId, (UINTN)mLastSource);
++  } else {
++    VgicFail (
++      "delivery.ppi",
++      "virtual timer PPI %u was not delivered within %u us",
++      VirtTimerIntId,
++      VGIC_WAIT_IRQ_US
++      );
++  }
++
++  CntvSetCtl (0x2);           // stop the timer again for TimerDxe
++  Interrupt->RegisterInterruptSource (Interrupt, VirtTimerIntId, NULL);
++}
++
++/**
++  Entry point.
++**/
++EFI_STATUS
++EFIAPI
++AppleVgicSelfTestInitialize (
++  IN EFI_HANDLE        ImageHandle,
++  IN EFI_SYSTEM_TABLE  *SystemTable
++  )
++{
++  EFI_STATUS                       Status;
++  EFI_CPU_ARCH_PROTOCOL            *Cpu;
++  EFI_HARDWARE_INTERRUPT_PROTOCOL  *Interrupt;
++  UINT64                           DistBase;
++  UINT64                           RedistBase;
++  UINT32                           CoreCount;
++  UINT32                           VirtTimerIntId;
++  UINT64                           Mpidr;
++  UINT32                           OtherAffinity;
++  BOOLEAN                          HasOther;
++  UINTN                            FrameCount;
++  UINTN                            BootFrame;
++  UINTN                            Index;
++  BOOLEAN                          BootFrameFound;
++  BOOLEAN                          InterruptsWereEnabled;
++  UINT16                           ProcNum[VGIC_MAX_FRAMES];
++  UINT32                           Affinity[VGIC_MAX_FRAMES];
++
++  DistBase       = PcdGet64 (PcdGicDistributorBase);
++  RedistBase     = PcdGet64 (PcdGicRedistributorsBase);
++  CoreCount      = PcdGet32 (PcdCoreCount);
++  VirtTimerIntId = PcdGet32 (PcdArmArchTimerVirtIntrNum);
++
++  DEBUG ((DEBUG_INFO, "\n"));
++  DEBUG ((DEBUG_INFO, "vgic: ===== vGIC conformance self-test =====\n"));
++
++  if ((DistBase == 0) || (RedistBase == 0)) {
++    VgicSkip ("setup", "no vGIC PCDs on this platform; nothing to test");
++    return EFI_SUCCESS;
++  }
++
++  Status = gBS->LocateProtocol (&gEfiCpuArchProtocolGuid, NULL, (VOID **)&Cpu);
++  if (EFI_ERROR (Status)) {
++    VgicSkip ("setup", "no CPU arch protocol: %r", Status);
++    return EFI_SUCCESS;
++  }
++
++  Status = gBS->LocateProtocol (&gHardwareInterruptProtocolGuid, NULL, (VOID **)&Interrupt);
++  if (EFI_ERROR (Status)) {
++    VgicSkip ("setup", "no hardware interrupt protocol: %r", Status);
++    return EFI_SUCCESS;
++  }
++
++  mInterrupt = Interrupt;
++
++  //
++  // Map the whole redistributor window, not just the boot PE's frame:
++  // ArmGicV3Dxe maps one frame and this test walks them all.  Both regions are
++  // in the platform's initial memory map (SIZE_64KB and SIZE_2MB), so this only
++  // changes attributes.
++  //
++  Status = Cpu->SetMemoryAttributes (Cpu, (UINTN)DistBase, SIZE_64KB, EFI_MEMORY_UC | EFI_MEMORY_XP);
++  if (EFI_ERROR (Status)) {
++    VgicSkip ("setup", "cannot map the distributor: %r", Status);
++    return EFI_SUCCESS;
++  }
++
++  Status = Cpu->SetMemoryAttributes (
++                  Cpu,
++                  (UINTN)RedistBase,
++                  (UINTN)CoreCount * GICR_FRAME_SIZE,
++                  EFI_MEMORY_UC | EFI_MEMORY_XP
++                  );
++  if (EFI_ERROR (Status)) {
++    VgicSkip ("setup", "cannot map %u redistributor frames: %r", CoreCount, Status);
++    return EFI_SUCCESS;
++  }
++
++  Mpidr         = ArmReadMpidr ();
++  OtherAffinity = 0;
++  HasOther      = FALSE;
++  BootFrame     = 0;
++
++  DEBUG ((
++    DEBUG_INFO,
++    "vgic: dist = 0x%lx, redist = 0x%lx, %u frames declared, boot MPIDR 0x%lx\n",
++    DistBase,
++    RedistBase,
++    CoreCount,
++    Mpidr
++    ));
++
++  VgicCheckDistributorCaps ((UINTN)DistBase);
++  VgicCheckDistributorControl ((UINTN)DistBase);
++  VgicCheckSpiRegisters ((UINTN)DistBase, VGIC_MSI_SPI_BASE);
++  VgicCheckWindowsHalSequence ((UINTN)DistBase);
++
++  FrameCount = VgicWalkRedistributors (
++                 (UINTN)RedistBase,
++                 CoreCount,
++                 Mpidr,
++                 &BootFrame,
++                 ProcNum,
++                 Affinity,
++                 &BootFrameFound
++                 );
++
++  //
++  // Pick a different PE for the affinity probe, if the device has one.
++  //
++  for (Index = 0; Index < FrameCount; Index++) {
++    if (Affinity[Index] != (UINT32)(Mpidr & 0xFFFFFFFF)) {
++      OtherAffinity = Affinity[Index];
++      HasOther      = TRUE;
++      break;
++    }
++  }
++
++  VgicCheckIrouter ((UINTN)DistBase, VGIC_MSI_SPI_BASE, Mpidr, HasOther, OtherAffinity);
++  VgicCheckRedistributorFrames ((UINTN)RedistBase, FrameCount);
++  VgicCheckRedistributorBanks (
++    (UINTN)RedistBase + (BootFrame * GICR_FRAME_SIZE),
++    VGIC_TEST_SGI_BANKS
++    );
++  VgicCheckCpuInterface (VirtTimerIntId);
++
++  //
++  // The delivery tests are the only part that needs PSTATE.I clear.  Restore
++  // whatever it was when this driver was entered.
++  //
++  InterruptsWereEnabled = ArmGetInterruptState ();
++  if (!InterruptsWereEnabled) {
++    ArmEnableInterrupts ();
++  }
++
++  VgicCheckSgiDelivery (Interrupt, Mpidr);
++  VgicCheckSgiGating (Interrupt, Mpidr, (UINTN)RedistBase + (BootFrame * GICR_FRAME_SIZE));
++  VgicCheckPpiDelivery (Interrupt, VirtTimerIntId);
++
++  if (!InterruptsWereEnabled) {
++    ArmDisableInterrupts ();
++  }
++
++  mInterrupt = NULL;
++
++  DEBUG ((DEBUG_INFO, "vgic: -----\n"));
++  DEBUG ((
++    DEBUG_INFO,
++    "vgic: totals: pass=%u fail=%u gap=%u skip=%u\n",
++    mPassed,
++    mFailed,
++    mGaps,
++    mSkipped
++    ));
++
++  if (mFailed != 0) {
++    DEBUG ((DEBUG_ERROR, "vgic: RESULT: FAIL\n"));
++  } else if (mGaps != 0) {
++    DEBUG ((DEBUG_ERROR, "vgic: RESULT: PASS-WITH-GAPS\n"));
++  } else {
++    DEBUG ((DEBUG_INFO, "vgic: RESULT: PASS\n"));
++  }
++
++  DEBUG ((DEBUG_INFO, "vgic: ===== end self-test =====\n\n"));
++
++  return EFI_SUCCESS;
++}
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.inf b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.inf
+new file mode 100644
+index 0000000..417e000
+--- /dev/null
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.inf
+@@ -0,0 +1,67 @@
++#
++#  Copyright (c) 2026, SiliconCamp contributors. All rights reserved.
++#
++#  Module Name:
++#    AppleVgicSelfTestDxe.inf
++#
++#  Abstract:
++#    Conformance self-test for the NTASP m1n1 vGIC that this platform's ACPI
++#    tables describe.  The firmware publishes a GICv3 distributor, ten
++#    redistributor frames and a GIC MSI Frame, but until this driver existed
++#    nothing in the image ever read them back.  A build that links is not a
++#    contract that holds; this driver walks the device the way a guest OS does,
++#    checks the properties the tables promise, and exercises real interrupt
++#    delivery through the architected CPU interface.
++#
++#    Every check either prints PASS, FAIL, GAP (a measured deviation from the
++#    architecture) or SKIP.  No check halts the boot: this runs before anything
++#    can be diagnosed, so a failure has to be loud and survivable.
++#
++#  Environment:
++#    UEFI Driver Execution Environment (DXE)
++#
++#  License:
++#    SPDX-License-Identifier: BSD-2-Clause-Patent
++#
++
++[Defines]
++  INF_VERSION                    = 0x0001001c
++  BASE_NAME                      = AppleVgicSelfTestDxe
++  FILE_GUID                      = 7b1f0a52-4c3e-4a8d-9f60-2d5c1e8b7a31
++  MODULE_TYPE                    = DXE_DRIVER
++  VERSION_STRING                 = 1.0
++  ENTRY_POINT                    = AppleVgicSelfTestInitialize
++
++[Sources]
++  AppleVgicSelfTestDxe.c
++
++[Packages]
++  MdePkg/MdePkg.dec
++  EmbeddedPkg/EmbeddedPkg.dec
++  ArmPkg/ArmPkg.dec
++  AppleSiliconPkg/AppleSiliconPkg.dec
++
++[LibraryClasses]
++  ArmLib
++  BaseLib
++  BaseMemoryLib
++  DebugLib
++  IoLib
++  PcdLib
++  PrintLib
++  TimerLib
++  UefiBootServicesTableLib
++  UefiDriverEntryPoint
++
++[Protocols]
++  gEfiCpuArchProtocolGuid          ## CONSUMES
++  gHardwareInterruptProtocolGuid   ## CONSUMES
++
++[Pcd]
++  gAppleSiliconPkgTokenSpaceGuid.PcdCoreCount
++  gArmTokenSpaceGuid.PcdGicDistributorBase
++  gArmTokenSpaceGuid.PcdGicRedistributorsBase
++  gArmTokenSpaceGuid.PcdArmArchTimerVirtIntrNum
++
++[Depex]
++  gEfiCpuArchProtocolGuid AND gHardwareInterruptProtocolGuid

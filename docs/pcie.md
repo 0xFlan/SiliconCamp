@@ -264,24 +264,39 @@ show up in a log:
 3. **Which CPU does the AIC target for those interrupts?** m1n1 unmasks but does
    not set the target; an MSI routed to a core that is not running would hang
    rather than drop.
-4. **Does Windows accept the GIC MSI Frame and ignore the absence of an IORT?**
-   Microsoft's own OpenVMM emits a GICv2m MSI frame for its aarch64 Windows
-   guests, which is why this path was chosen over an emulated ITS, but no IORT is
-   published yet and Windows' PCI stack may want one.
+4. **Does APCIE accept an MSI-X write addressed at the GIC MSI Frame?**
+   Microsoft's own OpenVMM documents that, on aarch64, "PCIe MSI/MSI-X
+   interrupts are routed through either a GICv3 ITS or a GICv2m MSI frame", and
+   that in the v2m case
+   "the MADT includes a GICv2m MSI frame entry" — so a Windows aarch64 guest is
+   expected to drive MSI through exactly the descriptor this platform publishes.
+   What is still unproven is the hardware half: whether an APCIE device, given an
+   MSI-X table entry whose address is the frame at `0xfffff000` and whose data is
+   the vector index, raises the AIC interrupt the hypervisor translated. That is
+   a property of Apple's controller, not of Windows, and the first device driver
+   that raises one is the experiment.
+   Source: <https://openvmm.dev/guide/reference/emulated/pcie/overview.html>.
 
 ## What is still missing
 
-1. **`_PRT` and IORT.** The DSDT has no `_PRT`, so nothing describes INTx
+1. **`_OSC` on `PCI0`.** Microsoft's OpenVMM guide is explicit that "Windows
+   requires _OSC to enable native hotplug", and its SSDT grants native PCIe
+   control per root complex. This DSDT has no `_OSC`, so Windows will not be
+   told it may use native PCIe hotplug, PME or AER even though the root bridge
+   supports them. It is not on the boot path — a device with MSI still enumerates
+   — but it belongs with `_PRT`/IORT rather than after the first driver.
+   Source: <https://openvmm.dev/guide/reference/emulated/pcie/overview.html>.
+2. **`_PRT` and IORT.** The DSDT has no `_PRT`, so nothing describes INTx
    routing, and no IORT describes the root complex or its ID mappings. Devices
    with MSI capability should not need `_PRT`, but a device that falls back to
    INTx has nothing to fall back to, and the IORT question above is unresolved.
-2. **The `apciec` root complexes.** Their ECAMs, bus ranges (0–128) and
+3. **The `apciec` root complexes.** Their ECAMs, bus ranges (0–128) and
    apertures need the same capture-then-wire treatment before Thunderbolt or
    USB4 devices can appear. `PCI0` describes only `apcie@B0000000`; the m1n1
    hand-off reports all of them, so the next capture session can fill in the
    rest. Their DARTs are already bypassed (`dart-apciec0`-`dart-apciec3`), so
    DMA is not the blocker there — the tables are.
-3. **One MSI window.** All APCIE controllers have to share one AIC base for the
+4. **One MSI window.** All APCIE controllers have to share one AIC base for the
    single MADT frame to be correct; `guest_msi.c` reports and refuses a
    controller whose `msi-vector-offset` differs instead of silently mapping it
    onto the wrong interrupts.

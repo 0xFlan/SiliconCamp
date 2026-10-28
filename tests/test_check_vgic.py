@@ -40,6 +40,7 @@ SOURCES = (
     "src/hv_vgic.c",
     "src/hv_vgic.h",
     "src/hv_exc.c",
+    "src/hv.h",
     "src/guest_msi.c",
     "src/guest_msi.h",
 )
@@ -173,6 +174,62 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertIn("FAIL", result.stdout)
 
 
+    def test_series_that_ignores_the_enable_bit_is_rejected(self) -> None:
+        tmp = self._mutated_series(
+            "0007-vgic-enable-gating.patch",
+            "if (!hv_vgic3_irq_enabled(vintid))",
+            "if (0)",
+        )
+        result = run_checker("--patches", tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refuses an INTID the guest has not enabled", result.stdout)
+
+    def test_series_that_writes_enables_into_the_active_bank_is_rejected(self) -> None:
+        tmp = self._mutated_series(
+            "0007-vgic-enable-gating.patch",
+            "gicr_isenabler0 |= *val;",
+            "gicr_isactiver0 |= *val;",
+        )
+        result = run_checker("--patches", tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GICR_ISENABLER0 is write-1-to-set", result.stdout)
+
+    def test_series_without_queue_deduplication_is_rejected(self) -> None:
+        # Without this, every timer tick or MSI while the guest has the INTID
+        # disabled enqueues another copy of the same vector.
+        tmp = self._mutated_series(
+            "0007-vgic-enable-gating.patch",
+            "bool virq_queue_push_unique(",
+            "bool virq_queue_push_dup(",
+        )
+        result = run_checker("--patches", tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the queue can report an INTID", result.stdout)
+
+    def test_series_that_never_drains_after_enabling_is_rejected(self) -> None:
+        # Queuing an interrupt the guest has disabled is only half the fix.  If
+        # nothing drains when the guest enables it, an edge-triggered source can
+        # stay pending until some unrelated interrupt happens to arrive.
+        tmp = self._mutated_series(
+            "0007-vgic-enable-gating.patch",
+            "if (newly_enabled)",
+            "if (0)",
+        )
+        result = run_checker("--patches", tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("enabling an SPI drains an interrupt", result.stdout)
+
+    def test_series_that_drops_the_pending_readback_is_rejected(self) -> None:
+        tmp = self._mutated_series(
+            "0007-vgic-enable-gating.patch",
+            "*val = distributor->gicd_interrupt_set_pending_regs[reg_num];",
+            "distributor->gicd_interrupt_set_pending_regs[reg_num];",
+        )
+        result = run_checker("--patches", tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GICD_ISPENDR reads back the pending bitmap", result.stdout)
+
+
 class PatchedTreeTests(unittest.TestCase):
     """The checker's structural pass, run against real patched sources."""
 
@@ -254,6 +311,78 @@ class PatchedTreeTests(unittest.TestCase):
         result = run_checker("--tree", tree)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not the CPU that took the fault", result.stdout)
+
+    def test_tree_that_ignores_the_enable_bit_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "if (!hv_vgic3_irq_enabled(vintid))\n        return false;",
+                     "if (0)\n        return false;")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("consults the guest's enable state", result.stdout)
+
+    def test_tree_that_confuses_the_enable_and_active_banks_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "sgi_region.gicr_isenabler0 |= *val;",
+                     "sgi_region.gicr_isactiver0 |= *val;")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ISENABLER0 sets its own bank", result.stdout)
+
+    def test_tree_that_queues_a_copy_per_timer_tick_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_exc.c",
+                     "virq_queue_push_unique(&PERCPU(timer_queue), &pending);",
+                     "virq_queue_push(&PERCPU(timer_queue), &pending);")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not enqueue a second copy", result.stdout)
+
+    def test_tree_that_never_drains_on_enable_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     """if (sgi_newly_enabled)
+                    hv_vgic3_drain_pending();""",
+                     """if (sgi_newly_enabled)
+                    (void)0;""")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("enabling an SGI/PPI drains a queued interrupt", result.stdout)
+
+    def test_tree_with_a_lock_free_dedupe_scan_is_rejected(self) -> None:
+        # Compaction moves entries in place; a lock-free scan can read a slot
+        # mid-copy, report a false positive, and drop a real interrupt.
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.h",
+                     """    spin_lock(&q->p_lock);
+
+    bool found = false;""",
+                     """    bool found = false;""")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dedupe test and the insert share one critical section", result.stdout)
+
+    def test_tree_that_stops_the_drain_at_a_disabled_entry_is_rejected(self) -> None:
+        # The pre-drain code broke out of the queue loop on the first refused
+        # injection, which would let one disabled INTID block every interrupt
+        # behind it.
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_exc.c",
+                     "kept++;",
+                     "break;")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not stop the pass", result.stdout)
+
+    def test_tree_that_drops_the_pending_readback_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     "*val = distributor->gicd_interrupt_set_pending_regs[reg_num];",
+                     "distributor->gicd_interrupt_set_pending_regs[reg_num];")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("returns the pending bitmap", result.stdout)
 
     def test_verbatim_waker_store_is_rejected(self) -> None:
         # Storing the write verbatim leaves ChildrenAsleep set, so a conforming

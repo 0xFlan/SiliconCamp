@@ -149,9 +149,50 @@ makes it one a strict guest can drive:
   and Apple's hardware never writes `GITS_TRANSLATER`;
 - `GICD_ICENABLER` masks and `GICD_ISENABLER` unmasks.
 
+`0007` closes the delivery half of that contract. `hv_vgic3_irq_enabled()` is the
+single predicate behind `hv_vgic3_inject_irq()`: an INTID is delivered only if
+`GICD_CTLR.EnableGrp1` is set, and its bit is set in the taking PE's
+`GICR_ISENABLER0` (INTIDs below 32) or in its `GICD_ISENABLER` bank. Every caller
+keeps the interrupt queued when the predicate refuses it. The drain compacts
+instead of popping the head, so a disabled INTID stays pending without blocking
+the entries behind it, and enabling an INTID — `GICR_ISENABLER0`, a
+`GICD_ISENABLER` bank, or `GICD_CTLR.EnableGrp1` — drains the queue at that
+write. Waiting for the next unrelated interrupt would leave an edge-triggered
+source silent indefinitely. Queuing is one `virq_queue_push_unique()` critical
+section, not a "is it queued?" test followed by a separate push: two CPUs can
+send the same SGI to one target at once, and the GIC has one pending bit per
+INTID, so both enqueuing would deliver an interrupt the guest never asked for.
+
+The split is the one upstream KVM uses. `struct vgic_irq` keeps `pending_latch`
+independently of `enabled`, `vgic_target_oracle()` refuses to route an interrupt
+that is not both pending and enabled, and `vgic_mmio_write_senable()` re-runs
+`vgic_queue_irq_unlock()` on the enable write — so a latched edge survives a
+disable and is queued when the guest enables it, without a second edge. This
+vGIC has no per-INTID state array, so the queues are its `pending_latch`, and the
+drain is the equivalent of `vgic_queue_irq_unlock()`. Unlike KVM's global-enable
+path, which only kicks vCPUs that already have an entry on an AP list, the vGIC
+also drains on `GICD_CTLR.EnableGrp1`; it has no other retry path that would find
+a queued interrupt whose group was off.
+
+One limit follows from the queues being per-CPU. An enable written into
+*another* PE's redistributor frame drains the writer's queues, not that PE's,
+and an SPI enabled on a CPU other than the one holding the queued interrupt has
+the same problem. KVM kicks the target vCPU from the enable handler; this vGIC
+does not send a cross-CPU IPI on an MMIO write, because the firmware and the
+self-test only enable their own frame, and an untested broadcast from inside the
+trap handler is a worse risk before the first hardware log. In that case the
+interrupt is delivered when the owning CPU next drains, exactly the event the
+pre-`0007` code waited for. The
+redistributor's `ISENABLER0`/`ICENABLER0`, `ISPENDR0`/`ICPENDR0` and
+`ISACTIVER0`/`ICACTIVER0` pairs now keep their own state and mirror it, so either
+alias reads the same bitmap; before `0007` the enable and pending handlers wrote
+the active bank, and `GICR_ICENABLER0` cleared nothing. `GICD_IGROUPR` and
+`GICR_IGROUPR0` report Group 1 because every injection sets `ICH_LR_GRP1`.
+
 `scripts/check-vgic.py` asserts all of it, against the patch series and against
 patched sources; `docs/next-steps.md` explains why the firmware could not have
-caught any of it.
+caught any of it, and `scripts/check-gicv3-oracle.py` checks the read-backs
+against QEMU's independent GICv3 model rather than against another comment.
 
 `0006` answers the capability question `0004` left open. `GICD_TYPER.No1N` is
 now 1: the distributor does not perform 1-of-N selection, so a guest must name a

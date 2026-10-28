@@ -31,6 +31,13 @@ jobs:
       - name: vGIC guest contract
         run: ./scripts/check-vgic.py
 
+      # The self-test runs before Windows and reads the emulated controller back,
+      # so a mistake in it is a stopped boot rather than a wrong answer. The
+      # checker pins the properties that make that safe: bounded waits, no ASSERT
+      # or dead loop, a handler that EOIs, and register offsets the vGIC models.
+      - name: vGIC conformance self-test
+        run: ./scripts/check-vgic-selftest.py
+
       - name: Python syntax
         run: python3 -m py_compile scripts/*.py tests/*.py
 
@@ -70,6 +77,9 @@ jobs:
       # compared with the m1n1 sources they were ported from.
       - name: Apply the firmware platform patch
         run: ./scripts/apply-ntasp-patches.sh
+
+      - name: vGIC conformance self-test on the patched firmware tree
+        run: ./scripts/check-vgic-selftest.py --tree third_party/ntasp-firmware
 
       # The ANS driver is a port of m1n1's nvme.c/asc.c/sart.c/rtkit.c.  Every
       # register offset and bit position in it is compared against those files,

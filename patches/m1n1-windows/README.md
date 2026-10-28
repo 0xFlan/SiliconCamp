@@ -1,6 +1,6 @@
 # m1n1-windows patches
 
-Six patches apply to the NTASP `m1n1_windows` commit pinned by this
+Seven patches apply to the NTASP `m1n1_windows` commit pinned by this
 repository. They are cumulative (each assumes every earlier one), so the order
 below is part of the contract, and `verify-patches.sh` applies the whole series,
 in order, to one pristine worktree:
@@ -13,6 +13,7 @@ in order, to one pristine worktree:
 | `0004-vgic-guest-contract.patch` | `src/hv_vgic.c`, `src/hv_vgic.h`, `src/hv_exc.c`, `src/guest_msi.c`, `src/guest_msi.h` | Makes the emulated distributor and redistributors behave the way a GICv3 guest is entitled to assume: decode each redistributor frame from its address instead of the faulting CPU, complete `GICR_WAKER` wake sequences, never leave `RWP` set, stop advertising LPI capabilities nothing implements, and translate every guest INTID into an AIC number before masking it, unmasking it, or routing it. |
 | `0005-vgic-diagnostics.patch` | `src/hv_vgic.c` | Takes the UART write off the interrupt-controller hot path: the per-access trace becomes a 64-entry ring buffer plus counters in a global, and only genuinely exceptional events print, through a 32-line budget. Without this, a guest that programs ~1020 SPIs stalls for minutes in `printf()`, which looks exactly like a hang in the vGIC. |
 | `0006-vgic-honest-spi-routing.patch` | `src/hv_vgic.c`, `src/hv_vgic.h` | Sets `GICD_TYPER.No1N` so the distributor does not claim 1-of-N SPI selection it never performs, treats a `GICD_IROUTER.IRM` write of 1 as 0 (the behaviour the architecture permits when `No1N` is set), and keeps bit 31 out of the stored routing value so read-back cannot report a mode that never runs. |
+| `0007-vgic-enable-gating.patch` | `src/hv_vgic.c`, `src/hv_vgic.h`, `src/hv_exc.c` | Makes delivery obey the guest's enable state (`GICD_CTLR.EnableGrp1`, `GICR_ISENABLER0`, `GICD_ISENABLER`), keeps a refused interrupt queued instead of dropping it, and repairs the redistributor's SGI-frame bank handlers, which kept enable and pending state in the active bank. Also makes `GICD_ISPENDR` read back and reports the Group 1 that delivery implements. |
 
 ## Why 0002 is not optional on M4
 
@@ -255,6 +256,77 @@ where interrupts actually land.
 `scripts/check-vgic.py` fails if a later patch drops `No1N`, accepts `IRM`
 without normalising it, or stores the raw routing value.
 
+## Why 0007 exists
+
+The UEFI self-test (patch `0003` of the firmware series) measured three deviations
+from the architecture, and all three were in the delivery path rather than in a
+capability bit:
+
+1. `gating.sgi` — a self-SGI whose `GICR_ISENABLER0` bit was clear was still
+   delivered.
+2. The virtual timer PPI behaved the same way: the injection path never read the
+   distributor's group enables or the per-interrupt enable.
+3. `GICD_IGROUPR` read 0 under `DS = 1`, describing Group 0 delivery that the
+   hypervisor does not implement (every list register is written with
+   `ICH_LR_GRP1`).
+
+While implementing the first one, reading the redistributor handlers made a
+larger defect visible: `GICR_ISENABLER0`, `GICR_ICENABLER0`, `GICR_ISPENDR0` and
+`GICR_ICPENDR0` all read and wrote `gicr_isactiver0`/`gicr_icactiver0`. Enable
+state was therefore stored in the active bank, and `GICR_ICENABLER0` never
+cleared the enable bit at all. A guest that only writes cannot see this; a guest
+that reads back — which Windows' HAL does — reads the wrong state immediately.
+The same handlers also stored the raw write to `ISENABLER0`, so a write of 0
+silently cleared lines that were already enabled. `GICD_ISPENDR` had a `;` where
+it should have had `*val =`, so a read returned whatever the value register held.
+
+None of this is guesswork about what a guest expects. Arm IHI 0069 defines both
+aliases of each set/clear pair as reading the current state, and QEMU's GICv3
+model agrees; `scripts/check-gicv3-oracle.py` drives that model over qtest and
+asserts 26 of these read-backs. `AppleVgicSelfTestDxe` gained
+`VgicCheckRedistributorBanks`, which measures the same properties on the device,
+including the write-of-zero case that distinguishes write-1-to-set from a raw
+store.
+
+Group state needed a policy rather than a decode. With `GICD_CTLR.DS = 1` the
+architecture leaves `GICD_IGROUPR` writable and does **not** force Group 1; a
+register that read 0 would be telling the guest the line is Group 0 while the
+injection path delivers it with `ICH_LR_GRP1`. Since there is no Group 0 delivery
+path, the emulation now reports Group 1 for modelled SPIs and ignores a write
+that tries to select Group 0. That is a limitation stated in the register, not a
+capability claimed without an implementation.
+
+Refusing an injection is only safe if the interrupt survives the refusal, and
+the first version of the gate did not do that properly. A queue that stopped at
+its first refused entry would let one disabled INTID block every interrupt
+behind it — a disabled SGI 0 starving SGI 1, for example — and a queued
+interrupt was only retried when some later, unrelated interrupt happened to
+drain the queue. An edge-triggered source could therefore stay pending forever
+after the guest enabled it. The drain now compacts the queue, keeping the
+refused entries in order while delivering the rest, and the vGIC register paths
+call it when the guest enables an INTID in `GICR_ISENABLER0`, in a
+`GICD_ISENABLER` bank, or when `GICD_CTLR.EnableGrp1` turns on. The firmware
+probe `gating.pending` measures exactly this: it sends an SGI while the bit is
+clear, sets the bit, and waits without resending.
+
+A refusal must also not multiply. The first version tested `virq_queue_contains()`
+and then called `virq_queue_push()` as two critical sections, so two CPUs sending
+the same SGI to one target could both see an empty queue and enqueue the vector
+twice. A GIC has one pending bit per INTID; delivering two interrupts for it is
+a behaviour the guest never asked for. `virq_queue_push_unique()` scans and
+inserts under one lock, so the duplicate cannot be created in the first place.
+
+What 0007 deliberately does not do is make `GICR_ISPENDR0` raise an interrupt.
+It is modelled as pending state, which is what a guest reads back; this vGIC
+raises guest interrupts from `ICC_SGI1R_EL1` and the AIC. `docs/vgic-selftest.md`
+records that gap next to the probe that measures the read-back.
+
+`scripts/check-vgic.py` fails if the gate is removed, if a bank handler writes
+enable or pending state into the active bank, if `GICR_ISENABLER0` becomes a raw
+store again, if the drain stops at a refused entry, if enabling an INTID stops
+draining the queue, or if an enqueue site separates the duplicate test from the
+insert.
+
 ## The SMC trace
 
 `hv_handle_smc()` used to print the PSCI function ID on every guest SMC. That is
@@ -267,7 +339,7 @@ bring-up. It is now behind `DEBUG_PSCI_SMC` (off by default); define it in
 
 ```bash
 ./scripts/apply-patches.sh          # the whole series, idempotent
-./scripts/verify-patches.sh         # applies 0001-0006 in order to a clean worktree of the pin
+./scripts/verify-patches.sh         # applies 0001-0007 in order to a clean worktree of the pin
 ./scripts/check-vgic.py             # asserts the vGIC contract against the series
 ```
 
@@ -287,7 +359,7 @@ diff against the commit:
 TMP=$(mktemp -d)
 git -C third_party/m1n1-windows worktree add --detach "$TMP/tree" HEAD
 for p in 0001-vgic-m4-topology 0002-psci-t8132 0003-pcie-guest-handoff \
-         0004-vgic-guest-contract 0005-vgic-diagnostics; do
+         0004-vgic-guest-contract 0005-vgic-diagnostics 0006-vgic-honest-spi-routing; do
     git -C "$TMP/tree" apply "$PWD/patches/m1n1-windows/$p.patch"
 done
 # make the base a commit, so the diff below contains only this patch
@@ -296,7 +368,7 @@ git -C "$TMP/tree" -c user.email=build@local -c user.name=build commit -qm base
 
 # copy the files this patch owns out of the working tree, then:
 git -C "$TMP/tree" add -A
-git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0006-vgic-honest-spi-routing.patch
+git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0007-vgic-enable-gating.patch
 ```
 
 Skipping the base commit is the mistake that silently produces a 1000-line patch
@@ -311,6 +383,6 @@ diff -r --exclude=.git --exclude=build --exclude='*.o' \
 Then run `./scripts/verify-patches.sh`, `./scripts/check-vgic.py --tree
 third_party/m1n1-windows`, and rebuild with `./scripts/build-m1n1.sh`. As a
 reproducibility check, the series as committed builds
-`m1n1.macho` = `222b6f9bf8e8…` and `m1n1.bin` = `c59b4f143f48…` (SHA-256),
-the same bytes as the working tree it was generated from.
+`m1n1.macho` = `a5636c6de757…` and `m1n1.bin` = `06247d0eb94b…` (SHA-256),
+the same bytes as the working tree it was generated from (checked 2026-10-28).
 
