@@ -85,14 +85,18 @@ Windows Installer, Reserve Space, Safety, Review and Install — and shows this
 Mac, the pinned image hashes, the read-only diagnostics, the boot chain and the
 five blockers.
 
-Two steps are real. The installer step validates a Windows 11 Arm64 ISO, erases
-and formats the destination as one FAT32 partition, copies the setup files
-(splitting an `install.wim` over 4 GiB with wimlib), strips the macOS metadata
-the FAT driver adds, and reads every file back. It writes to an external USB
-disk or to a disk image, never to the internal SSD. The space step measures the
-live APFS container and plans the BOOTCAMP partition; the resize itself is
-disabled until Windows can boot, because holding that space would cost the user
-capacity for an installation that cannot start.
+Three steps are real. The installer step validates a Windows 11 Arm64 ISO
+(including the PE machine type of `BOOTAA64.EFI`), erases and formats the
+destination as one FAT32 partition, copies the setup files (splitting an
+`install.wim` over 4 GiB with wimlib), strips the macOS metadata the FAT driver
+adds, writes an `Autounattend.xml` that accepts the licence and bypasses the
+TPM, Secure Boot and RAM checks, and reads every file back. It writes to an
+external USB disk or to a disk image, never to the internal SSD. The space step
+measures the live APFS container and contains the real shrink / FAT32
+partition / restore engine, which rehearses end to end on a throwaway APFS
+image from the page. The internal resize is disabled until Windows can boot,
+because holding that space would cost the user capacity for an installation
+that cannot start.
 
 The Install control is disabled for the same reason, and the walkthrough says
 so instead of offering an install that cannot work. The native app starts or
@@ -137,7 +141,7 @@ third_party/ntasp-drivers/   Windows drivers/HAL extensions (currently empty)
 - The M4 PSCI patch adds the T8132 power-domain tree (two clusters, 6E+4P), the T8132 PMGR CPU-start offset, ADT bounds and core-count checks, and normalises the ADT's MPIDR encoding to Aff1:Aff0. Before it, `hv_psci_init()` had no `T8132` case and passed an unset topology pointer to `psci_num_clusters = topology_tree[1]`.
 - `src/pcie_guest.c` (patch 0003) does not hard-code device paths: it walks the ADT for `apcie`/`apcie-ge` controllers and `dart,*apcie*` DARTs, prints everything it finds (ECAM, `#ports`, MSI address/vector-offset/count), and refuses to run DART bypass halfway — a stream that is locked or ignores the write makes the hand-off fail loudly instead of leaving a device that silently cannot DMA. `HV_QUIESCE_PCIE` in `config.h` restores upstream's `pcie_shutdown()` for a guest that owns the controllers.
 - The per-SMC PSCI trace is compiled out by default (`DEBUG_PSCI_SMC` in `config.h` turns it on), so the guest's timing is not distorted by a UART write on every PSCI call.
-- The assistant's installer-media engine is real and tested end to end on disk images: it validates a Windows Arm64 ISO, writes one MBR FAT32 partition, splits an oversized `install.wim`, strips macOS's AppleDouble files, and reads every file back. It refuses an internal or non-USB disk, and a physical erase needs a per-run token and a second confirmation. Its space plan is measured from `diskutil apfs list`, not estimated.
+- The assistant's installer-media engine is real and tested end to end on disk images: it validates a Windows Arm64 ISO and the PE machine type of its boot application, writes one MBR FAT32 partition, splits an oversized `install.wim`, strips macOS's AppleDouble files, writes and re-validates `Autounattend.xml`, and reads every file back. It refuses an internal or non-USB disk, and a physical erase needs a per-run token and a second confirmation. Its space plan is measured from `diskutil apfs list`, not estimated, and its allocation engine runs the complete `diskutil apfs resizeContainer` / `addPartition` / erase-and-restore sequence on a throwaway APFS image (`rehearse_space`). It refuses the container that holds `/` while `BOOT_PATH_READY` is false.
 
 ## What is still missing
 
@@ -145,7 +149,7 @@ third_party/ntasp-drivers/   Windows drivers/HAL extensions (currently empty)
 2. A hardware run of the vGIC conformance self-test: the contract fixes above are arguments about what a strict guest does, and the firmware never exercised them. `AppleVgicSelfTestDxe` (patch `0003`) turns them into observations: it walks every redistributor frame, wakes each frame with a bounded poll, checks both `RWP` bits and the capability bits, drives the banked SPI registers, and delivers a self-SGI and the timer PPI through the real exception path. It is in the image and is machine-checked offline (`docs/vgic-selftest.md`), but nothing has executed it on the M4. The gaps it was expected to report — a disabled SGI and PPI still delivered, and `GICD_IGROUPR` reading 0 — are closed by `0007`, so the first run should report `[PASS]` for those, including `gating.pending`: an SGI sent while disabled has to arrive when the bit is set, without being sent again; `gating.group1` and `gating.group1-pending` measure the same rule against the distributor's Group 1 enable. The remaining stated limitations are listed in `docs/vgic-selftest.md`.
 3. PCIe and storage: the host bridge, page tables, MCFG and `PCI0` `_CRS` use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus `0x80000000` → host `0xb80000000`) and prefetch window (`0xbc0000000`); the m1n1 hand-off maps them into the guest and bypasses the APCIE DARTs; and MSI is wired from the MADT GIC MSI Frame through the APCIE port maps to the guest's INTID window. None of that has run on hardware. The four `apciec` complexes are not described, `_PRT`/IORT are absent, and the internal ANS2 SSD's UEFI driver has not run. USB storage is the current install path. See `docs/pcie.md`.
 4. Validation of the MSI window on hardware: the port map offset, the meaning of `msi-vector-offset`, the AIC target CPU, and whether an APCIE device actually raises the AIC interrupt from an MSI-X write to the frame are all unproven (`docs/pcie.md` lists them in the order a first boot will expose them; OpenVMM documents that a Windows aarch64 guest drives MSI through a GICv2m frame, so the guest side is the documented one).
-5. A working Windows loader-to-kernel handoff (the central unsolved bug, even on M1/M2). The assistant can build the installer media and size the partition, but it cannot install or boot Windows, and it does not resize the internal disk until that handoff works.
+5. A working Windows loader-to-kernel handoff (the central unsolved bug, even on M1/M2). The assistant can build the installer media, write the Setup answer file and rehearse the partition engine, but it cannot install or boot Windows, and it does not resize the internal disk until that handoff works.
 6. Windows drivers: ANS NVMe (the UEFI driver is the reference now), DART, PCIe, DCP display, SPI input, SMC, USB, Wi-Fi/Bluetooth.
 7. A Windows AGX GPU driver.
 8. Platform trust: Secure Boot, TPM 2.0, VBS/HVCI, IOMMU, driver signing, anti-cheat certification.

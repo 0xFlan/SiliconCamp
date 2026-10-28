@@ -49,6 +49,16 @@ HAVE_DISK_TOOLS = (
 )
 
 
+def pe_image(machine: int = 0xAA64) -> bytes:
+    """The smallest bytes `pe_machine` needs: MZ, e_lfanew, PE signature, machine."""
+    data = bytearray(0x120)
+    data[0:2] = b"MZ"
+    data[0x3C:0x40] = (0x40).to_bytes(4, "little")
+    data[0x40:0x44] = b"PE\0\0"
+    data[0x44:0x46] = machine.to_bytes(2, "little")
+    return bytes(data)
+
+
 def find_free_port() -> int:
     import socket
 
@@ -175,7 +185,7 @@ class MediaPayloadTests(unittest.TestCase):
     def payload_tree(self, root: pathlib.Path, install_bytes: int = 4096) -> None:
         (root / "efi" / "boot").mkdir(parents=True, exist_ok=True)
         (root / "sources").mkdir(parents=True, exist_ok=True)
-        (root / "efi" / "boot" / "bootaa64.efi").write_bytes(b"MZ" + b"\0" * 64)
+        (root / "efi" / "boot" / "bootaa64.efi").write_bytes(pe_image())
         (root / "sources" / "boot.wim").write_bytes(b"w" * 1024)
         with (root / "sources" / "install.wim").open("wb") as handle:
             handle.truncate(install_bytes)
@@ -247,6 +257,26 @@ class MediaPayloadTests(unittest.TestCase):
                 with self.assertRaises(self.media.MediaError) as caught:
                     self.media.scan_payload(root)
             self.assertIn("case", str(caught.exception))
+
+    def test_an_x64_boot_application_is_refused(self) -> None:
+        # A file named BOOTAA64.EFI is not proof of an Arm64 image; writing an
+        # x64 chainloader would fail in firmware long after the disk was erased.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.payload_tree(root)
+            (root / "efi" / "boot" / "bootaa64.efi").write_bytes(pe_image(0x8664))
+            with self.assertRaises(self.media.MediaError) as caught:
+                self.media.scan_payload(root)
+            self.assertIn("not Arm64", str(caught.exception))
+
+    def test_a_file_that_is_not_a_pe_image_is_reported_as_such(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.payload_tree(root)
+            (root / "efi" / "boot" / "bootaa64.efi").write_bytes(b"not an executable")
+            with self.assertRaises(self.media.MediaError) as caught:
+                self.media.scan_payload(root)
+            self.assertIn("not a PE image", str(caught.exception))
 
     def test_an_install_wim_over_fat32_needs_splitting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -341,7 +371,7 @@ class MediaImageTests(unittest.TestCase):
         (root / "efi" / "boot").mkdir(parents=True, exist_ok=True)
         (root / "sources").mkdir(parents=True, exist_ok=True)
         (root / "boot").mkdir(parents=True, exist_ok=True)
-        (root / "efi" / "boot" / "bootaa64.efi").write_bytes(b"MZ" + os.urandom(512))
+        (root / "efi" / "boot" / "bootaa64.efi").write_bytes(pe_image())
         (root / "sources" / "boot.wim").write_bytes(os.urandom(32 * 1024))
         (root / "boot" / "BCD").write_bytes(os.urandom(4096))
         with (root / "sources" / "install.wim").open("wb") as handle:
@@ -366,6 +396,8 @@ class MediaImageTests(unittest.TestCase):
             self.assertTrue(report["verified"]["ok"])
             self.assertEqual(report["verified"]["missing"], [])
             self.assertEqual(report["verified"]["mismatched"], [])
+            self.assertTrue(report["unattend"]["validated"])
+            self.assertEqual(report["unattend"]["path"], "Autounattend.xml")
             self.assertTrue(image.exists())
             self.assertTrue(any("verified" in line for line in events))
 
@@ -378,6 +410,9 @@ class MediaImageTests(unittest.TestCase):
                 self.assertTrue((base / "efi" / "boot" / "bootaa64.efi").is_file())
                 self.assertTrue((base / "sources" / "boot.wim").is_file())
                 self.assertTrue((base / "sources" / "install.wim").is_file())
+                answer = (base / "Autounattend.xml").read_text(encoding="utf-8")
+                self.assertEqual(self.media.validate_unattend(answer), [])
+                self.assertIn("BypassTPMCheck", answer)
                 stray = [
                     path.name
                     for path in base.rglob("*")
@@ -560,6 +595,107 @@ class AllocationTests(unittest.TestCase):
         self.assertLessEqual(stats["max_bytes"], stats["free"])
 
 
+class UnattendTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.media = load_module("siliconcamp_media_unattend", TOOL / "media.py")
+
+    def test_the_generated_answer_file_is_usable(self) -> None:
+        text = self.media.render_unattend()
+        self.assertEqual(self.media.validate_unattend(text), [])
+        self.assertIn('processorArchitecture="arm64"', text)
+        for gate in self.media.LAB_GATES:
+            self.assertIn(gate, text)
+        self.assertIn("<AcceptEula>true</AcceptEula>", text)
+
+    def test_the_locale_is_configurable(self) -> None:
+        text = self.media.render_unattend(locale="en-GB")
+        self.assertEqual(self.media.validate_unattend(text), [])
+        self.assertIn("<UILanguage>en-GB</UILanguage>", text)
+
+    def test_a_disk_configuration_is_rejected(self) -> None:
+        # A fixed disk number on a machine with several disks could format the
+        # wrong volume; the answer file must never carry one.
+        text = self.media.render_unattend().replace(
+            "<UserData>", "<DiskConfiguration><WillShowUI>OnError</WillShowUI></DiskConfiguration><UserData>"
+        )
+        problems = self.media.validate_unattend(text)
+        self.assertTrue(any("configures a disk" in problem for problem in problems))
+
+    def test_an_image_install_target_is_rejected(self) -> None:
+        text = self.media.render_unattend().replace(
+            "<UserData>", "<ImageInstall><OSImage /></ImageInstall><UserData>"
+        )
+        problems = self.media.validate_unattend(text)
+        self.assertTrue(any("install target" in problem for problem in problems))
+
+    def test_a_missing_eula_or_gate_is_reported(self) -> None:
+        text = self.media.render_unattend().replace("<AcceptEula>true</AcceptEula>", "")
+        self.assertTrue(any("EULA" in problem for problem in self.media.validate_unattend(text)))
+        text = self.media.render_unattend().replace("BypassTPMCheck /t", "Ignored /t")
+        self.assertTrue(
+            any("BypassTPMCheck" in problem for problem in self.media.validate_unattend(text))
+        )
+
+    def test_malformed_xml_is_reported_not_raised(self) -> None:
+        problems = self.media.validate_unattend("<unattend>")
+        self.assertTrue(problems)
+        self.assertIn("well-formed", problems[0])
+
+
+class AllocationWriteTests(unittest.TestCase):
+    """The resize engine, without touching the internal disk."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.allocation = load_module("siliconcamp_allocation_write", TOOL / "allocation.py")
+
+    def test_an_apply_needs_an_explicit_confirmation(self) -> None:
+        if not HAVE_DISK_TOOLS:
+            self.skipTest("needs diskutil")
+        with self.assertRaises(self.allocation.AllocationError) as caught:
+            self.allocation.apply_space(64)
+        self.assertIn("confirm=True", str(caught.exception))
+
+    def test_the_container_holding_root_is_refused_until_windows_boots(self) -> None:
+        if not HAVE_DISK_TOOLS:
+            self.skipTest("needs diskutil")
+        stats = self.allocation.read_host_space()
+        before = self.allocation.container_info(stats["container"])["capacity"]
+        with self.assertRaises(self.allocation.AllocationError) as caught:
+            self.allocation.apply_space(
+                64, container=stats["container"], confirm=True, log=lambda _: None
+            )
+        self.assertIn("never reached the kernel", str(caught.exception))
+        after = self.allocation.container_info(stats["container"])["capacity"]
+        self.assertEqual(before, after)
+
+    def test_the_rehearsal_image_accounts_for_the_macos_reserve(self) -> None:
+        # A 64 GB rehearsal on a 72 GB image would be refused by the same
+        # reserve the internal disk uses, and the rehearsal must not cheat.
+        self.assertGreaterEqual(
+            self.allocation.rehearsal_size(64), (64 + self.allocation.RESERVE_GB) * 10**9
+        )
+        self.assertGreater(self.allocation.rehearsal_size(300), 300 * 10**9)
+
+    @unittest.skipUnless(HAVE_DISK_TOOLS, "needs hdiutil and diskutil")
+    def test_a_full_resize_and_restore_rehearsal_passes(self) -> None:
+        notes: list[str] = []
+        result = self.allocation.rehearse_space(64, log=notes.append)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["requested_gb"], 64)
+        self.assertTrue(result["created"]["bytes"] >= 63 * 10**9)
+        # The partition is really mounted as FAT32 under its Boot Camp name.
+        self.assertEqual(result["created"]["volume"], "BOOTCAMP")
+        self.assertEqual(result["created"]["mount"], "/Volumes/BOOTCAMP")
+        # Remove must give every byte back: the container is the same size.
+        self.assertEqual(result["restored"]["container_after"], result["created"]["container_before"])
+        self.assertFalse(pathlib.Path(result["image"]).exists())
+        self.assertTrue(any("rehearsal passed" in line for line in notes))
+        # No rehearsal partition is left on the machine.
+        self.assertFalse(pathlib.Path("/Volumes/BOOTCAMP").exists())
+
+
 class ServerWriteGuardTests(unittest.TestCase):
     """The loopback server must not be drivable by another web page."""
 
@@ -610,6 +746,20 @@ class ServerWriteGuardTests(unittest.TestCase):
         )
         self.assertEqual(status, 403)
         self.assertIn("cross-origin", payload["error"])
+
+    def test_the_rehearsal_needs_the_token(self) -> None:
+        status, payload = self.post("/api/allocation/rehearse", {"gb": 64})
+        self.assertEqual(status, 403)
+        self.assertIn("token", payload["error"])
+
+    def test_a_rehearsal_below_the_windows_minimum_is_refused(self) -> None:
+        status, payload = self.post(
+            "/api/allocation/rehearse",
+            {"gb": 32},
+            headers={"X-SiliconCamp-Token": self.server_module.TOKEN},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("at least 64", payload["error"])
 
     def test_an_unknown_destination_kind_is_rejected(self) -> None:
         status, payload = self.post(

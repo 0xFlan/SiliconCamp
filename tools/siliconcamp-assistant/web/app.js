@@ -29,6 +29,8 @@
     iso: "",
     job: null,
     jobTimer: null,
+    spaceJob: null,
+    spaceTimer: null,
     armed: "",
     busy: false,
     current: 0,
@@ -132,7 +134,7 @@
         return "A new disk image will be created, written and verified.";
       }
       case "allocation":
-        return "This step measures only; the internal disk is not changed.";
+        return "The internal disk is not changed; the rehearsal runs the real commands on a throwaway image.";
       case "safety": {
         const checked = Array.from(document.querySelectorAll("[data-gate]")).filter(
           (box) => box.checked
@@ -684,11 +686,15 @@
       }
       state.allocation = payload;
       renderSpaceFacts(payload.stats);
-      const low = Math.min(payload.stats.minimum_gb, payload.stats.max_gb || payload.stats.minimum_gb);
-      slider.min = String(Math.max(1, low));
-      slider.max = String(Math.max(slider.min, payload.stats.max_gb || payload.default_gb));
+      // Windows' own minimum is the floor, even when the Mac cannot meet it:
+      // the slider must not offer a size Windows refuses, and the plan box then
+      // explains the shortfall instead of showing a different number.
+      const floor = payload.stats.minimum_gb;
+      const ceiling = Math.max(floor, payload.stats.max_gb || payload.default_gb);
+      slider.min = String(floor);
+      slider.max = String(ceiling);
       slider.step = "1";
-      slider.disabled = false;
+      slider.disabled = payload.stats.max_gb < floor;
       slider.value = String(payload.default_gb);
       renderSpacePlan(payload.plan);
       if (state.current === activeSteps().findIndex((s) => s.id === "allocation")) {
@@ -721,7 +727,8 @@
     const apply = $("#allocate");
     apply.disabled = !plan.apply.enabled;
     $("#allocate-reason").textContent = plan.apply.reason || "";
-    $("#space-state").textContent = "";
+    $("#rehearse-space").disabled = !plan.fit || Boolean(state.spaceJob);
+    if (!state.spaceJob) $("#space-state").textContent = "";
   }
 
   async function planSpace() {
@@ -740,6 +747,88 @@
       renderSpacePlan(plan);
     } catch (error) {
       $("#space-plan").replaceChildren(el("p", "plan-block", `Cannot plan: ${error}`));
+    }
+  }
+
+  function appendSpaceLog(line) {
+    const log = $("#space-log");
+    const wasHidden = log.hidden;
+    log.hidden = false;
+    log.textContent += `${line}\n`;
+    log.scrollTop = log.scrollHeight;
+    if (wasHidden) log.scrollIntoView({ block: "nearest" });
+  }
+
+  function endRehearsal(label, kind) {
+    if (state.spaceTimer) clearTimeout(state.spaceTimer);
+    state.spaceTimer = null;
+    state.spaceJob = null;
+    $("#space-state").textContent = label;
+    $("#space-state").className = `status-text ${kind}`;
+    $("#rehearse-space").disabled = !state.spacePlan?.fit;
+  }
+
+  async function rehearseSpace() {
+    if (state.spaceJob) return;
+    const gb = Number($("#space-slider").value);
+    $("#space-log").textContent = "";
+    $("#space-log").hidden = false;
+    $("#space-state").textContent = "Rehearsing";
+    $("#space-state").className = "status-text warn";
+    $("#rehearse-space").disabled = true;
+    try {
+      const response = await fetch("/api/allocation/rehearse", {
+        method: "POST",
+        headers: writeHeaders(),
+        body: JSON.stringify({ gb }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        appendSpaceLog(`error: ${payload.error || response.statusText}`);
+        endRehearsal("Refused", "bad");
+        return;
+      }
+      state.spaceJob = { id: payload.job, seen: 0 };
+      pollSpaceJob();
+    } catch (error) {
+      appendSpaceLog(`cannot reach the assistant: ${error}`);
+      endRehearsal("Offline", "bad");
+    }
+  }
+
+  async function pollSpaceJob() {
+    const job = state.spaceJob;
+    if (!job) return;
+    try {
+      const response = await fetch(`/api/jobs/${job.id}`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        appendSpaceLog(payload.error || "the job disappeared");
+        endRehearsal("Failed", "bad");
+        return;
+      }
+      for (const line of payload.notes.slice(job.seen)) appendSpaceLog(line);
+      state.spaceJob = { id: payload.id, seen: payload.notes.length };
+      if (payload.state === "running") {
+        state.spaceTimer = setTimeout(pollSpaceJob, 700);
+        return;
+      }
+      if (payload.state === "done") {
+        const created = payload.result?.created;
+        const restored = payload.result?.restored;
+        appendSpaceLog(
+          created && restored
+            ? `done in ${payload.seconds}s: ${created.mount || created.device} was created ` +
+              `and removed; the container returned to ${formatBytes(restored.container_after)}`
+            : `done in ${payload.seconds}s`
+        );
+        endRehearsal("Rehearsed", "ok");
+      } else {
+        endRehearsal("Failed", "bad");
+      }
+    } catch (error) {
+      appendSpaceLog(`lost contact with the assistant: ${error}`);
+      endRehearsal("Failed", "bad");
     }
   }
 
@@ -859,6 +948,7 @@
     $("#space-value").textContent = formatGib(Number($("#space-slider").value));
   });
   $("#space-slider").addEventListener("change", planSpace);
+  $("#rehearse-space").addEventListener("click", rehearseSpace);
 
   renderStepList();
   load();
