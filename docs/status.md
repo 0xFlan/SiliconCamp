@@ -21,10 +21,10 @@ firmware `18000.161.10`.
 | m1n1 PCIe hand-off | `src/pcie_guest.c` maps ECAM + BAR windows into stage 2 and bypasses every APCIE DART, verifying each stream by read-back |
 | m1n1 guest MSI | `src/guest_msi.c` programs all 256 port MSIMAP entries with read-back, unmasks AIC 1506–1761, and `hv_vgic3_guest_vintid()` maps them to INTIDs 512–767; the firmware advertises the same window as a MADT GIC MSI Frame |
 | Patch integrity | the m1n1-windows series (0001-0007) and the firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-28); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from (`a5636c6d…` / `06247d0e…`, checked 2026-10-28); the firmware platform patch reproduces every file it owns, including the MADT MSI frame. `0003-vgic-selftest.patch` is verified as a continuation of `0001` in the same cumulative worktree, because it edits files `0001` creates |
-| NTASP M4 UEFI build | success, 30 MB `MAC16_3_EFI.fd`, rebuilt 2026-10-28 with the `gating.pending` probe. `artifacts/` still documents release `v0.8.0`, which predates patch `0007` and that probe |
+| NTASP M4 UEFI build | success, 30 MB `MAC16_3_EFI.fd`, rebuilt 2026-10-28 with the `gating.pending` and `gating.group1` probes. `artifacts/` documents release `v0.9.0`, which carries patch `0007` and both enable-gate probes |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 128 pass (`python3 -m unittest discover -s tests`), including 31 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect, 22 that mutate the self-test series or tree and require `check-vgic-selftest.py` to reject it, and 5 for the GICv3 oracle |
-| vGIC conformance self-test | `AppleVgicSelfTestDxe` is linked into the DXE FV and placed before `TimerDxe`; `scripts/check-vgic-selftest.py` passes in both modes (87 checks against the patch series, 86 against the patched tree) and the build script fails if the module is missing. Never executed on hardware |
+| Checker regression tests | 131 pass (`python3 -m unittest discover -s tests`), including 31 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect, 25 that mutate the self-test series or tree and require `check-vgic-selftest.py` to reject it, and 5 for the GICv3 oracle |
+| vGIC conformance self-test | `AppleVgicSelfTestDxe` is linked into the DXE FV and placed before `TimerDxe`; `scripts/check-vgic-selftest.py` passes in both modes (94 checks against the patch series, 93 against the patched tree) and the build script fails if the module is missing. Never executed on hardware |
 | GICv3 reference oracle | `scripts/check-gicv3-oracle.py` drives QEMU 11.1.2's GICv3 model over qtest, with no guest, and passes 26 probes: the set/clear bank aliases read back the same state, a write of 0 to `GICR_ISENABLER0` is ignored, `GICD_IGROUPR` is writable under `DS=1` rather than RAZ/WI, `GICD_CTLR.DS`/`ARE` cannot be cleared, and a redistributor wake completes. Local-only; skips when QEMU is absent |
 | M4 ACPI tables | disassembled and checked (below) |
 | MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
@@ -124,8 +124,10 @@ disabled cannot block the interrupts behind it, and enabling an INTID — in
 the queues at that write. Without the drain, an edge-triggered interrupt that
 arrived while disabled would stay pending until some unrelated interrupt
 happened to arrive; `gating.pending` in the self-test is the probe that measures
-it. The redistributor's set/clear pairs also stopped sharing the active bank,
-and `GICD_IGROUPR` reports the Group 1 that delivery implements. Queuing is a
+it. `gating.group1` and `gating.group1-pending` measure the other half of that
+predicate, the distributor's Group 1 enable. The redistributor's set/clear pairs
+also stopped sharing the active bank, and `GICD_IGROUPR` reports the Group 1
+that delivery implements. Queuing is a
 single `virq_queue_push_unique()` critical section rather than a separate
 "is it queued?" test followed by a push, so two CPUs sending the same SGI to one
 target cannot both enqueue it; the GIC has one pending bit per INTID.
@@ -175,7 +177,7 @@ correct.
 | M4 USB path | Prepared, untested | Four DWC3 controllers are described by `PcdAppleNumDwc3Controllers`; the low 1 GB MMIO window (USB and USB DARTs) is mapped. The DWC3/XHCI stack still needs hardware validation. |
 | NTASP AIC DXE | Partial | AICv1/v2; AICv3 is an explicit TODO. The M4 package uses the vGIC path. |
 | NTASP Windows drivers | Empty | Repository is README-only. |
-| vGIC conformance self-test | In the image, untested | `AppleVgicSelfTestDxe` in the DXE FV before `TimerDxe`, gated on `AIC_BUILD == FALSE`. Walks every redistributor frame, performs the wake sequence, checks capability bits and `RWP`, drives SPI 512's banked registers, measures the SGI/PPI set/clear banks on the boot PE, and delivers a self-SGI and the virtual timer PPI through the hardware interrupt protocol. It also measures that an SGI refused while disabled is still delivered when the bit is set, without resending. 87 offline checks pin bounded waits, EOI, the modelled register set, the enable gate in both directions, the Windows HAL replay and boot order. Never executed on hardware; with `0007` applied the previously predicted gaps should be `[PASS]` lines. |
+| vGIC conformance self-test | In the image, untested | `AppleVgicSelfTestDxe` in the DXE FV before `TimerDxe`, gated on `AIC_BUILD == FALSE`. Walks every redistributor frame, performs the wake sequence, checks capability bits and `RWP`, drives SPI 512's banked registers, measures the SGI/PPI set/clear banks on the boot PE, and delivers a self-SGI and the virtual timer PPI through the hardware interrupt protocol. It also measures that an SGI refused while disabled is still delivered when the bit is set, without resending. 94 offline checks pin bounded waits, EOI, the modelled register set, both halves of the enable gate in both directions, the Windows HAL replay and boot order. Never executed on hardware; with `0007` applied the previously predicted gaps should be `[PASS]` lines. |
 | Internal NVMe/ANS2 | Driver written, untested | `AppleNANDStorageDxe` boots the ANS coprocessor (ASC mailbox, RTKit handshake, SART windows), programs the NVMMU/NVMe queues, runs Identify and publishes `EFI_BLOCK_IO_PROTOCOL`. 36 KB DXE module, linked into the FV, 110 hardware constants checked against m1n1 on every CI run. Never executed on hardware; see `docs/ans2.md`. |
 | Windows kernel boot | Not achieved | Existing project hangs at loader-to-kernel handoff even on M1/M2. |
 | AGX GPU driver | None | No WDDM/D3D driver for any Apple Silicon GPU. |
@@ -192,8 +194,8 @@ correct.
    PPI through the real exception path. The checker proves it cannot hang, dead
    loop or touch an unmodelled register; only the M4 can prove the device it
    describes (`docs/vgic-selftest.md`). With `0007` applied, no `[GAP ]` is
-   expected from the enable gate: `gating.sgi`, `gating.pending` and
-   `gating.rearm` should all be `[PASS]`. The stated gaps that remain are
+   expected from the enable gate: `gating.sgi`, `gating.pending`, `gating.rearm`,
+   `gating.group1` and `gating.group1-pending` should all be `[PASS]`. The stated gaps that remain are
    `GICR_ISPENDR0` being state rather than a trigger, Group 0 delivery, and SPI
    affinity (`docs/vgic-selftest.md`).
 3. **PCIe and storage.** The host bridge, page tables, MCFG and `PCI0` `_CRS`

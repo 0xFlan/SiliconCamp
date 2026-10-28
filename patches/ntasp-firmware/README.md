@@ -50,6 +50,9 @@ self-test, and wires it into the image:
   measured in both directions, including the case that separates a vGIC which
   keeps a refused interrupt pending from one that drops it: the driver disables
   the bit, sends the SGI, re-enables the bit and waits without sending again.
+  It then does the same for the distributor half of the gate: clears
+  `GICD_CTLR.EnableGrp1` with the SGI's own bit set, sends, restores the register
+  and waits without resending.
   Every result is one `vgic:` line and nothing halts the boot. `docs/vgic-selftest.md` lists each
   check and the limits.
 - `Platform/Mac16_3Pkg/Mac16_3.dsc` and `Mac16_3.fdf` — the component, behind

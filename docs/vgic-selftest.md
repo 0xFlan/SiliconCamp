@@ -9,8 +9,8 @@ one. UEFI is a lenient guest, so a build that boots is evidence about UEFI, not
 about the vGIC.
 
 **Status:** builds with zero warnings, is present in the DXE FV, and is
-machine-checked offline by `scripts/check-vgic-selftest.py` (87 checks against the
-patch series, 86 against the tree). `scripts/check-gicv3-oracle.py` additionally
+machine-checked offline by `scripts/check-vgic-selftest.py` (94 checks against the
+patch series, 93 against the tree). `scripts/check-gicv3-oracle.py` additionally
 re-checks the register read-backs it assumes against QEMU's independent GICv3
 model. **It has never run on the M4.** Everything it asserts about the device is
 an expectation derived from ARM IHI 0069 and from the hypervisor's source; the run
@@ -222,6 +222,8 @@ vector reads `ICC_IAR1_EL1`, calls the registered handler, and the handler write
 | `gating.sgi` | A **disabled** SGI (INTID 10) is not delivered. The protocol enables the source when a handler is registered, so the test clears `GICR_ISENABLER0` in the boot PE's own frame behind the protocol's back and sends the SGI. Delivery that ignores the enable bit is reported as a gap. |
 | `gating.pending` | The SGI refused above is not lost: the test sets `GICR_ISENABLER0` and waits **without sending again**. A vGIC that dropped the interrupt instead of queueing it leaves this silent, which for an edge-triggered source can be forever. This is a `[FAIL]`, not a gap: the pending state is part of the contract, and the check is the only one that distinguishes "queued" from "dropped". |
 | `gating.rearm` | The same SGI is enabled again and sent again, and has to arrive. A gate that refuses forever would be worse than no gate: this is the failure mode of testing the enable bit before the guest has programmed it, and it is the reason the check is a `[FAIL]`, not a gap. |
+| `gating.group1` | The **other half** of the gate: with the SGI's own enable bit set, the test clears `GICD_CTLR.EnableGrp1` and sends it. Every list register is injected as Group 1, so delivery while that bit is clear is reported as a gap. The register is written back exactly; DS and ARE are preserved. |
+| `gating.group1-pending` | Restoring `GICD_CTLR.EnableGrp1` delivers the SGI sent while the group was disabled, **without a resend**. A vGIC that discarded it leaves the guest waiting; the check is a `[FAIL]`. |
 | `delivery.ppi` | The virtual timer PPI (from `PcdArmArchTimerVirtIntrNum`, 18 on this platform) is programmed 5 ms out and delivered. It is then stopped again for `TimerDxe`. |
 
 The handler calls `EndOfInterrupt` itself. That is not optional: EDK2's
@@ -289,7 +291,9 @@ refusal: one disabled INTID at the head would have blocked every interrupt
 behind it. The drain now compacts instead of popping at the first failure, and
 enabling an INTID (`GICR_ISENABLER0`, a `GICD_ISENABLER` bank, or
 `GICD_CTLR.EnableGrp1`) drains the queues immediately rather than waiting for the
-next unrelated interrupt. `gating.pending` is the probe that measures it.
+next unrelated interrupt. `gating.pending` is the probe that measures it, and
+`gating.group1` / `gating.group1-pending` measure the group half of the same
+predicate in both directions.
 
 What remains is stated rather than hidden:
 
@@ -324,6 +328,8 @@ vgic: [PASS] dist.intids: GICD_TYPER describes 1024 INTIDs
 ...
 vgic: [PASS] gating.sgi: a disabled SGI 10 was correctly not delivered
 vgic: [PASS] gating.pending: an SGI 10 sent while disabled was delivered when its bit was set
+vgic: [PASS] gating.group1: an SGI 10 sent while Group 1 was disabled was not delivered
+vgic: [PASS] gating.group1-pending: an SGI 10 sent while Group 1 was disabled was delivered when it was re-enabled
 vgic: cpu virt-timer PPI 18
 ...
 vgic: -----

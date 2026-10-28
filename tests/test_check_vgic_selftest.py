@@ -237,6 +237,41 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("stayed pending across a disable", result.stdout)
 
+    def test_series_without_the_group_gate_probe_is_rejected(self) -> None:
+        # The per-INTID bit is half the gate.  Clearing GICD_CTLR.EnableGrp1
+        # must stop delivery too, and only this probe measures that half.
+        series = self._mutated_series(
+            '\"gating.group1\",',
+            '\"gating.group-one\",',
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("measures delivery while GICD_CTLR.EnableGrp1 is clear",
+                      result.stdout)
+
+    def test_series_that_does_not_restore_the_group_register_is_rejected(self) -> None:
+        # The probe clears a register the rest of the boot depends on.  If it
+        # does not write the saved value back, the failure is a stopped boot.
+        series = self._mutated_series(
+            "+  MmioWrite32 (DistBase + GICD_CTLR, SavedCtlr);",
+            "+  (void)0;",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("restores GICD_CTLR from the value that was read",
+                      result.stdout)
+
+    def test_series_that_clears_more_than_the_group_bit_is_rejected(self) -> None:
+        # DS and ARE are read-only state on this platform; writing 0 to the
+        # whole register would describe a reset the vGIC does not perform.
+        series = self._mutated_series(
+            "MmioWrite32 (DistBase + GICD_CTLR, SavedCtlr & ~GICD_CTLR_ENABLEGRP1NS);",
+            "MmioWrite32 (DistBase + GICD_CTLR, 0);",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("clears only EnableGrp1", result.stdout)
+
     def test_series_without_the_enable_write_zero_probe_is_rejected(self) -> None:
         # Writing 0 to GICR_ISENABLER0 is what separates a write-1-to-set
         # register from a raw store; without it the probe cannot see the defect.

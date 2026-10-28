@@ -40,10 +40,10 @@ index 88934cd..d51fa41 100644
    INF ArmPkg/Drivers/ArmGicDxe/ArmGicDxe.inf
 diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
 new file mode 100644
-index 0000000..1420574
+index 0000000..e6b243e
 --- /dev/null
 +++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
-@@ -0,0 +1,1932 @@
+@@ -0,0 +1,1989 @@
 +/** @file
 +  Conformance self-test for the NTASP m1n1 vGIC.
 +
@@ -1664,18 +1664,23 @@ index 0000000..1420574
 +  GICR_ISENABLER0 delivers it anyway.
 +
 +  The bit lives in the boot PE's SGI frame, which is not necessarily frame 0, so
-+  the caller passes the frame the walk found for this PE.
++  the caller passes the frame the walk found for this PE.  The second half of
++  the gate is GICD_CTLR.EnableGrp1: every list register is injected as Group 1,
++  so clearing that bit has to stop delivery even while the INTID's own enable
++  bit stays set.  That is measured too, and the register is restored exactly.
 +**/
 +STATIC
 +VOID
 +VgicCheckSgiGating (
 +  IN EFI_HARDWARE_INTERRUPT_PROTOCOL  *Interrupt,
 +  IN UINT64                            Mpidr,
-+  IN UINTN                             BootFrameBase
++  IN UINTN                             BootFrameBase,
++  IN UINTN                             DistBase
 +  )
 +{
 +  EFI_STATUS  Status;
 +  UINT32      Bit;
++  UINT32      SavedCtlr;
 +
 +  Status = Interrupt->RegisterInterruptSource (Interrupt, VGIC_TEST_SGI_2, VgicTestHandler);
 +  if (EFI_ERROR (Status)) {
@@ -1751,8 +1756,55 @@ index 0000000..1420574
 +  }
 +
 +  //
-+  // Unregistering disables the source again, so there is nothing else to
-+  // restore: the enable bit was the only state this test changed.
++  // The per-INTID bit is only one half of the gate.  Delivery also requires
++  // GICD_CTLR.EnableGrp1 because every list register is injected as Group 1.
++  // Clear it while the SGI's own bit stays set, send once, and require that
++  // nothing arrives.  Then restore the register and require that same SGI to
++  // arrive without a resend.  The register is saved and written back exactly,
++  // so a failure here does not leak into the rest of the boot.
++  //
++  SavedCtlr = MmioRead32 (DistBase + GICD_CTLR);
++
++  MmioWrite32 (DistBase + GICD_CTLR, SavedCtlr & ~GICD_CTLR_ENABLEGRP1NS);
++  mIrqCount = 0;
++  IccSgi1r (VgicSelfSgi1r (Mpidr, VGIC_TEST_SGI_2));
++  VgicWaitCount (&mIrqCount, 1, VGIC_GATE_WINDOW_US);
++
++  if (mIrqCount == 0) {
++    VgicPass (
++      "gating.group1",
++      "an SGI %u sent while Group 1 was disabled was not delivered",
++      VGIC_TEST_SGI_2
++      );
++  } else {
++    VgicGap (
++      "gating.group1",
++      "an SGI %u was delivered while GICD_CTLR.EnableGrp1 was clear",
++      VGIC_TEST_SGI_2
++      );
++  }
++
++  mIrqCount = 0;
++  MmioWrite32 (DistBase + GICD_CTLR, SavedCtlr);
++
++  if (VgicWaitCount (&mIrqCount, 1, VGIC_GATE_WINDOW_US)) {
++    VgicPass (
++      "gating.group1-pending",
++      "an SGI %u sent while Group 1 was disabled was delivered when it was re-enabled",
++      VGIC_TEST_SGI_2
++      );
++  } else {
++    VgicFail (
++      "gating.group1-pending",
++      "SGI %u sent while Group 1 was disabled was dropped instead of staying pending",
++      VGIC_TEST_SGI_2
++      );
++  }
++
++  //
++  // Unregistering disables the source again, so the enable bit and the
++  // distributor's group register are the only state this test changed, and
++  // both have been restored.
 +  //
 +  Interrupt->RegisterInterruptSource (Interrupt, VGIC_TEST_SGI_2, NULL);
 +}
@@ -1945,7 +1997,12 @@ index 0000000..1420574
 +  }
 +
 +  VgicCheckSgiDelivery (Interrupt, Mpidr);
-+  VgicCheckSgiGating (Interrupt, Mpidr, (UINTN)RedistBase + (BootFrame * GICR_FRAME_SIZE));
++  VgicCheckSgiGating (
++    Interrupt,
++    Mpidr,
++    (UINTN)RedistBase + (BootFrame * GICR_FRAME_SIZE),
++    (UINTN)DistBase
++    );
 +  VgicCheckPpiDelivery (Interrupt, VirtTimerIntId);
 +
 +  if (!InterruptsWereEnabled) {
