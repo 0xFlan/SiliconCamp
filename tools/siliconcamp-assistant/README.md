@@ -1,7 +1,7 @@
 # SiliconCamp Assistant
 
 A Boot Camp-shaped setup assistant for running Windows on Apple silicon. It is a
-real macOS window, and three of the steps now do work rather than describe it:
+real macOS window, and its two disk steps now do work rather than describe it:
 
 - **Windows Installer** validates a Windows 11 Arm64 ISO (including the PE
   machine type of `BOOTAA64.EFI`), writes a bootable FAT32 UEFI installer to an
@@ -11,8 +11,9 @@ real macOS window, and three of the steps now do work rather than describe it:
   the real `diskutil` resize / FAT32 partition / restore engine. The engine runs
   end to end on a throwaway APFS image; the internal disk is gated until Windows
   can boot.
-- **The walkthrough** reports the machine, the pinned image hashes, the boot
-  chain, the blockers and the read-only repository checks.
+
+The rest of the walkthrough reports the machine, the pinned image hashes, the
+boot chain, the blockers and the read-only repository checks.
 
 The remaining gap is unchanged and on screen: Windows has never reached the
 kernel on this hardware, so there is no boot path, no AGX graphics driver, and

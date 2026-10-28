@@ -85,7 +85,7 @@ Windows Installer, Reserve Space, Safety, Review and Install — and shows this
 Mac, the pinned image hashes, the read-only diagnostics, the boot chain and the
 five blockers.
 
-Three steps are real. The installer step validates a Windows 11 Arm64 ISO
+Two disk steps are now real. The installer step validates a Windows 11 Arm64 ISO
 (including the PE machine type of `BOOTAA64.EFI`), erases and formats the
 destination as one FAT32 partition, copies the setup files (splitting an
 `install.wim` over 4 GiB with wimlib), strips the macOS metadata the FAT driver
