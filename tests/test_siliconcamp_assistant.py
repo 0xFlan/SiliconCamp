@@ -56,6 +56,16 @@ class AssistantStatusTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertFalse(skipped)
 
+    def test_dirty_submodules_are_not_reported_as_source_edits(self) -> None:
+        # Porcelain uses ` M` for a submodule with modified content, the same
+        # code a modified file gets; the panel must not call that a source edit.
+        info = self.server.repo_info()
+        declared = self.server._submodule_paths()
+        self.assertIn("third_party/m1n1-windows", declared)
+        self.assertTrue(set(info["submodules_modified"]).issubset(declared))
+        for line in info["source_modified"]:
+            self.assertNotIn(line[3:].strip(), declared)
+
     def test_diagnostics_are_a_fixed_allow_list(self) -> None:
         # There is no request-supplied command: every entry is an argv list
         # rooted in the repository's own checkers.

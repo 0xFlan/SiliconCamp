@@ -256,16 +256,44 @@ def machine_info() -> dict[str, object]:
     }
 
 
+def _submodule_paths() -> set[str]:
+    """Paths declared in .gitmodules."""
+    path = ROOT / ".gitmodules"
+    if not path.exists():
+        return set()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    paths: set[str] = set()
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key.strip() == "path":
+            paths.add(value.strip())
+    return paths
+
+
 def repo_info() -> dict[str, object]:
     porcelain = _git("status", "--porcelain")
+    known_submodules = _submodule_paths()
     dirty = [
         line for line in porcelain.splitlines()
         if line.strip() and not line.startswith("??")
     ]
-    submodules = [
-        line[3:].strip() for line in dirty if line.startswith(" m ")
-    ]
-    other_dirty = [line for line in dirty if not line.startswith(" m ")]
+    submodules: list[str] = []
+    other_dirty: list[str] = []
+    for line in dirty:
+        rel = line[3:].strip()
+        #
+        # `git status --porcelain` reports a submodule with modified content as
+        # ` M path`, the same worktree code a modified file gets.  Classify by
+        # the path, or the panel would claim the patched submodules are source
+        # edits.
+        #
+        if rel in known_submodules:
+            submodules.append(rel)
+        else:
+            other_dirty.append(line)
     return {
         "branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "unknown",
         "commit": _git("rev-parse", "--short", "HEAD") or "unknown",
