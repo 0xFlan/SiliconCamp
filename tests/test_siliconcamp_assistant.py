@@ -64,7 +64,9 @@ class AssistantStatusTests(unittest.TestCase):
         self.assertIn("third_party/m1n1-windows", declared)
         self.assertTrue(set(info["submodules_modified"]).issubset(declared))
         for line in info["source_modified"]:
-            self.assertNotIn(line[3:].strip(), declared)
+            parts = line.split(maxsplit=1)
+            self.assertTrue(parts)
+            self.assertNotIn(parts[1] if len(parts) > 1 else parts[0], declared)
 
     def test_diagnostics_are_a_fixed_allow_list(self) -> None:
         # There is no request-supplied command: every entry is an argv list
