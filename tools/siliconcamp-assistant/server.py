@@ -3,16 +3,18 @@
 SiliconCamp Assistant — a local Boot Camp-shaped setup assistant.
 
 It serves the walkthrough, the repository's read-only checks, the installer
-media engine and the Windows space plan.  Windows still cannot boot on this
-hardware; the assistant says so in the same pane as the controls it cannot
-offer yet, and it never writes to an internal disk.
+media engine, the Windows space plan and both space operations.  Windows still
+cannot boot on this hardware; the assistant says so in the same pane as the
+controls it cannot offer yet.
 
 What can write:
 
   * installer media, and only to a disk image the user names or to an external
     USB disk that is re-validated immediately before it is erased;
-  * nothing else.  The space plan is arithmetic over this Mac's APFS container,
-    not a resize.
+  * the BOOTCAMP partition.  Allocating resizes the internal APFS container and
+    is refused until Windows has a boot path; removing a partition returns its
+    space and is always available.  Both need the write token and the disk
+    identifier typed into the page.
 
 Safety properties:
 
@@ -150,7 +152,7 @@ ROADMAP = (
     {
         "feature": "Reserve space for Windows",
         "state": "engine ready",
-        "detail": "The resize and restore commands are implemented and rehearse end to end on a throwaway APFS image. The internal disk stays disabled until Windows can boot.",
+        "detail": "The resize and restore commands are implemented and rehearse end to end on a throwaway APFS image. Allocation stays disabled until Windows can boot; removing an existing partition returns its space now.",
     },
     {
         "feature": "Install Windows from an ISO",
@@ -541,7 +543,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _allocation(self) -> None:
         try:
-            stats = allocation.read_host_space()
+            info = allocation.container_info()
+            stats = allocation._stats_from(info)
+            existing = allocation.existing_partition(info)
         except allocation.AllocationError as exc:
             self._json({"error": str(exc), "stats": None}, status=HTTPStatus.SERVICE_UNAVAILABLE)
             return
@@ -556,7 +560,7 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "stats": stats,
                 "default_gb": default,
-                "plan": allocation.plan_space(default, stats=stats),
+                "plan": allocation.plan_space(default, stats=stats, existing=existing),
             }
         )
 
@@ -643,6 +647,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/allocation/rehearse":
             self._rehearse_allocation()
+            return
+        if path == "/api/allocation/apply":
+            self._apply_allocation()
+            return
+        if path == "/api/allocation/remove":
+            self._remove_allocation()
             return
         if path != "/api/check":
             self._error(HTTPStatus.NOT_FOUND, "not found")
@@ -770,11 +780,13 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, "bad size")
             return
         try:
-            stats = allocation.read_host_space()
+            info = allocation.container_info()
+            stats = allocation._stats_from(info)
+            existing = allocation.existing_partition(info)
         except allocation.AllocationError as exc:
             self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
             return
-        self._json(allocation.plan_space(gib, stats=stats))
+        self._json(allocation.plan_space(gib, stats=stats, existing=existing))
 
     def _rehearse_allocation(self) -> None:
         """Run the real resize and restore against a throwaway APFS image."""
@@ -800,6 +812,103 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             job_id = JOBS.start("rehearsal", work)
+        except RuntimeError as exc:
+            self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        self._json({"job": job_id}, status=HTTPStatus.ACCEPTED)
+
+    def _apply_allocation(self) -> None:
+        """Shrink the container and create BOOTCAMP after the user types its name.
+
+        The plan is recomputed here rather than trusted from the page, so a
+        container that changed since the page loaded cannot be resized against
+        stale numbers.
+        """
+        if not self._authorised_write():
+            return
+        payload = self._body()
+        if payload is None:
+            return
+        try:
+            gib = int(payload.get("gb", 0))
+        except (TypeError, ValueError):
+            self._error(HTTPStatus.BAD_REQUEST, "bad size")
+            return
+        try:
+            info = allocation.container_info()
+            stats = allocation._stats_from(info)
+            existing = allocation.existing_partition(info)
+            plan = allocation.plan_space(gib, stats=stats, existing=existing)
+        except allocation.AllocationError as exc:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+            return
+        if not plan["apply"]["enabled"]:
+            self._error(
+                HTTPStatus.CONFLICT,
+                str(plan["apply"]["reason"] or "the resize is not available"),
+            )
+            return
+        expected = str(info["reference"])
+        typed = allocation._normalise_reference(str(payload.get("confirm", "")))
+        if typed != expected:
+            self._error(
+                HTTPStatus.BAD_REQUEST,
+                f"type {expected} to confirm this resize",
+            )
+            return
+
+        def work(log):
+            return allocation.apply_space(
+                gib, container=info["reference"], confirm=True, log=log
+            )
+
+        try:
+            job_id = JOBS.start("allocation", work)
+        except RuntimeError as exc:
+            self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        self._json({"job": job_id}, status=HTTPStatus.ACCEPTED)
+
+    def _remove_allocation(self) -> None:
+        """Delete BOOTCAMP and return its space to macOS.
+
+        Allowed before Windows boots: it only gives capacity back.  The page has
+        to name the partition device, so a click alone cannot erase a Windows
+        installation.
+        """
+        if not self._authorised_write():
+            return
+        payload = self._body()
+        if payload is None:
+            return
+        try:
+            info = allocation.container_info()
+            existing = allocation.existing_partition(info)
+        except allocation.AllocationError as exc:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+            return
+        if not existing or not existing.get("device"):
+            self._error(
+                HTTPStatus.CONFLICT,
+                f"no {allocation.PARTITION_NAME} partition on {info['whole_disk']}",
+            )
+            return
+        expected = str(existing["device"]).removeprefix("/dev/")
+        typed = allocation._normalise_reference(str(payload.get("confirm", "")))
+        if typed != expected:
+            self._error(
+                HTTPStatus.BAD_REQUEST,
+                f"type {expected} to confirm the removal",
+            )
+            return
+
+        def work(log):
+            return allocation.remove_space(
+                container=info["reference"], confirm=True, log=log
+            )
+
+        try:
+            job_id = JOBS.start("removal", work)
         except RuntimeError as exc:
             self._error(HTTPStatus.CONFLICT, str(exc))
             return

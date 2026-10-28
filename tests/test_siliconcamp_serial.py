@@ -94,5 +94,138 @@ class SerialCaptureTests(unittest.TestCase):
         os.close(slave)
 
 
+class SerialVerdictTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.serial = load_serial()
+
+    def write_log(self, tmp, lines, *, footer=True) -> pathlib.Path:
+        path = pathlib.Path(tmp) / "m4-boot.log"
+        body = [
+            "# SiliconCamp serial capture",
+            "# device: /dev/cu.usbmodem-test",
+            "# baud: 115200",
+            "# started: 2026-10-28T12:00:00+00:00",
+        ]
+        for index, text in enumerate(lines):
+            body.append(f"[12:00:{index:02d}.000] {text}")
+        if footer:
+            body.append(
+                f"# ended: 2026-10-28T12:00:20+00:00 after 12.0s, "
+                f"{sum(len(line) for line in lines)} bytes, {len(lines)} lines"
+            )
+        path.write_text("\n".join(body) + "\n", encoding="utf-8")
+        return path
+
+    def healthy(self) -> list[str]:
+        return [
+            "HV vGIC: 10 CPUs, 42-bit PA, dist=0x5000000000 redist=0x5100000000 its=0x5200000000",
+            "PSCI DEBUG: topology tree selected",
+            "PSCI DEBUG: Number of cores for PSCI nodes is 10",
+            "PSCI DEBUG: Number of clusters for PSCI nodes is 2",
+            "vgic: ===== vGIC conformance self-test =====",
+            "vgic: [PASS] dist.typer: No1N=1, LPIS=0",
+            "vgic: [PASS] wake.cpu0: ChildrenAsleep cleared",
+            "vgic: totals: pass=2 fail=0 gap=0 skip=0",
+            "vgic: RESULT: PASS",
+        ]
+
+    def test_a_clean_first_boot_is_a_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_log(tmp, self.healthy())
+            report = self.serial.judge_capture(path)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["verdict"], "pass")
+        self.assertEqual(report["m1n1"]["cpus"], 10)
+        self.assertEqual(report["m1n1"]["pa_bits"], 42)
+        self.assertEqual(report["psci"], {"cores": 10, "clusters": 2})
+        self.assertEqual(report["selftest"]["result"], "PASS")
+        self.assertEqual(report["selftest"]["pass"], 2)
+        self.assertIn("PASS", self.serial.format_verdict(report))
+
+    def test_a_self_test_failure_fails_the_boot(self) -> None:
+        lines = [
+            self.healthy()[0],
+            "vgic: [FAIL] redist.cpu3: GICR_WAKER never cleared",
+            "vgic: totals: pass=0 fail=1 gap=0 skip=0",
+            "vgic: RESULT: FAIL",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.serial.judge_capture(self.write_log(tmp, lines))
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["verdict"], "fail")
+        self.assertTrue(any("self-test failed" in item for item in report["failures"]))
+        self.assertEqual(report["selftest"]["failed_checks"][0]["name"], "redist.cpu3")
+
+    def test_a_fault_fails_the_boot_even_after_a_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.serial.judge_capture(
+                self.write_log(tmp, self.healthy() + ["Unhandled exception, rebooting..."])
+            )
+        self.assertEqual(report["verdict"], "fail")
+        self.assertTrue(any("fault" in item for item in report["failures"]))
+
+    def test_a_wrong_cpu_count_fails_the_topology(self) -> None:
+        lines = self.healthy()
+        lines[0] = lines[0].replace("10 CPUs", "8 CPUs")
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.serial.judge_capture(self.write_log(tmp, lines))
+        self.assertEqual(report["verdict"], "fail")
+        self.assertTrue(any("8 CPUs" in item for item in report["failures"]))
+
+    def test_gaps_are_reported_without_failing_the_boot(self) -> None:
+        lines = [
+            self.healthy()[0],
+            "PSCI DEBUG: Number of cores for PSCI nodes is 10",
+            "PSCI DEBUG: Number of clusters for PSCI nodes is 2",
+            "vgic: [GAP ] spi.affinity: AICv3 has no per-SPI target",
+            "vgic: totals: pass=0 fail=0 gap=1 skip=0",
+            "vgic: RESULT: PASS-WITH-GAPS",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.serial.judge_capture(self.write_log(tmp, lines))
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["verdict"], "pass-with-gaps")
+        self.assertEqual(report["selftest"]["gaps"][0]["name"], "spi.affinity")
+        self.assertIn("gap: spi.affinity", self.serial.format_verdict(report))
+
+    def test_a_silent_capture_is_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.serial.judge_capture(self.write_log(tmp, []))
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["verdict"], "incomplete")
+        self.assertTrue(any("no console output" in item for item in report["missing"]))
+
+    def test_m1n1_without_the_firmware_is_incomplete(self) -> None:
+        lines = self.healthy()[:4]
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self.serial.judge_capture(self.write_log(tmp, lines))
+        self.assertEqual(report["verdict"], "incomplete")
+        self.assertTrue(any("self-test did not run" in item for item in report["missing"]))
+
+    def test_a_truncated_log_without_a_footer_still_parses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_log(tmp, self.healthy(), footer=False)
+            report = self.serial.judge_capture(path)
+        self.assertEqual(report["verdict"], "pass")
+        self.assertIsNone(report["capture"]["duration"])
+
+    def test_the_cli_exit_status_matches_the_verdict(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self.write_log(tmp, self.healthy())
+            bad = pathlib.Path(tmp) / "bad.log"
+            bad.write_text(
+                "[12:00:00.000] HV vGIC: 10 CPUs, 42-bit PA, dist=0x1 redist=0x2 its=0x3\n"
+                "[12:00:01.000] Unhandled exception, rebooting...\n",
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.serial.main(["verdict", "--in", str(good)]), 0)
+                self.assertEqual(self.serial.main(["verdict", "--in", str(bad)]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,11 @@ This is the first hardware step and the first irreversible one. It requires the 
   `python3 tools/siliconcamp-assistant/serial.py capture --device /dev/cu.usbmodem… --out probes/m4-first-boot.log`
   keeps per-line timestamps and a counted footer, so a truncated or silent run is
   visible in the artefact itself.
+- Judge the capture instead of reading it by eye:
+  `python3 tools/siliconcamp-assistant/serial.py verdict --in probes/m4-first-boot.log`
+  exits 0 for `pass`/`pass-with-gaps`, 1 for a self-test failure, a topology
+  mismatch or a fault, and 2 when the log cannot support a verdict. `--json`
+  records the parsed topology and the named failures in the probe log.
 
 **Exit criteria:** m1n1 reaches its console on the M4 and prints the vGIC topology line:
 
@@ -47,6 +52,11 @@ The exact PA width may be 42 or larger; the patch chooses the 42-bit window for
 anything above 36 bits. If it prints `no CPU nodes found`, the ADT CPU parsing is
 wrong for this M4. A `PSCI: topology has N cores but the ADT has M` line means
 the descriptor and the machine disagree; stop and fix before proceeding.
+
+`serial.py verdict` checks exactly these lines (10 CPUs, at least 42-bit PA, 10
+cores in 2 clusters) plus the firmware self-test's `RESULT` when the log contains
+one. A green verdict is a claim about the markers in the log; it is not a
+substitute for reading the lines when it says `fail` or `incomplete`.
 
 ## Phase 2 — NTASP UEFI on the M4
 
@@ -86,8 +96,10 @@ Next:
   which PE takes each SPI as well: that measures the `GICD_IROUTER` affinity gap
   described in `docs/architecture.md` instead of arguing about it.
 - Chainload the UEFI firmware from m1n1 on the M4 (gated by the safety checklist).
-- Capture the UEFI serial log and check the memory map, CPU count, and ACPI
-  table addresses at runtime.
+- Capture the UEFI serial log and run `serial.py verdict` on it: the self-test's
+  `vgic: RESULT:` line is the firmware's own answer about the interrupt contract,
+  and the same command names every `[FAIL]` and `[GAP ]`. Then check the memory
+  map, CPU count, and ACPI table addresses at runtime by eye.
 - Bring up the USB DWC3/XHCI path so a USB keyboard and USB installer are usable.
 - Validate the MSI path: the frame, the MSIMAP programming and the translation
   are written and checked offline, but the first boot has to show that the port

@@ -6,13 +6,17 @@ Boot Camp's install step shrank the macOS volume, then created one FAT32
 partition labelled ``BOOTCAMP`` for Windows Setup.  This module measures that
 step against this Mac's own APFS container, and can perform it.
 
-The write path is implemented and exercised end to end, but it refuses the
-container that holds ``/`` until Windows has a boot path.  Taking tens of
-gigabytes from the internal SSD to hold an installation that cannot start would
-cost the user capacity for nothing, so the policy gate (``BOOT_PATH_READY``)
-lives here rather than in the UI.  ``rehearse`` runs the exact production
-commands against a throwaway APFS disk image, so the code is proven without
-touching the internal disk:
+The write path is implemented and exercised end to end, but it refuses to
+*allocate* on the container that holds ``/`` until Windows has a boot path.
+Taking tens of gigabytes from the internal SSD to hold an installation that
+cannot start would cost the user capacity for nothing, so the policy gate
+(``BOOT_PATH_READY``) lives here rather than in the UI.  *Removing* a BOOTCAMP
+partition is allowed before that: it returns capacity to macOS and cannot
+strand the host, and refusing it would leave a partition this tool created
+impossible to reclaim.  Both directions require ``confirm=True``; the server
+additionally requires the user to type the disk identifier.  ``rehearse`` runs
+the exact production commands against a throwaway APFS disk image, so the code
+is proven without touching the internal disk:
 
     shrink:  diskutil apfs resizeContainer <container> <capacity - requested>
     create:  diskutil addPartition <physical store> "MS-DOS FAT32" BOOTCAMP <size>
@@ -210,7 +214,28 @@ def read_host_space() -> dict[str, object]:
     return _stats_from(container_info())
 
 
-def plan_space(gb: int, *, stats: dict[str, object] | None = None) -> dict[str, object]:
+def existing_partition(info: dict) -> dict | None:
+    """The BOOTCAMP partition on this container's disk, if there is one.
+
+    ``addPartition`` can only hold one, and a second allocation would fail after
+    the container had already been shrunk, so the planner reports this before
+    anything is written.
+    """
+    part = find_bootcamp(str(info.get("whole_disk") or ""))
+    if not part or not part.get("DeviceIdentifier"):
+        return None
+    detail = _partition_detail(f"/dev/{part['DeviceIdentifier']}")
+    # `diskutil info` reports an unmounted partition with no filesystem, which is
+    # still a real partition that has to be removed before another can exist.
+    return detail
+
+
+def plan_space(
+    gb: int,
+    *,
+    stats: dict[str, object] | None = None,
+    existing: dict | None = None,
+) -> dict[str, object]:
     """Size one BOOTCAMP partition against the container's real free space."""
     host = stats if stats is not None else read_host_space()
     requested = int(gb)
@@ -247,7 +272,27 @@ def plan_space(gb: int, *, stats: dict[str, object] | None = None) -> dict[str, 
         }
     ]
 
+    if existing:
+        reason = (
+            f"{existing['device']} is already a {PARTITION_NAME} partition; "
+            "remove it before allocating another."
+        )
+    elif not BOOT_PATH_READY:
+        reason = APPLY_BLOCKER
+    elif blockers:
+        reason = blockers[0]
+    else:
+        reason = ""
+
     return {
+        "existing": existing or None,
+        "remove": {
+            "enabled": bool(existing and existing.get("device")),
+            "device": (existing or {}).get("device", ""),
+            "bytes": (existing or {}).get("bytes", 0),
+            "filesystem": (existing or {}).get("filesystem", ""),
+            "mount": (existing or {}).get("mount", ""),
+        },
         "requested_gb": requested,
         "fit": not blockers,
         "blockers": blockers,
@@ -259,8 +304,8 @@ def plan_space(gb: int, *, stats: dict[str, object] | None = None) -> dict[str, 
             "reserve": reserve,
         },
         "apply": {
-            "enabled": bool(BOOT_PATH_READY and not blockers),
-            "reason": "" if BOOT_PATH_READY else APPLY_BLOCKER,
+            "enabled": bool(BOOT_PATH_READY and not blockers and not existing),
+            "reason": reason,
         },
         "steps": [
             f"shrink the APFS container by {requested} GB",
@@ -308,7 +353,15 @@ def _partition_detail(device: str) -> dict:
     }
 
 
-def _assert_writable(info: dict) -> None:
+def _assert_writable(info: dict, *, removing: bool = False) -> None:
+    """Gate the two write directions separately.
+
+    Allocating on the system container stays blocked until Windows can boot.
+    Removing a partition only ever gives space back, so it is allowed -- but
+    only through an explicit confirmation, which ``remove_space`` requires.
+    """
+    if removing:
+        return
     if info["is_system"] and not BOOT_PATH_READY:
         raise AllocationError(APPLY_BLOCKER)
 
@@ -475,7 +528,7 @@ def remove_space(*, container: str = "", confirm: bool = False, log=print) -> di
         )
     started = time.monotonic()
     info = container_info(container)
-    _assert_writable(info)
+    _assert_writable(info, removing=True)
     part = find_bootcamp(info["whole_disk"])
     if not part:
         raise AllocationError(f"no {PARTITION_NAME} partition on {info['whole_disk']}")
