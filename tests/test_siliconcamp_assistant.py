@@ -1,9 +1,13 @@
 import importlib.util
+import os
 import pathlib
+import plistlib
+import re
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SERVER = ROOT / "tools" / "siliconcamp-assistant" / "server.py"
+TOOL = ROOT / "tools" / "siliconcamp-assistant"
+SERVER = TOOL / "server.py"
 
 
 def load_server():
@@ -22,7 +26,7 @@ class AssistantStatusTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.server = load_server()
 
-    def test_status_has_the_panel_shape(self) -> None:
+    def test_status_has_the_walkthrough_payload(self) -> None:
         status = self.server.build_status()
         self.assertEqual(status["product"], "SiliconCamp Assistant")
         self.assertTrue(status["preview"])
@@ -77,6 +81,39 @@ class AssistantStatusTests(unittest.TestCase):
             self.assertTrue(argv)
             self.assertGreater(timeout, 0)
             self.assertTrue(all(isinstance(part, str) for part in argv))
+
+    def test_walkthrough_is_six_sequential_steps(self) -> None:
+        html = (TOOL / "web" / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(
+            re.findall(r'data-pane="([^"]+)"', html),
+            ["intro", "tasks", "readiness", "safety", "review", "install"],
+        )
+        # The final Install control must stay disabled, and the walkthrough
+        # must identify itself as an application, not a scrolling dashboard.
+        self.assertRegex(
+            html,
+            r'<button class="button default install-button" type="button" disabled>',
+        )
+        self.assertIn('role="application"', html)
+
+    def test_walkthrough_loads_only_local_assets(self) -> None:
+        html = (TOOL / "web" / "index.html").read_text(encoding="utf-8")
+        assets = re.findall(r'(?:src|href)="([^"]+)"', html)
+        self.assertTrue(assets)
+        for asset in assets:
+            self.assertTrue(
+                asset.startswith("/") or asset.startswith("#"),
+                f"non-local asset reference: {asset}",
+            )
+        self.assertNotIn("http://", html)
+        self.assertNotIn("https://", html)
+
+    def test_native_bundle_is_described(self) -> None:
+        info = plistlib.loads((TOOL / "mac" / "Info.plist").read_bytes())
+        self.assertEqual(info["CFBundleIdentifier"], "com.siliconcamp.assistant")
+        self.assertEqual(info["CFBundleExecutable"], "SiliconCampAssistant")
+        self.assertTrue((TOOL / "mac" / "SiliconCampAssistant.swift").is_file())
+        self.assertTrue(os.access(TOOL / "build-app.sh", os.X_OK))
 
 
 if __name__ == "__main__":

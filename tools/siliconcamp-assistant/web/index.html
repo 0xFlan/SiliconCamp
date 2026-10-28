@@ -8,167 +8,312 @@
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-  <div class="shell">
-    <header class="topbar">
-      <div class="brand">
-        <span class="mark" aria-hidden="true">SC</span>
-        <span class="brand-text">
-          <strong>SiliconCamp</strong>
-          <span>Assistant · bring-up preview</span>
-        </span>
-      </div>
-      <div class="pills">
-        <span class="pill" id="machine-pill">Detecting this Mac…</span>
-        <span class="pill ghost" id="tag-pill">checkout</span>
-      </div>
-    </header>
+  <div class="desktop" aria-hidden="true"></div>
 
-    <main>
-      <section class="hero" aria-labelledby="hero-title">
-        <div class="eyebrow">Windows on Apple Silicon</div>
-        <h1 id="hero-title">This Mac cannot install Windows yet.</h1>
-        <p class="lede">
-          The hypervisor and firmware build, and the vGIC has an on-image
-          self-test. Windows has never booted: the loader-to-kernel handoff is
-          unsolved and there is no graphics driver. This assistant shows what is
-          ready, what is not, and why the install button is off.
-        </p>
-        <div class="actions">
-          <button class="button primary" id="install-button" type="button" disabled
-                  title="Disabled until a Windows boot path exists.">
-            Install Windows
-          </button>
-          <a class="button secondary" href="#diagnostics">Run diagnostics</a>
+  <div class="app" id="app">
+    <div class="window" role="application" aria-label="SiliconCamp Assistant">
+      <header class="titlebar">
+        <div class="traffic-lights" aria-hidden="true">
+          <span class="light close"></span>
+          <span class="light min"></span>
+          <span class="light zoom"></span>
         </div>
-        <p class="fine">
-          Not a Boot Camp replacement. It is a local readiness panel for a
-          research bring-up, and it never writes to a disk.
-        </p>
-      </section>
+        <div class="window-title">SiliconCamp Assistant</div>
+      </header>
 
-      <div class="grid">
-        <section class="card span-5" id="machine" aria-labelledby="machine-title">
-          <div class="card-head">
-            <span class="step">01</span>
-            <h2 id="machine-title">This Mac</h2>
-            <span class="chip muted" id="machine-chip">checking</span>
+      <div class="window-body">
+        <aside class="sidebar" aria-hidden="true">
+          <div class="diamond-field">
+            <span class="diamond diamond-a"></span>
+            <span class="diamond diamond-b"></span>
+            <span class="diamond diamond-c"></span>
+            <span class="diamond diamond-d"></span>
+            <span class="diamond diamond-e"></span>
           </div>
-          <dl class="facts" id="machine-facts">
-            <div><dt>Model</dt><dd>—</dd></div>
-            <div><dt>Chip</dt><dd>—</dd></div>
-            <div><dt>macOS</dt><dd>—</dd></div>
-            <div><dt>Checkout</dt><dd>—</dd></div>
-          </dl>
-          <p class="note" id="machine-note">Reading the machine and repository…</p>
-        </section>
+        </aside>
 
-        <section class="card span-7" id="safety" aria-labelledby="safety-title">
-          <div class="card-head">
-            <span class="step">02</span>
-            <h2 id="safety-title">Safety gate</h2>
-            <span class="chip warn" id="safety-progress">0 of 4</span>
-          </div>
-          <p class="note">
-            A custom boot on the only Mac is hard to undo: a failed attempt can
-            require a DFU restore, which erases the machine. These
-            acknowledgements are stored in this browser only. All four still do
-            not make installation possible.
-          </p>
-          <div class="checks">
-            <label class="check"><input type="checkbox" data-gate="backup">
-              <span><strong>Restorable backup</strong>
-              <small>I have a backup I have tested, not just a Time Machine snapshot.</small></span>
-            </label>
-            <label class="check"><input type="checkbox" data-gate="secondMac">
-              <span><strong>Second Mac for recovery</strong>
-              <small>Apple Configurator 2 and a DFU-capable setup are available.</small></span>
-            </label>
-            <label class="check"><input type="checkbox" data-gate="cable">
-              <span><strong>Data-capable USB-C cable</strong>
-              <small>Charge-only cables cannot carry the recovery link.</small></span>
-            </label>
-            <label class="check"><input type="checkbox" data-gate="owner">
-              <span><strong>Owner approval</strong>
-              <small>The machine owner has accepted the boot-security risk.</small></span>
-            </label>
-          </div>
-          <p class="note" id="safety-note"></p>
-        </section>
+        <main class="content">
+          <div class="panes" id="panes">
+            <section class="pane is-active" data-pane="intro" aria-labelledby="intro-title">
+              <h1 id="intro-title">Introduction</h1>
+              <div class="intro">
+                <div class="app-icon" aria-hidden="true">
+                  <span class="app-icon-diamond left"></span>
+                  <span class="app-icon-diamond right"></span>
+                  <span class="app-icon-diamond center"></span>
+                </div>
+                <div class="intro-copy">
+                  <p>
+                    SiliconCamp Assistant checks this Mac, the firmware images and
+                    the hypervisor's interrupt path before anything touches a disk.
+                  </p>
+                  <p>
+                    It does not download Windows, partition the disk, or install
+                    anything. It reads this checkout and nothing else.
+                  </p>
+                </div>
+              </div>
 
-        <section class="card span-12" id="images" aria-labelledby="images-title">
-          <div class="card-head">
-            <span class="step">03</span>
-            <h2 id="images-title">Images</h2>
-            <span class="chip muted" id="images-chip">checking</span>
-          </div>
-          <p class="note">
-            These are the files a hardware experiment would install. The hashes
-            are pinned by <code>artifacts/SHA256SUMS</code>; a missing image is a
-            build step, not a download.
-          </p>
-          <div class="artifact-list" id="artifact-list" role="list"></div>
-        </section>
+              <div class="notice">
+                <span class="notice-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                       stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 3l9 16H3L12 3z"></path>
+                    <path d="M12 9v4"></path>
+                    <path d="M12 16.5h.01"></path>
+                  </svg>
+                </span>
+                <div>
+                  <strong>This Mac cannot install Windows yet.</strong>
+                  <p id="intro-status-detail">
+                    The loader-to-kernel handoff is unsolved and there is no graphics
+                    driver. The remaining steps show what is ready and what is missing.
+                  </p>
+                </div>
+              </div>
+            </section>
 
-        <section class="card span-7" id="diagnostics" aria-labelledby="diagnostics-title">
-          <div class="card-head">
-            <span class="step">04</span>
-            <h2 id="diagnostics-title">Diagnostics</h2>
-            <span class="chip muted" id="diag-state">idle</span>
-          </div>
-          <p class="note">
-            Runs only the repository's own read-only checkers, on this machine,
-            through a fixed allow-list. Output is not uploaded.
-          </p>
-          <div class="button-row" id="diagnostic-buttons"></div>
-          <pre class="output" id="diag-output" tabindex="0">No check has run in this session.</pre>
-        </section>
+            <section class="pane" data-pane="tasks" aria-labelledby="tasks-title" hidden>
+              <h1 id="tasks-title">Select Tasks</h1>
+              <p class="intro-line">
+                Select the tasks you want to perform. Tasks that cannot run are
+                disabled and explain why.
+              </p>
 
-        <section class="card span-5" id="blockers" aria-labelledby="blockers-title">
-          <div class="card-head">
-            <span class="step">05</span>
-            <h2 id="blockers-title">What is blocking</h2>
-            <span class="chip bad">5 open</span>
-          </div>
-          <ul class="blocker-list" id="blocker-list"></ul>
-        </section>
+              <div class="task-box">
+                <label class="task">
+                  <input type="checkbox" id="task-check" checked data-task="check">
+                  <span>
+                    <strong>Check this Mac for compatibility</strong>
+                    <span>Reads the model, firmware target, image hashes and safety
+                    state. This task is read-only.</span>
+                  </span>
+                </label>
 
-        <section class="card span-12" id="parity" aria-labelledby="parity-title">
-          <div class="card-head">
-            <span class="step">06</span>
-            <h2 id="parity-title">The Boot Camp gap</h2>
-            <span class="chip muted">honest parity</span>
-          </div>
-          <p class="note">
-            Boot Camp Assistant installed Windows, partitioned the disk, chose a
-            startup volume and supplied drivers. None of those user-facing steps
-            exist here yet. This is the measured gap.
-          </p>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr><th scope="col">Boot Camp behaviour</th><th scope="col">Status</th><th scope="col">What is missing</th></tr>
-              </thead>
-              <tbody id="roadmap-body"></tbody>
-            </table>
-          </div>
-        </section>
+                <label class="task is-disabled">
+                  <input type="checkbox" disabled data-task="usb">
+                  <span>
+                    <strong>Create a bootable Windows installer</strong>
+                    <span>Unavailable. Windows has never reached the kernel on this
+                    machine, so there is no boot path to install.</span>
+                  </span>
+                </label>
 
-        <section class="card span-12" id="chain" aria-labelledby="chain-title">
-          <div class="card-head">
-            <span class="step">07</span>
-            <h2 id="chain-title">Boot chain</h2>
-            <span class="chip muted">where it stops</span>
+                <label class="task is-disabled">
+                  <input type="checkbox" disabled data-task="drivers">
+                  <span>
+                    <strong>Download Windows support software</strong>
+                    <span>Unavailable. There are no Apple drivers for Windows on
+                    this hardware: GPU, keyboard, trackpad, audio, Wi-Fi and
+                    Bluetooth.</span>
+                  </span>
+                </label>
+
+                <label class="task is-disabled">
+                  <input type="checkbox" disabled data-task="install">
+                  <span>
+                    <strong>Install Windows</strong>
+                    <span>Unavailable. The loader-to-kernel handoff is unsolved, and
+                    this assistant does not write to a disk.</span>
+                  </span>
+                </label>
+              </div>
+
+              <p class="fine">
+                The compatibility check runs only the repository's read-only
+                checkers. Nothing is downloaded or installed.
+              </p>
+            </section>
+
+            <section class="pane" data-pane="readiness" aria-labelledby="readiness-title" hidden>
+              <h1 id="readiness-title">Readiness</h1>
+              <p class="intro-line">
+                The machine, the published firmware images and the repository's
+                read-only checks.
+              </p>
+
+              <section class="group">
+                <h2>This Mac</h2>
+                <dl class="spec-list" id="machine-facts">
+                  <div><dt>Model</dt><dd>—</dd></div>
+                  <div><dt>Chip</dt><dd>—</dd></div>
+                  <div><dt>macOS</dt><dd>—</dd></div>
+                  <div><dt>Checkout</dt><dd>—</dd></div>
+                </dl>
+                <p class="fine" id="machine-note">Reading the machine and repository…</p>
+              </section>
+
+              <section class="group">
+                <h2>Firmware Images</h2>
+                <div class="artifact-list" id="artifact-list"></div>
+                <p class="fine">
+                  Hashes are pinned by <code>artifacts/SHA256SUMS</code>. A missing
+                  image is a build step, not a download.
+                </p>
+              </section>
+
+              <section class="group">
+                <div class="group-head">
+                  <h2>Diagnostics</h2>
+                  <span class="status-text" id="diag-state">Idle</span>
+                </div>
+                <p class="fine">
+                  Runs only the repository's own checkers, through a fixed
+                  allow-list. Output stays on this Mac.
+                </p>
+                <div class="button-row" id="diagnostic-buttons"></div>
+                <pre class="output" id="diag-output" tabindex="0" aria-live="polite">No check has run in this session.</pre>
+              </section>
+            </section>
+
+            <section class="pane" data-pane="safety" aria-labelledby="safety-title" hidden>
+              <h1 id="safety-title">Before You Continue</h1>
+              <p class="intro-line">
+                A custom boot on the only Mac is hard to undo. These acknowledgements
+                are stored in this browser only, and they do not enable installation.
+              </p>
+
+              <div class="notice">
+                <span class="notice-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                       stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 3l9 16H3L12 3z"></path>
+                    <path d="M12 9v4"></path>
+                    <path d="M12 16.5h.01"></path>
+                  </svg>
+                </span>
+                <div>
+                  <strong>A failed attempt can require a DFU restore.</strong>
+                  <p>A DFU restore erases the machine. None of these acknowledgements
+                  make the Windows boot path exist.</p>
+                </div>
+              </div>
+
+              <div class="check-box">
+                <label>
+                  <input type="checkbox" data-gate="backup">
+                  <span>
+                    <strong>Restorable backup</strong>
+                    <span>I have a backup I have tested, not just a Time Machine snapshot.</span>
+                  </span>
+                </label>
+                <label>
+                  <input type="checkbox" data-gate="secondMac">
+                  <span>
+                    <strong>Second Mac for recovery</strong>
+                    <span>Apple Configurator 2 and a DFU-capable setup are available.</span>
+                  </span>
+                </label>
+                <label>
+                  <input type="checkbox" data-gate="cable">
+                  <span>
+                    <strong>Data-capable USB-C cable</strong>
+                    <span>Charge-only cables cannot carry the recovery link.</span>
+                  </span>
+                </label>
+                <label>
+                  <input type="checkbox" data-gate="owner">
+                  <span>
+                    <strong>Owner approval</strong>
+                    <span>The machine owner has accepted the boot-security risk.</span>
+                  </span>
+                </label>
+              </div>
+
+              <p class="fine" id="safety-note"></p>
+            </section>
+
+            <section class="pane" data-pane="review" aria-labelledby="review-title" hidden>
+              <h1 id="review-title">Review</h1>
+              <p class="intro-line">
+                The measured gap between this machine and Boot Camp. Nothing in this
+                step enables an install.
+              </p>
+
+              <div class="two-column">
+                <section class="group">
+                  <h2>Blockers</h2>
+                  <ul class="blocker-list" id="blocker-list"></ul>
+                </section>
+
+                <section class="group">
+                  <h2>Boot Chain</h2>
+                  <ol class="chain" id="chain-list"></ol>
+                </section>
+              </div>
+
+              <section class="group">
+                <h2>Boot Camp Comparison</h2>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th scope="col">Boot Camp behaviour</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">What is missing</th>
+                      </tr>
+                    </thead>
+                    <tbody id="roadmap-body"></tbody>
+                  </table>
+                </div>
+              </section>
+            </section>
+
+            <section class="pane" data-pane="install" aria-labelledby="install-title" hidden>
+              <h1 id="install-title">Install Windows</h1>
+
+              <div class="install-line">
+                <div class="app-icon small" aria-hidden="true">
+                  <span class="app-icon-diamond left"></span>
+                  <span class="app-icon-diamond right"></span>
+                  <span class="app-icon-diamond center"></span>
+                </div>
+                <div>
+                  <strong>Windows cannot be installed on this Mac yet.</strong>
+                  <p>
+                    The boot path does not exist, the graphics driver does not exist,
+                    and the internal SSD driver has never run on hardware.
+                  </p>
+                </div>
+              </div>
+
+              <button class="button default install-button" type="button" disabled>
+                Install Windows
+              </button>
+
+              <p class="fine">
+                This control stays disabled until the boot path and drivers are
+                real, not until the safety acknowledgements are checked.
+              </p>
+
+              <section class="group">
+                <h2>Why</h2>
+                <p><strong>Boot path.</strong> No Windows kernel has run on this M4.
+                The loader-to-kernel handoff is unsolved.</p>
+                <p><strong>Display.</strong> There is no WDDM driver for Apple AGX,
+                so a booting kernel would have no desktop.</p>
+                <p><strong>Storage.</strong> AppleNANDStorageDxe is in the image but
+                untested. USB storage is the only install path.</p>
+              </section>
+            </section>
           </div>
-          <ol class="chain" id="chain-list"></ol>
-        </section>
+
+          <footer class="actionbar">
+            <p class="action-note" id="action-note">Read-only. Nothing is downloaded or installed.</p>
+            <div class="action-buttons">
+              <button class="button" id="back-button" type="button">Go Back</button>
+              <button class="button default" id="next-button" type="button">Continue</button>
+            </div>
+          </footer>
+        </main>
       </div>
-
-      <footer class="footer">
-        <span>Local only · 127.0.0.1 · nothing leaves this Mac</span>
-        <span id="checkout-line">—</span>
-      </footer>
-    </main>
+    </div>
   </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <noscript>
+    <div class="no-script">SiliconCamp Assistant needs JavaScript to read the local checkout.</div>
+  </noscript>
   <script src="/app.js"></script>
 </body>
 </html>
