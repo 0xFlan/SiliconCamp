@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
+  <meta name="siliconcamp-token" content="__SILICONCAMP_TOKEN__">
   <title>SiliconCamp Assistant</title>
   <link rel="stylesheet" href="/app.css">
 </head>
@@ -44,12 +45,14 @@
                 </div>
                 <div class="intro-copy">
                   <p>
-                    SiliconCamp Assistant checks this Mac, the firmware images and
-                    the hypervisor's interrupt path before anything touches a disk.
+                    This assistant prepares the disk side of running Windows on
+                    Apple silicon: it builds the Windows install media and works
+                    out how much of this Mac's storage can be given to Windows.
                   </p>
                   <p>
-                    It does not download Windows, partition the disk, or install
-                    anything. It reads this checkout and nothing else.
+                    It writes only to an external USB disk or to a disk image you
+                    name. The internal SSD is not touched: Windows has never
+                    reached the kernel on this hardware.
                   </p>
                 </div>
               </div>
@@ -64,10 +67,11 @@
                   </svg>
                 </span>
                 <div>
-                  <strong>This Mac cannot install Windows yet.</strong>
-                  <p id="intro-status-detail">
-                    The loader-to-kernel handoff is unsolved and there is no graphics
-                    driver. The remaining steps show what is ready and what is missing.
+                  <strong>Windows cannot boot on this Mac yet.</strong>
+                  <p>
+                    The loader-to-kernel handoff is unsolved and there is no
+                    graphics driver. Installer media built here is real and will
+                    be usable the day the handoff works.
                   </p>
                 </div>
               </div>
@@ -90,12 +94,21 @@
                   </span>
                 </label>
 
-                <label class="task is-disabled">
-                  <input type="checkbox" disabled data-task="usb">
+                <label class="task">
+                  <input type="checkbox" id="task-media" checked data-task="media">
                   <span>
                     <strong>Create a bootable Windows installer</strong>
-                    <span>Unavailable. Windows has never reached the kernel on this
-                    machine, so there is no boot path to install.</span>
+                    <span>Validates a Windows 11 Arm64 ISO and writes a FAT32 UEFI
+                    installer to a USB disk or a disk image.</span>
+                  </span>
+                </label>
+
+                <label class="task">
+                  <input type="checkbox" id="task-space" checked data-task="space">
+                  <span>
+                    <strong>Reserve space for Windows</strong>
+                    <span>Measured against this Mac's APFS container. The resize
+                    itself waits for a Windows build that boots.</span>
                   </span>
                 </label>
 
@@ -113,15 +126,15 @@
                   <input type="checkbox" disabled data-task="install">
                   <span>
                     <strong>Install Windows</strong>
-                    <span>Unavailable. The loader-to-kernel handoff is unsolved, and
-                    this assistant does not write to a disk.</span>
+                    <span>Unavailable. The loader-to-kernel handoff is unsolved;
+                    nothing can be installed to a partition that cannot boot.</span>
                   </span>
                 </label>
               </div>
 
               <p class="fine">
                 The compatibility check runs only the repository's read-only
-                checkers. Nothing is downloaded or installed.
+                checkers. Nothing is downloaded.
               </p>
             </section>
 
@@ -164,6 +177,84 @@
                 <div class="button-row" id="diagnostic-buttons"></div>
                 <pre class="output" id="diag-output" tabindex="0" aria-live="polite">No check has run in this session.</pre>
               </section>
+            </section>
+
+            <section class="pane" data-pane="installer" aria-labelledby="installer-title" hidden>
+              <h1 id="installer-title">Windows Installer</h1>
+              <p class="intro-line">
+                Choose a Windows 11 Arm64 ISO and a destination. The destination
+                is erased, formatted as one FAT32 partition, written with the
+                setup files and read back.
+              </p>
+
+              <section class="group">
+                <h2>Windows ISO</h2>
+                <div class="field-row">
+                  <input class="field" type="text" id="iso-path" spellcheck="false"
+                         placeholder="/Users/me/Downloads/Win11_24H2_ARM64.iso"
+                         aria-label="Path to the Windows ISO">
+                  <button class="button small" id="iso-browse" type="button" hidden>Choose…</button>
+                  <button class="button small" id="iso-check" type="button">Verify</button>
+                </div>
+                <p class="fine" id="iso-note">
+                  The ISO is mounted read-only, inspected and detached. Nothing
+                  is copied from it until you press Create Installer.
+                </p>
+                <dl class="spec-list" id="iso-facts"></dl>
+              </section>
+
+              <section class="group">
+                <h2>Destination</h2>
+                <div class="field-row">
+                  <select class="field" id="target-select" aria-label="Destination"></select>
+                  <button class="button small" id="target-refresh" type="button">Rescan</button>
+                </div>
+                <div class="field-row" id="image-row" hidden>
+                  <input class="field" type="text" id="image-path" spellcheck="false"
+                         placeholder="/Users/me/Desktop/WindowsInstaller.sparseimage"
+                         aria-label="Path for the disk image">
+                  <button class="button small" id="image-browse" type="button" hidden>Choose…</button>
+                </div>
+                <p class="fine" id="target-note">Looking for external USB disks…</p>
+                <div class="plan-box" id="media-plan" hidden></div>
+              </section>
+
+              <div class="button-row">
+                <button class="button default" id="create-media" type="button" disabled>Create Installer</button>
+                <span class="status-text" id="media-state"></span>
+              </div>
+              <pre class="output" id="media-log" tabindex="0" aria-live="polite" hidden></pre>
+            </section>
+
+            <section class="pane" data-pane="allocation" aria-labelledby="allocation-title" hidden>
+              <h1 id="allocation-title">Reserve Space for Windows</h1>
+              <p class="intro-line">
+                Boot Camp gave Windows one partition taken out of the macOS
+                container. This is the same measurement on this Mac, from the live
+                APFS container.
+              </p>
+
+              <section class="group">
+                <h2>This Mac's Storage</h2>
+                <dl class="spec-list" id="space-facts"></dl>
+                <p class="fine" id="space-note">Reading the APFS container…</p>
+              </section>
+
+              <section class="group">
+                <h2>Windows Partition</h2>
+                <div class="slider-row">
+                  <input type="range" id="space-slider" min="64" max="128" value="64"
+                         step="1" aria-label="Size of the Windows partition in gigabytes" disabled>
+                  <output class="slider-value" id="space-value">—</output>
+                </div>
+                <div class="plan-box" id="space-plan"><p class="fine">Waiting for the disk.</p></div>
+              </section>
+
+              <div class="button-row">
+                <button class="button default" id="allocate" type="button" disabled>Allocate Space</button>
+                <span class="status-text" id="space-state"></span>
+              </div>
+              <p class="fine" id="allocate-reason"></p>
             </section>
 
             <section class="pane" data-pane="safety" aria-labelledby="safety-title" hidden>
