@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
-SiliconCamp Assistant — a local, read-only setup walkthrough.
+SiliconCamp Assistant — a local Boot Camp-shaped setup assistant.
 
-The project can build m1n1 and the NTASP UEFI firmware, and it cannot yet boot
-Windows.  This serves a small Boot Camp-shaped UI that says exactly that: which
-images are present and match their pinned hashes, what the machine is, which
-safety gates are acknowledged, and which checks still pass.  It is deliberately
-not an installer.
+It serves the walkthrough, the repository's read-only checks, the installer
+media engine and the Windows space plan.  Windows still cannot boot on this
+hardware; the assistant says so in the same pane as the controls it cannot
+offer yet, and it never writes to an internal disk.
+
+What can write:
+
+  * installer media, and only to a disk image the user names or to an external
+    USB disk that is re-validated immediately before it is erased;
+  * nothing else.  The space plan is arithmetic over this Mac's APFS container,
+    not a resize.
 
 Safety properties:
 
   * binds only to 127.0.0.1;
   * serves files from ``web/`` only (no path traversal);
-  * the only command execution is a fixed allow-list of repository checkers;
-  * no request body is written to disk and no credentials are read.
+  * diagnostics run a fixed allow-list of repository checkers;
+  * write endpoints require a per-run token embedded in the page, so another
+    web page cannot post to the loopback server;
+  * one destructive job at a time, and the media engine re-checks the target
+    type before it erases anything.
 
 Run::
 
@@ -30,9 +39,13 @@ import json
 import mimetypes
 import os
 import platform
+import secrets
 import subprocess
 import sys
+import threading
 import time
+import traceback
+import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +55,17 @@ from urllib.parse import urlparse
 TOOL_DIR = Path(__file__).resolve().parent
 ROOT = TOOL_DIR.parents[1]
 WEB_DIR = TOOL_DIR / "web"
+
+if str(TOOL_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOL_DIR))
+
+import allocation  # noqa: E402 - local module, path set above
+import media  # noqa: E402 - local module, path set above
+
+#: Embedded in index.html and required by every write endpoint.  A page on
+#: another origin cannot read it, so it cannot drive the local server.
+TOKEN = secrets.token_urlsafe(24)
+TOKEN_PLACEHOLDER = "__SILICONCAMP_TOKEN__"
 
 #: The names in artifacts/SHA256SUMS and where a local build puts each one.
 ARTIFACTS = (
@@ -114,6 +138,16 @@ BLOCKERS = (
 
 ROADMAP = (
     {
+        "feature": "Create a bootable Windows installer",
+        "state": "available",
+        "detail": "Validates a Windows Arm64 ISO and writes FAT32 UEFI media to a USB disk or a disk image, then reads every file back.",
+    },
+    {
+        "feature": "Reserve space for Windows",
+        "state": "planned",
+        "detail": "The BOOTCAMP size is computed from the live APFS container. The resize stays disabled until Windows can boot.",
+    },
+    {
         "feature": "Install Windows from an ISO",
         "state": "blocked",
         "detail": "No bootable Windows path exists yet; there is nothing an installer could write.",
@@ -122,11 +156,6 @@ ROADMAP = (
         "feature": "Choose a startup disk at boot",
         "state": "blocked",
         "detail": "iBoot only chainloads; there is no installed boot entry to select.",
-    },
-    {
-        "feature": "Partition or resize the internal disk",
-        "state": "blocked",
-        "detail": "The ANS2 driver is untested and no user-space disk tooling exists.",
     },
     {
         "feature": "Drivers after install",
@@ -324,7 +353,7 @@ def build_status() -> dict[str, object]:
     ready = bool(artifacts) and all(row["status"] == "match" for row in artifacts)
     return {
         "product": "SiliconCamp Assistant",
-        "version": "0.2",
+        "version": "0.3",
         "preview": True,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "machine": machine_info(),
@@ -341,12 +370,104 @@ def build_status() -> dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
+# Background jobs: media creation can take minutes and must not block the UI.
+# ---------------------------------------------------------------------------
+
+
+class Job:
+    """One long-running operation with a bounded transcript."""
+
+    def __init__(self, job_id: str, kind: str) -> None:
+        self.id = job_id
+        self.kind = kind
+        self.state = "running"
+        self.result: object = None
+        self.error = ""
+        self.started = time.time()
+        self.finished: float | None = None
+        self.notes: list[str] = []
+        self._lock = threading.Lock()
+
+    def log(self, message: str) -> None:
+        text = str(message).rstrip()
+        if not text:
+            return
+        with self._lock:
+            self.notes.append(text)
+            if len(self.notes) > 500:
+                del self.notes[: len(self.notes) - 500]
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            notes = list(self.notes)
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "state": self.state,
+            "notes": notes,
+            "result": self.result,
+            "error": self.error,
+            "seconds": round((self.finished or time.time()) - self.started, 1),
+        }
+
+
+class Jobs:
+    """At most one writer at a time, and a short history for the UI."""
+
+    def __init__(self) -> None:
+        self._jobs: dict[str, Job] = {}
+        self._order: list[str] = []
+        self._active: str = ""
+        self._lock = threading.Lock()
+
+    def start(self, kind: str, work) -> str:
+        with self._lock:
+            if self._active:
+                raise RuntimeError("another write is already running")
+            job_id = uuid.uuid4().hex[:12]
+            job = Job(job_id, kind)
+            self._jobs[job_id] = job
+            self._order.append(job_id)
+            self._active = job_id
+            while len(self._order) > 20:
+                self._jobs.pop(self._order.pop(0), None)
+        thread = threading.Thread(target=self._run, args=(job, work), daemon=True)
+        thread.start()
+        return job_id
+
+    def _run(self, job: Job, work) -> None:
+        try:
+            job.result = work(job.log)
+            job.state = "done"
+        except (media.MediaError, allocation.AllocationError, OSError) as exc:
+            job.error = str(exc)
+            job.state = "failed"
+            job.log(f"error: {exc}")
+        except Exception as exc:  # noqa: BLE001 - the transcript is the report
+            job.error = f"unexpected failure: {exc}"
+            job.state = "failed"
+            job.log(traceback.format_exc())
+        finally:
+            job.finished = time.time()
+            with self._lock:
+                if self._active == job.id:
+                    self._active = ""
+
+    def get(self, job_id: str) -> Job | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+
+JOBS = Jobs()
+
+
+# ---------------------------------------------------------------------------
 # HTTP.
 # ---------------------------------------------------------------------------
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SiliconCampAssistant/0.2"
+    server_version = "SiliconCampAssistant/0.3"
     sys_version = ""
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -390,7 +511,49 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if path == "/api/installer":
+            self._installer()
+            return
+        if path == "/api/allocation":
+            self._allocation()
+            return
+        if path.startswith("/api/jobs/"):
+            job = JOBS.get(path.rsplit("/", 1)[-1])
+            if job is None:
+                self._error(HTTPStatus.NOT_FOUND, "unknown job")
+                return
+            self._json(job.snapshot())
+            return
         self._static(path)
+
+    def _installer(self) -> None:
+        try:
+            data = media.list_targets()
+        except media.MediaError as exc:
+            self._json({"targets": [], "wimlib": "", "boot_disk": "", "error": str(exc)})
+            return
+        self._json(data)
+
+    def _allocation(self) -> None:
+        try:
+            stats = allocation.read_host_space()
+        except allocation.AllocationError as exc:
+            self._json({"error": str(exc), "stats": None}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        #
+        # Default to a size that leaves macOS headroom rather than the largest
+        # allowed: Boot Camp did not start its slider at the maximum either.
+        #
+        ceiling = int(stats["max_gb"])
+        preferred = max(allocation.MIN_WINDOWS_GB, int(ceiling * 0.75))
+        default = min(128, max(allocation.MIN_WINDOWS_GB, min(preferred, ceiling)))
+        self._json(
+            {
+                "stats": stats,
+                "default_gb": default,
+                "plan": allocation.plan_space(default, stats=stats),
+            }
+        )
 
     def _static(self, path: str) -> None:
         if path in ("", "/"):
@@ -416,27 +579,70 @@ class Handler(BaseHTTPRequestHandler):
             "application/json",
         ):
             content_type += "; charset=utf-8"
+        if target.name == "index.html":
+            body = body.replace(
+                TOKEN_PLACEHOLDER.encode("ascii"), TOKEN.encode("ascii")
+            )
         self._headers(HTTPStatus.OK, content_type, len(body))
         self.wfile.write(body)
 
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if urlparse(self.path).path != "/api/check":
-            self._error(HTTPStatus.NOT_FOUND, "not found")
-            return
+    def _body(self, limit: int = 8192) -> dict | None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             self._error(HTTPStatus.BAD_REQUEST, "bad length")
-            return
-        if length <= 0 or length > 4096:
+            return None
+        if length <= 0 or length > limit:
             self._error(HTTPStatus.BAD_REQUEST, "bad body")
-            return
+            return None
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            self._error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "expected application/json")
+            return None
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._error(HTTPStatus.BAD_REQUEST, "bad json")
+            return None
+        if not isinstance(payload, dict):
+            self._error(HTTPStatus.BAD_REQUEST, "expected an object")
+            return None
+        return payload
+
+    def _authorised_write(self) -> bool:
+        """Reject a write that did not come from this page."""
+        supplied = self.headers.get("X-SiliconCamp-Token", "")
+        if not secrets.compare_digest(supplied, TOKEN):
+            self._error(HTTPStatus.FORBIDDEN, "missing or wrong write token")
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            port = self.server.server_address[1]
+            if origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+                self._error(HTTPStatus.FORBIDDEN, "cross-origin write")
+                return False
+        return True
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        path = urlparse(self.path).path
+        if path == "/api/installer/inspect":
+            self._inspect_iso()
             return
-        check_id = payload.get("id") if isinstance(payload, dict) else None
+        if path == "/api/installer/plan":
+            self._plan_iso()
+            return
+        if path == "/api/installer/create":
+            self._create_media()
+            return
+        if path == "/api/allocation/plan":
+            self._plan_allocation()
+            return
+        if path != "/api/check":
+            self._error(HTTPStatus.NOT_FOUND, "not found")
+            return
+        payload = self._body(limit=4096)
+        if payload is None:
+            return
+        check_id = payload.get("id")
         if check_id not in CHECKS:
             self._error(HTTPStatus.BAD_REQUEST, "unknown check")
             return
@@ -478,6 +684,89 @@ class Handler(BaseHTTPRequestHandler):
                 "output": output[-16000:],
             }
         )
+
+    # -- installer media ---------------------------------------------------
+
+    def _inspect_iso(self) -> None:
+        payload = self._body()
+        if payload is None:
+            return
+        iso = str(payload.get("iso", "")).strip()
+        if not iso:
+            self._error(HTTPStatus.BAD_REQUEST, "no ISO path")
+            return
+        try:
+            found = media.inspect_iso(iso)
+        except media.MediaError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._json({"iso": str(Path(iso).expanduser()), "payload": found.summary()})
+
+    def _target_from(self, raw: object) -> dict[str, object]:
+        if not isinstance(raw, dict):
+            raise media.MediaError("no destination")
+        kind = str(raw.get("kind", ""))
+        if kind == "disk":
+            return {"kind": "disk", "device": str(raw.get("device", "")), "label": str(raw.get("label") or "WINDOWS")}
+        if kind == "image":
+            return {"kind": "image", "path": str(raw.get("path", "")), "label": str(raw.get("label") or "WINDOWS")}
+        raise media.MediaError(f"unknown destination kind: {kind!r}")
+
+    def _plan_iso(self) -> None:
+        payload = self._body()
+        if payload is None:
+            return
+        iso = str(payload.get("iso", "")).strip()
+        try:
+            plan = media.plan_iso(iso, target=self._target_from(payload.get("target")))
+        except media.MediaError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._json(plan)
+
+    def _create_media(self) -> None:
+        if not self._authorised_write():
+            return
+        payload = self._body()
+        if payload is None:
+            return
+        try:
+            iso = str(payload.get("iso", "")).strip()
+            target = self._target_from(payload.get("target"))
+            confirm = bool(payload.get("confirm"))
+            if target["kind"] == "disk" and not confirm:
+                raise media.MediaError("erasing a USB disk needs an explicit confirmation")
+            if target["kind"] == "image":
+                # Fail the request, not a background job, for a path that can
+                # never be written.
+                media.normalise_image(str(target.get("path", "")))
+
+            def work(log):
+                return media.create_media(iso, target=target, confirm=confirm, log=log)
+
+            job_id = JOBS.start("installer", work)
+        except (media.MediaError, RuntimeError) as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        self._json({"job": job_id}, status=HTTPStatus.ACCEPTED)
+
+    # -- space allocation --------------------------------------------------
+
+    def _plan_allocation(self) -> None:
+        payload = self._body()
+        if payload is None:
+            return
+        try:
+            gib = int(payload.get("gib", 0))
+        except (TypeError, ValueError):
+            self._error(HTTPStatus.BAD_REQUEST, "bad size")
+            return
+        try:
+            stats = allocation.read_host_space()
+        except allocation.AllocationError as exc:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
+            return
+        self._json(allocation.plan_space(gib, stats=stats))
 
 
 def main() -> int:

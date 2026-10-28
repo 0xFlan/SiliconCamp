@@ -1,11 +1,68 @@
 import AppKit
 import Darwin
+import UniformTypeIdentifiers
 import WebKit
+
+/// Native file pickers.  A WKWebView cannot hand the page a real path from
+/// `<input type=file>`, and the server needs a path it can open, so the "Choose…"
+/// buttons come here and the result goes back through `siliconcampPicked`.
+final class FilePickerBridge: NSObject, WKScriptMessageHandler {
+    weak var webView: WKWebView?
+
+    func userContentController(
+        _ controller: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard let body = message.body as? [String: Any],
+              let kind = body["kind"] as? String else { return }
+        DispatchQueue.main.async { self.present(kind: kind) }
+    }
+
+    private func present(kind: String) {
+        if kind == "iso" {
+            let panel = NSOpenPanel()
+            panel.message = "Choose a Windows 11 Arm64 ISO"
+            panel.prompt = "Choose"
+            panel.canChooseDirectories = false
+            panel.canChooseFiles = true
+            panel.allowsMultipleSelection = false
+            if let type = UTType(filenameExtension: "iso") {
+                panel.allowedContentTypes = [type]
+            }
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            send(kind: "iso", path: url.path)
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.message = "Save the installer as a disk image"
+        panel.prompt = "Save"
+        panel.nameFieldStringValue = "WindowsInstaller.sparseimage"
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        if let type = UTType(filenameExtension: "sparseimage") {
+            panel.allowedContentTypes = [type]
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        send(kind: "image", path: url.path)
+    }
+
+    private func send(kind: String, path: String) {
+        guard let webView else { return }
+        let arguments = [kind, path]
+        guard let data = try? JSONSerialization.data(withJSONObject: arguments),
+              let json = String(data: data, encoding: .utf8) else { return }
+        webView.evaluateJavaScript(
+            "window.siliconcampPicked && window.siliconcampPicked.apply(null, \(json))"
+        )
+    }
+}
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private let port = 8770
     private var window: NSWindow!
     private var webView: WKWebView!
+    private var bridge: FilePickerBridge?
     private var server: Process?
     private var ownsServer = false
     private var logHandle: FileHandle?
@@ -26,13 +83,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             return
         }
 
-        if serverIsRunningWithRetries() {
+        //
+        // A synchronous HTTP probe here can deadlock on the main thread, which
+        // made a perfectly healthy assistant look like a foreign process and
+        // showed the error page instead of the walkthrough.  A TCP connect is
+        // enough to decide whether to start a server; the page itself reports
+        // a server it cannot talk to.
+        //
+        if portIsOpen() {
             loadWalkthrough()
-        } else if portIsOpen() {
-            showFailure(
-                title: "Port 8770 is already in use",
-                detail: "Another process is listening there. Quit it and reopen SiliconCamp Assistant, or stop the other assistant server."
-            )
         } else {
             startServer(root: root)
         }
@@ -74,7 +133,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        let controller = WKUserContentController()
+        let picker = FilePickerBridge()
+        controller.add(picker, name: "siliconcamp")
+        configuration.userContentController = controller
         let web = WKWebView(frame: frame, configuration: configuration)
+        picker.webView = web
+        bridge = picker
         web.setValue(false, forKey: "drawsBackground")
         web.autoresizingMask = [.width, .height]
         web.navigationDelegate = self
@@ -158,10 +223,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         return nil
     }
 
-    private func statusURL() -> URL? {
-        URL(string: "http://127.0.0.1:\(port)/api/status")
-    }
-
     private func portIsOpen() -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
@@ -179,36 +240,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             }
         }
         return result == 0
-    }
-
-    private func serverIsRunningWithRetries() -> Bool {
-        for attempt in 0..<3 {
-            if serverIsRunning() {
-                return true
-            }
-            if attempt < 2 {
-                usleep(80_000)
-            }
-        }
-        return false
-    }
-
-    private func serverIsRunning() -> Bool {
-        guard let url = statusURL() else { return false }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 0.35
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var reachable = false
-        URLSession.shared.dataTask(with: request) { _, response, _ in
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                reachable = true
-            }
-            semaphore.signal()
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + 0.5)
-        return reachable
     }
 
     private func startServer(root: URL) {
@@ -247,7 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     private func waitForServer(attempts: Int) {
-        if serverIsRunning() {
+        if portIsOpen() {
             loadWalkthrough()
             return
         }
@@ -330,6 +361,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if screenshotPath != nil {
+            fputs("loaded \(webView.url?.absoluteString ?? "nil")\n", stderr)
+        }
         captureScreenshotIfRequested()
     }
 

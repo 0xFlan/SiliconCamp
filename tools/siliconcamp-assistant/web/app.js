@@ -3,47 +3,40 @@
 (() => {
   const $ = (selector) => document.querySelector(selector);
   const SAFETY_KEY = "siliconcamp.safety.v1";
+  const TOKEN =
+    document.querySelector('meta[name="siliconcamp-token"]')?.content || "";
 
+  // Boot Camp's order, with the two steps this project can actually perform.
   const STEPS = [
-    {
-      id: "intro",
-      note: "Read-only. Nothing is downloaded or installed.",
-      next: "Continue",
-    },
-    {
-      id: "tasks",
-      note: "The check is read-only.",
-      next: "Continue",
-    },
-    {
-      id: "readiness",
-      note: "Checks run locally.",
-      next: "Continue",
-    },
-    {
-      id: "safety",
-      note: "",
-      next: "Continue",
-    },
-    {
-      id: "review",
-      note: "Nothing here enables an install.",
-      next: "Continue",
-    },
-    {
-      id: "install",
-      note: "Nothing was written to a disk.",
-      next: "",
-    },
+    { id: "intro", needs: [] },
+    { id: "tasks", needs: [] },
+    { id: "readiness", needs: ["check"] },
+    { id: "installer", needs: ["media"] },
+    { id: "allocation", needs: ["space"] },
+    { id: "safety", needs: [] },
+    { id: "review", needs: [] },
+    { id: "install", needs: [] },
   ];
+
+  const TASK_IDS = ["check", "media", "space"];
 
   const state = {
     status: null,
+    installer: null,
+    allocation: null,
+    plan: null,
+    spacePlan: null,
+    iso: "",
+    job: null,
+    jobTimer: null,
+    armed: "",
+    busy: false,
     current: 0,
-    running: false,
     safety: loadSafety(),
     toastTimer: null,
   };
+
+  const bridge = window.webkit?.messageHandlers?.siliconcamp;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -51,6 +44,8 @@
     if (text !== undefined && text !== null) node.textContent = String(text);
     return node;
   }
+
+  // -- stored acknowledgements -------------------------------------------------
 
   function loadSafety() {
     try {
@@ -75,39 +70,32 @@
     }
   }
 
+  // -- helpers -----------------------------------------------------------------
+
   function formatBytes(value) {
-    if (!value) return "not built";
-    const units = ["B", "KB", "MB", "GB"];
-    let size = Number(value);
+    const size = Number(value) || 0;
+    if (!size) return "none";
+    const units = ["bytes", "KB", "MB", "GB", "TB"];
+    let scaled = size;
     let unit = 0;
-    while (size >= 1000 && unit < units.length - 1) {
-      size /= 1000;
+    while (scaled >= 1000 && unit < units.length - 1) {
+      scaled /= 1000;
       unit += 1;
     }
-    return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+    return `${scaled.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
   }
 
-  function artifactState(row) {
-    switch (row.status) {
-      case "match":
-        return { label: "Matches", kind: "ok" };
-      case "mismatch":
-        return { label: "Mismatch", kind: "bad" };
-      case "unpinned":
-        return { label: "Not pinned", kind: "warn" };
-      default:
-        return { label: "Not built", kind: "warn" };
-    }
+  function formatGib(value) {
+    return `${Number(value).toFixed(0)} GB`;
   }
 
-  function roadmapKind(value) {
-    if (value === "blocked" || value === "missing") return "bad";
-    if (value === "preview") return "ok";
-    return "warn";
+  function taskOn(id) {
+    const box = document.querySelector(`[data-task="${id}"]`);
+    return box ? box.checked : false;
   }
 
-  function blockerKind(value) {
-    return value === "unsolved" || value === "none" ? "bad" : "warn";
+  function activeSteps() {
+    return STEPS.filter((step) => step.needs.every((id) => taskOn(id)));
   }
 
   function showToast(message) {
@@ -122,65 +110,75 @@
     }, 2600);
   }
 
-  function taskSelected() {
-    const box = $("#task-check");
-    return box ? box.checked : false;
-  }
-
-  function countGates() {
-    return Array.from(document.querySelectorAll("[data-gate]")).filter(
-      (box) => box.checked
-    ).length;
-  }
-
-  function updateChrome() {
-    const step = STEPS[state.current];
-    const back = $("#back-button");
-    const next = $("#next-button");
-
-    back.disabled = state.current === 0;
-    next.hidden = state.current === STEPS.length - 1;
-    next.textContent = step.next || "Continue";
-    next.disabled = step.id === "tasks" && !taskSelected();
-
-    if (step.id === "tasks") {
-      $("#action-note").textContent = taskSelected()
-        ? step.note
-        : "Select the compatibility check to continue.";
-    } else if (step.id === "safety") {
-      const checked = countGates();
-      $("#action-note").textContent =
-        `${checked} of 4 checked. Installation stays disabled.`;
-    } else {
-      $("#action-note").textContent = step.note;
+  function actionNote(step) {
+    switch (step.id) {
+      case "intro":
+        return "Nothing is written until you press Create Installer.";
+      case "tasks": {
+        const count = TASK_IDS.filter(taskOn).length;
+        return count
+          ? `${count} task(s) selected.`
+          : "Select at least one task to continue.";
+      }
+      case "readiness":
+        return "Checks run locally.";
+      case "installer": {
+        if (state.job && state.job.state === "running") return "Writing the installer…";
+        if (!state.iso) return "Choose a Windows Arm64 ISO.";
+        if (state.plan?.blockers?.length) return "The destination cannot hold this media.";
+        if (selectedTarget().kind === "disk") {
+          return "The USB disk will be erased before it is written.";
+        }
+        return "A new disk image will be created, written and verified.";
+      }
+      case "allocation":
+        return "This step measures only; the internal disk is not changed.";
+      case "safety": {
+        const checked = Array.from(document.querySelectorAll("[data-gate]")).filter(
+          (box) => box.checked
+        ).length;
+        return `${checked} of 4 checked. Installation stays disabled.`;
+      }
+      case "review":
+        return "Nothing here enables an install.";
+      default:
+        return "Nothing was written to the internal disk.";
     }
   }
 
-  function showStep(index, focus = true) {
-    const clamped = Math.max(0, Math.min(STEPS.length - 1, index));
-    if (
-      clamped > state.current &&
-      STEPS[state.current].id === "tasks" &&
-      !taskSelected()
-    ) {
-      showToast("Select the compatibility check to continue.");
-      return;
-    }
-    state.current = clamped;
-
+  function renderStepList() {
+    const steps = activeSteps();
+    const step = steps[Math.min(state.current, steps.length - 1)];
     for (const pane of document.querySelectorAll(".pane")) {
-      const active = pane.dataset.pane === STEPS[clamped].id;
+      const active = pane.dataset.pane === step.id;
       pane.hidden = !active;
       pane.classList.toggle("is-active", active);
     }
+    $("#back-button").disabled = state.current === 0;
+    const next = $("#next-button");
+    const last = state.current >= steps.length - 1;
+    next.hidden = last;
+    next.textContent = "Continue";
+    next.disabled = step.id === "tasks" && !TASK_IDS.some(taskOn);
+    $("#action-note").textContent = actionNote(step);
+    return step;
+  }
 
+  function showStep(index, focus = true) {
+    const steps = activeSteps();
+    const max = steps.length - 1;
+    const clamped = Math.max(0, Math.min(max, index));
+    if (clamped > state.current && steps[state.current].id === "tasks" && !TASK_IDS.some(taskOn)) {
+      showToast("Select at least one task to continue.");
+      return;
+    }
+    state.current = clamped;
+    const step = renderStepList();
     $("#panes").scrollTop = 0;
-    updateChrome();
-
+    if (step.id === "installer" && !state.installer) loadInstaller();
+    if (step.id === "allocation" && !state.allocation) loadAllocation();
     if (focus) {
-      const heading = document.querySelector(
-        `.pane[data-pane="${STEPS[clamped].id}"] h1`
-      );
+      const heading = document.querySelector(`.pane[data-pane="${step.id}"] h1`);
       if (heading) {
         heading.setAttribute("tabindex", "-1");
         heading.focus({ preventScroll: true });
@@ -189,47 +187,18 @@
   }
 
   function nextStep() {
-    if (state.current < STEPS.length - 1) showStep(state.current + 1);
+    showStep(state.current + 1);
   }
 
   function previousStep() {
-    if (state.current > 0) showStep(state.current - 1);
+    showStep(state.current - 1);
   }
 
-  function updateSafety() {
-    const gates = Array.from(document.querySelectorAll("[data-gate]"));
-    let checked = 0;
-    for (const gate of gates) {
-      gate.checked = state.safety[gate.dataset.gate] === true;
-      if (gate.checked) checked += 1;
-    }
-    $("#safety-note").textContent =
-      checked === gates.length
-        ? "All four are checked. Installation is still unavailable: the Windows boot path does not exist."
-        : "All four are required before any hardware experiment. They do not enable installation.";
-    updateChrome();
-  }
-
-  function wireSafety() {
-    for (const gate of document.querySelectorAll("[data-gate]")) {
-      gate.addEventListener("change", () => {
-        state.safety[gate.dataset.gate] = gate.checked;
-        saveSafety();
-        updateSafety();
-      });
-    }
-    updateSafety();
-  }
-
-  function wireTasks() {
-    const box = $("#task-check");
-    if (box) box.addEventListener("change", updateChrome);
-  }
+  // -- readiness ---------------------------------------------------------------
 
   function renderMachine(status) {
     const machine = status.machine;
     const repo = status.repo;
-
     const facts = $("#machine-facts");
     facts.replaceChildren();
     const rows = [
@@ -245,13 +214,11 @@
     }
 
     const notes = [];
-    if (!machine.supported) {
-      notes.push(
-        "This is not the Mac16,3/J624 machine the firmware tables were captured from. The build still works, but every hardware expectation in this repository is untested here."
-      );
-    } else {
-      notes.push("This is the captured Mac16,3 / J624 / T8132 target.");
-    }
+    notes.push(
+      machine.supported
+        ? "This is the captured Mac16,3 / J624 / T8132 target."
+        : "This is not the Mac16,3/J624 machine the firmware tables were captured from. Every hardware expectation in this repository is untested here."
+    );
     if (repo.source_modified.length) {
       notes.push(`${repo.source_modified.length} tracked file(s) differ from the commit.`);
     }
@@ -259,36 +226,48 @@
       notes.push("The patched submodules are intentionally dirty; the patches are the source of truth.");
     }
     $("#machine-note").textContent = notes.join(" ");
+  }
 
-    if (!status.artifacts_ready) {
-      $("#intro-status-detail").textContent =
-        "One or more firmware images is missing or does not match its pinned hash. The install stays off: there is no Windows boot path and no graphics driver.";
+  function artifactState(row) {
+    switch (row.status) {
+      case "match":
+        return { label: "Matches", kind: "ok" };
+      case "mismatch":
+        return { label: "Mismatch", kind: "bad" };
+      case "unpinned":
+        return { label: "Not pinned", kind: "warn" };
+      default:
+        return { label: "Not built", kind: "warn" };
     }
   }
 
   function renderArtifacts(status) {
     const list = $("#artifact-list");
     list.replaceChildren();
-
     for (const row of status.artifacts) {
       const item = el("div", "artifact");
-
       const copy = el("div", "artifact-copy");
       copy.append(el("strong", null, row.name));
       copy.append(el("small", null, row.description));
       copy.append(el("div", "artifact-build", `build: ${row.build}`));
-
       const meta = el("div", "artifact-meta");
       const tag = artifactState(row);
       meta.append(el("span", `status-text ${tag.kind}`, tag.label));
       meta.append(el("small", null, formatBytes(row.size)));
-      if (row.actual) {
-        meta.append(el("small", null, `${row.actual.slice(0, 10)}…`));
-      }
-
+      if (row.actual) meta.append(el("small", null, `${row.actual.slice(0, 10)}…`));
       item.append(copy, meta);
       list.append(item);
     }
+  }
+
+  function roadmapKind(value) {
+    if (value === "available") return "ok";
+    if (value === "blocked" || value === "missing") return "bad";
+    return "warn";
+  }
+
+  function blockerKind(value) {
+    return value === "unsolved" || value === "none" ? "bad" : "warn";
   }
 
   function renderBlockers(status) {
@@ -298,9 +277,7 @@
       const item = el("li");
       const head = el("div");
       head.append(el("strong", null, blocker.name));
-      head.append(
-        el("span", `status-text ${blockerKind(blocker.status)}`, blocker.status)
-      );
+      head.append(el("span", `status-text ${blockerKind(blocker.status)}`, blocker.status));
       item.append(head, el("p", null, blocker.detail));
       list.append(item);
     }
@@ -328,9 +305,7 @@
       const feature = el("td");
       feature.append(el("strong", null, row.feature));
       const stateCell = el("td");
-      stateCell.append(
-        el("span", `status-text ${roadmapKind(row.state)}`, row.state)
-      );
+      stateCell.append(el("span", `status-text ${roadmapKind(row.state)}`, row.state));
       tr.append(feature, stateCell, el("td", null, row.detail));
       body.append(tr);
     }
@@ -348,8 +323,8 @@
   }
 
   async function runCheck(id, label) {
-    if (state.running) return;
-    state.running = true;
+    if (state.busy) return;
+    state.busy = true;
     const buttons = Array.from(document.querySelectorAll("#diagnostic-buttons button"));
     for (const button of buttons) button.disabled = true;
     const tag = $("#diag-state");
@@ -357,7 +332,6 @@
     tag.className = "status-text warn";
     const output = $("#diag-output");
     output.textContent = `Running ${label}…\n`;
-
     try {
       const response = await fetch("/api/check", {
         method: "POST",
@@ -383,26 +357,454 @@
       tag.textContent = "Offline";
       tag.className = "status-text bad";
     } finally {
-      state.running = false;
+      state.busy = false;
       for (const button of buttons) button.disabled = false;
     }
   }
 
-  function showError(message) {
-    $("#intro-status-detail").textContent = message;
-    showToast("The local assistant is not responding. Start server.py and reload.");
+  // -- installer media ---------------------------------------------------------
+
+  function writeHeaders(json = true) {
+    const headers = { "X-SiliconCamp-Token": TOKEN };
+    if (json) headers["Content-Type"] = "application/json";
+    return headers;
   }
 
-  function render() {
-    const status = state.status;
-    if (!status) return;
-    renderMachine(status);
-    renderArtifacts(status);
-    renderBlockers(status);
-    renderChain(status);
-    renderRoadmap(status);
-    renderDiagnostics(status);
+  function selectedTarget() {
+    const select = $("#target-select");
+    const value = select?.value || "";
+    if (value.startsWith("disk:")) {
+      return { kind: "disk", device: value.slice(5) };
+    }
+    return { kind: "image", path: $("#image-path")?.value.trim() || "" };
+  }
+
+  function targetLabel() {
+    const select = $("#target-select");
+    return select?.selectedOptions?.[0]?.textContent || "destination";
+  }
+
+  function renderTargets(data) {
+    const select = $("#target-select");
+    select.replaceChildren();
+    for (const row of data.targets || []) {
+      const option = el(
+        "option",
+        null,
+        `${row.name} — ${formatBytes(row.size)} (${row.device.replace("/dev/", "")})`
+      );
+      option.value = `disk:${row.device}`;
+      select.append(option);
+    }
+    const image = el("option", null, "Disk image…");
+    image.value = "image:";
+    select.append(image);
+
+    if (!data.targets?.length) {
+      select.value = "image:";
+    }
+
+    const note = $("#target-note");
+    if (data.error) {
+      note.textContent = `The disk list is unavailable: ${data.error}`;
+    } else if (!data.targets?.length) {
+      note.textContent =
+        "No external USB disk is connected. A disk image is written to a file and can be flashed later.";
+    } else {
+      note.textContent = `${data.targets.length} external USB disk(s) found. Erasing a USB disk destroys everything on it.`;
+    }
+    if (!data.wimlib) {
+      note.textContent +=
+        " wimlib is not installed; an install.wim larger than 4 GiB cannot be split (`brew install wimlib`).";
+    }
+    syncTargetRows();
+  }
+
+  function syncTargetRows() {
+    const target = selectedTarget();
+    $("#image-row").hidden = target.kind !== "image";
+    state.armed = "";
+    updateCreateButton();
+  }
+
+  function updateCreateButton() {
+    const button = $("#create-media");
+    if (!button) return;
+    const plan = state.plan;
+    const blocked = !plan || plan.blockers?.length > 0 || !state.iso;
+    const target = selectedTarget();
+    if (target.kind === "image" && !target.path) {
+      button.disabled = true;
+      button.textContent = "Create Installer";
+      return;
+    }
+    button.disabled = blocked || Boolean(state.job && state.job.state === "running");
+    if (target.kind === "disk") {
+      button.textContent = state.armed === target.device ? "Erase and Create" : "Create Installer";
+    } else {
+      button.textContent = "Create Installer";
+    }
+  }
+
+  async function loadInstaller() {
+    try {
+      const response = await fetch("/api/installer", { cache: "no-store" });
+      state.installer = await response.json();
+      renderTargets(state.installer);
+    } catch (error) {
+      $("#target-note").textContent = `Cannot read the destination list: ${error}`;
+    }
+  }
+
+  function renderIsoFacts(payload) {
+    const facts = $("#iso-facts");
+    facts.replaceChildren();
+    const rows = [
+      ["Boot loader", payload.boot_efi],
+      ["Setup image", payload.boot_wim],
+      ["Install image", `${payload.install_image} (${formatBytes(payload.install_bytes)})`],
+      ["Files", `${payload.file_count} · ${formatBytes(payload.total_bytes)}`],
+      ["Split needed", payload.needs_split ? "yes, install.wim exceeds 4 GiB" : "no"],
+    ];
+    for (const [term, value] of rows) {
+      const wrap = el("div");
+      wrap.append(el("dt", null, term), el("dd", null, value));
+      facts.append(wrap);
+    }
+  }
+
+  async function checkIso() {
+    const iso = $("#iso-path").value.trim();
+    const note = $("#iso-note");
+    state.iso = "";
+    state.plan = null;
+    $("#iso-facts").replaceChildren();
+    $("#media-plan").hidden = true;
+    updateCreateButton();
+    if (!iso) {
+      note.textContent = "Enter the path to a Windows 11 Arm64 ISO.";
+      return;
+    }
+    note.textContent = "Mounting and inspecting the ISO…";
+    try {
+      const response = await fetch("/api/installer/inspect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ iso }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        note.textContent = payload.error || "The ISO was rejected.";
+        return;
+      }
+      state.iso = payload.iso;
+      renderIsoFacts(payload.payload);
+      note.textContent = "This ISO has the Arm64 UEFI boot loader and the setup images Windows Setup needs.";
+      planMedia();
+    } catch (error) {
+      note.textContent = `Cannot reach the assistant: ${error}`;
+    }
+  }
+
+  async function planMedia() {
+    const target = selectedTarget();
+    const box = $("#media-plan");
+    if (!state.iso || (target.kind === "image" && !target.path)) {
+      box.hidden = true;
+      updateCreateButton();
+      return;
+    }
+    try {
+      const response = await fetch("/api/installer/plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ iso: state.iso, target }),
+      });
+      const plan = await response.json();
+      if (!response.ok) {
+        state.plan = null;
+        box.hidden = false;
+        box.replaceChildren(el("p", "plan-block", plan.error || "The destination was rejected."));
+        updateCreateButton();
+        updateChrome();
+        return;
+      }
+      state.plan = plan;
+      box.hidden = false;
+      box.replaceChildren();
+      box.append(el("h3", null, `${targetLabel()} · ${formatBytes(plan.capacity)}`));
+      const list = el("ol", "plan-steps");
+      for (const step of plan.steps) list.append(el("li", null, step));
+      box.append(list);
+      for (const blocker of plan.blockers) box.append(el("p", "plan-block", blocker));
+      for (const warning of plan.warnings) box.append(el("p", "plan-warn", warning));
+      if (target.kind === "disk") {
+        box.append(
+          el("p", "plan-warn", `Everything on ${target.device} is destroyed by this operation.`)
+        );
+      }
+      updateCreateButton();
+      updateChrome();
+    } catch (error) {
+      box.hidden = false;
+      box.replaceChildren(el("p", "plan-block", `Cannot plan: ${error}`));
+      updateCreateButton();
+      updateChrome();
+    }
+  }
+
+  function appendLog(line) {
+    const log = $("#media-log");
+    log.hidden = false;
+    log.textContent += `${line}\n`;
+    log.scrollTop = log.scrollHeight;
+  }
+
+  async function createMedia() {
+    if (state.busy) return;
+    const target = selectedTarget();
+    if (target.kind === "disk" && state.armed !== target.device) {
+      state.armed = target.device;
+      updateCreateButton();
+      showToast(`Press Create Installer again to erase ${target.device}.`);
+      return;
+    }
+    state.busy = true;
+    $("#media-log").textContent = "";
+    $("#media-log").hidden = false;
+    $("#media-state").textContent = "Starting";
+    $("#media-state").className = "status-text warn";
+    $("#create-media").disabled = true;
+    try {
+      const response = await fetch("/api/installer/create", {
+        method: "POST",
+        headers: writeHeaders(),
+        body: JSON.stringify({ iso: state.iso, target, confirm: true }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        appendLog(`error: ${payload.error || response.statusText}`);
+        $("#media-state").textContent = "Refused";
+        $("#media-state").className = "status-text bad";
+        return;
+      }
+      state.job = { id: payload.job, state: "running", seen: 0 };
+      pollJob();
+    } catch (error) {
+      appendLog(`cannot reach the assistant: ${error}`);
+      $("#media-state").textContent = "Offline";
+      $("#media-state").className = "status-text bad";
+    } finally {
+      state.busy = false;
+    }
+  }
+
+  async function pollJob() {
+    const job = state.job;
+    if (!job) return;
+    try {
+      const response = await fetch(`/api/jobs/${job.id}`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        appendLog(payload.error || "the job disappeared");
+        finishJob("Failed", "bad");
+        return;
+      }
+      const seen = job.id === payload.id ? job.seen || 0 : 0;
+      for (const line of payload.notes.slice(seen)) appendLog(line);
+      state.job = { ...payload, seen: payload.notes.length };
+      if (payload.state === "running") {
+        $("#media-state").textContent = "Writing";
+        state.jobTimer = setTimeout(pollJob, 700);
+        return;
+      }
+      if (payload.state === "done") {
+        const verified = payload.result?.verified;
+        appendLog(
+          verified
+            ? `done in ${payload.seconds}s: ${verified.checked} file(s) verified, ` +
+              `${verified.hashed} hashed`
+            : `done in ${payload.seconds}s`
+        );
+        finishJob("Created", "ok");
+        if (payload.result?.image) {
+          appendLog(`installer image: ${payload.result.image}`);
+        }
+      } else {
+        finishJob("Failed", "bad");
+      }
+    } catch (error) {
+      appendLog(`lost contact with the assistant: ${error}`);
+      finishJob("Failed", "bad");
+    }
+  }
+
+  function finishJob(label, kind) {
+    if (state.jobTimer) clearTimeout(state.jobTimer);
+    state.jobTimer = null;
+    state.job = state.job ? { ...state.job, state: "finished" } : null;
+    $("#media-state").textContent = label;
+    $("#media-state").className = `status-text ${kind}`;
+    updateCreateButton();
     updateChrome();
+  }
+
+  // -- space allocation --------------------------------------------------------
+
+  function renderSpaceFacts(stats) {
+    const facts = $("#space-facts");
+    facts.replaceChildren();
+    const rows = [
+      ["Volume", `${stats.volume} (${stats.container})`],
+      ["Container", formatBytes(stats.capacity)],
+      ["Free now", formatBytes(stats.free)],
+      ["Kept for macOS", formatBytes(stats.reserve)],
+      ["Maximum for Windows", `${stats.max_gb} GB`],
+    ];
+    for (const [term, value] of rows) {
+      const wrap = el("div");
+      wrap.append(el("dt", null, term), el("dd", null, value));
+      facts.append(wrap);
+    }
+    $("#space-note").textContent =
+      stats.max_gb < stats.minimum_gb
+        ? `Windows needs at least ${stats.minimum_gb} GB, and this Mac cannot give that up without eating into the reserve. Free space first.`
+        : "Measured from this Mac's APFS container; nothing has been resized.";
+  }
+
+  async function loadAllocation() {
+    const slider = $("#space-slider");
+    try {
+      const response = await fetch("/api/allocation", { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) {
+        $("#space-note").textContent = payload.error || "The APFS container could not be read.";
+        slider.disabled = true;
+        return;
+      }
+      state.allocation = payload;
+      renderSpaceFacts(payload.stats);
+      const low = Math.min(payload.stats.minimum_gb, payload.stats.max_gb || payload.stats.minimum_gb);
+      slider.min = String(Math.max(1, low));
+      slider.max = String(Math.max(slider.min, payload.stats.max_gb || payload.default_gb));
+      slider.step = "1";
+      slider.disabled = false;
+      slider.value = String(payload.default_gb);
+      renderSpacePlan(payload.plan);
+      if (state.current === activeSteps().findIndex((s) => s.id === "allocation")) {
+        updateChrome();
+      }
+    } catch (error) {
+      $("#space-note").textContent = `Cannot read the APFS container: ${error}`;
+    }
+  }
+
+  function renderSpacePlan(plan) {
+    state.spacePlan = plan;
+    const box = $("#space-plan");
+    box.replaceChildren();
+    $("#space-value").textContent = formatGib(plan.requested_gb);
+    box.append(el("h3", null, "Planned partition"));
+    const list = el("ul", "layout-list");
+    for (const row of plan.layout) {
+      const item = el("li");
+      item.append(el("strong", null, `${row.name} — ${formatBytes(row.bytes)}`));
+      item.append(el("span", null, `${row.role} · ${row.format} · ${row.note}`));
+      list.append(item);
+    }
+    box.append(list);
+    const after = el("p", "fine", `macOS keeps ${formatBytes(plan.after.free)} free (reserve ${formatBytes(plan.after.reserve)}).`);
+    box.append(after);
+    for (const blocker of plan.blockers) box.append(el("p", "plan-block", blocker));
+    for (const warning of plan.warnings) box.append(el("p", "plan-warn", warning));
+
+    const apply = $("#allocate");
+    apply.disabled = !plan.apply.enabled;
+    $("#allocate-reason").textContent = plan.apply.reason || "";
+    $("#space-state").textContent = "";
+  }
+
+  async function planSpace() {
+    const gib = Number($("#space-slider").value);
+    try {
+      const response = await fetch("/api/allocation/plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gib }),
+      });
+      const plan = await response.json();
+      if (!response.ok) {
+        $("#space-plan").replaceChildren(el("p", "plan-block", plan.error || "rejected"));
+        return;
+      }
+      renderSpacePlan(plan);
+    } catch (error) {
+      $("#space-plan").replaceChildren(el("p", "plan-block", `Cannot plan: ${error}`));
+    }
+  }
+
+  // -- native file pickers -----------------------------------------------------
+
+  window.siliconcampPicked = (kind, path) => {
+    if (!path) return;
+    if (kind === "iso") {
+      $("#iso-path").value = path;
+      checkIso();
+    } else if (kind === "image") {
+      $("#image-path").value = path;
+      planMedia();
+    }
+  };
+
+  function wireBrowsers() {
+    if (!bridge) return;
+    $("#iso-browse").hidden = false;
+    $("#image-browse").hidden = false;
+    $("#iso-browse").addEventListener("click", () => bridge.postMessage({ kind: "iso" }));
+    $("#image-browse").addEventListener("click", () => bridge.postMessage({ kind: "image" }));
+  }
+
+  // -- shell -------------------------------------------------------------------
+
+  function updateChrome() {
+    renderStepList();
+  }
+
+  function wireTasks() {
+    for (const id of TASK_IDS) {
+      const box = document.querySelector(`[data-task="${id}"]`);
+      if (box) box.addEventListener("change", () => showStep(state.current, false));
+    }
+  }
+
+  function updateSafety() {
+    const gates = Array.from(document.querySelectorAll("[data-gate]"));
+    let checked = 0;
+    for (const gate of gates) {
+      gate.checked = state.safety[gate.dataset.gate] === true;
+      if (gate.checked) checked += 1;
+    }
+    $("#safety-note").textContent =
+      checked === gates.length
+        ? "All four are checked. Installation is still unavailable: the Windows boot path does not exist."
+        : "All four are required before any hardware experiment. They do not enable installation.";
+    updateChrome();
+  }
+
+  function wireSafety() {
+    for (const gate of document.querySelectorAll("[data-gate]")) {
+      gate.addEventListener("change", () => {
+        state.safety[gate.dataset.gate] = gate.checked;
+        saveSafety();
+        updateSafety();
+      });
+    }
+    updateSafety();
+  }
+
+  function showError(message) {
+    showToast(message);
+    $("#machine-note").textContent = message;
   }
 
   async function load() {
@@ -410,7 +812,13 @@
       const response = await fetch("/api/status", { cache: "no-store" });
       if (!response.ok) throw new Error(`status ${response.status}`);
       state.status = await response.json();
-      render();
+      renderMachine(state.status);
+      renderArtifacts(state.status);
+      renderBlockers(state.status);
+      renderChain(state.status);
+      renderRoadmap(state.status);
+      renderDiagnostics(state.status);
+      updateChrome();
     } catch (error) {
       showError(
         `Cannot read http://127.0.0.1:8770/api/status (${error}). ` +
@@ -437,6 +845,21 @@
 
   wireTasks();
   wireSafety();
-  showStep(0, false);
+  wireBrowsers();
+  $("#iso-check").addEventListener("click", checkIso);
+  $("#iso-path").addEventListener("change", checkIso);
+  $("#target-select").addEventListener("change", () => {
+    syncTargetRows();
+    planMedia();
+  });
+  $("#target-refresh").addEventListener("click", loadInstaller);
+  $("#image-path").addEventListener("change", planMedia);
+  $("#create-media").addEventListener("click", createMedia);
+  $("#space-slider").addEventListener("input", () => {
+    $("#space-value").textContent = formatGib(Number($("#space-slider").value));
+  });
+  $("#space-slider").addEventListener("change", planSpace);
+
+  renderStepList();
   load();
 })();
