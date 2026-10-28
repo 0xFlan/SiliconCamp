@@ -1,0 +1,855 @@
+diff --git a/src/hv.h b/src/hv.h
+index de1e94d..8115ceb 100644
+--- a/src/hv.h
++++ b/src/hv.h
+@@ -132,6 +132,7 @@ void hv_psci_init(void);
+ #ifdef ENABLE_VGIC_MODULE
+ void hv_vgicv3_init(void);
+ void init_vgic_irq_queues(void);
++void hv_vgic3_drain_pending(void);
+ void hv_vgicv3_init_list_registers(void);
+ int hv_vgicv3_enable_virtual_interrupts(void);
+ #endif
+diff --git a/src/hv_exc.c b/src/hv_exc.c
+index 3f2841f..72fa29f 100644
+--- a/src/hv_exc.c
++++ b/src/hv_exc.c
+@@ -66,6 +66,77 @@ void init_vgic_irq_queues(void) {
+ #endif
+ }
+ 
++/*
++ * Deliver everything queued for this CPU that the guest currently allows.
++ *
++ * The queues exist because an interrupt can arrive while the guest has it
++ * disabled or while every list register is busy; the interrupt must survive
++ * that.  A FIFO that stops at its first undeliverable entry is not enough: a
++ * guest that has SGI 0 disabled would also stop receiving SGI 1, so this
++ * compacts instead, keeping the undeliverable entries in order and injecting
++ * the rest.
++ *
++ * The whole pass runs under the queue lock.  Producers push from other CPUs
++ * and from interrupt context, so compaction has to be invisible to them; the
++ * reader/consumer is only ever this CPU.
++ */
++static void hv_vgic3_drain_queue(virq_queue_t *q)
++{
++#ifdef ENABLE_VGIC_MODULE
++    spin_lock(&q->p_lock);
++
++    u32 tail = __atomic_load_n(&q->tail, __ATOMIC_RELAXED);
++    u32 head = __atomic_load_n(&q->head, __ATOMIC_ACQUIRE);
++    u32 kept = 0;
++
++    for (u32 i = tail; i != head; i++) {
++        virq_t pending = q->buf[i & (VIRQ_QUEUE_SIZE - 1)];
++
++        //
++        // hv_vgic3_inject_irq() re-checks the enable state, so an interrupt
++        // enabled between the test and the injection is not lost.
++        //
++        if (hv_vgic3_irq_enabled(pending.vintid) &&
++            hv_vgic3_inject_irq(
++                pending.vintid,
++                pending.priority,
++                pending.active,
++                pending.pending,
++                pending.hw_status,
++                pending.hw_irq
++            ))
++            continue;
++
++        q->buf[(tail + kept) & (VIRQ_QUEUE_SIZE - 1)] = pending;
++        kept++;
++    }
++
++    if (kept != (head - tail)) {
++        __atomic_store_n(&q->head, tail + kept, __ATOMIC_RELEASE);
++        sysop("dsb ishst");
++    }
++
++    spin_unlock(&q->p_lock);
++#endif
++}
++
++/*
++ * Drain every queue for this CPU.  Called when the guest enables something, so
++ * a pending interrupt is delivered at the point the guest asked for it rather
++ * than whenever the next unrelated interrupt happens to arrive.
++ */
++void hv_vgic3_drain_pending(void)
++{
++#ifdef ENABLE_VGIC_MODULE
++    if (!vgic_inited)
++        return;
++
++    hv_vgic3_drain_queue(&PERCPU(timer_queue));
++    hv_vgic3_drain_queue(&PERCPU(sgi_queue));
++    hv_vgic3_drain_queue(&PERCPU(irq_queue));
++#endif
++}
++
+ static void _hv_exc_proxy(struct exc_info *ctx, uartproxy_boot_reason_t reason, u32 type,
+                           void *extra)
+ {
+@@ -186,26 +257,28 @@ static void hv_update_fiq(void)
+ 
+         //TODO: proper injection
+ #ifdef ENABLE_VGIC_MODULE
+-        if(hv_vgic3_get_free_lr() != -1){
+-            hv_vgic3_inject_irq(
++        //
++        // Injection fails when the guest has the INTID disabled or there is no
++        // free list register; either way the timer stays queued and is retried
++        // on the next drain, rather than being dropped.
++        //
++        if(!hv_vgic3_inject_irq(
+                 17,                         //vintid
+                 hv_vgic3_get_priority(17),  //priority
+                 false,                      //active
+                 true,                       //pending
+                 false,                      //hw_status
+                 0                           //hw_irq
+-            );
+-        }
+-        else{
++            )){
+             virq_t pending = { 
+                 .vintid = 17, 
+                 .priority = 0x20, 
+                 .active = false, 
+                 .pending = true,
+-                .hw_status = false,
++                .hw_status = false, 
+                 .hw_irq = 0,
+             };
+-            virq_queue_push(&PERCPU(timer_queue), &pending);
++            virq_queue_push_unique(&PERCPU(timer_queue), &pending);
+         }
+ #endif
+     } else {
+@@ -218,26 +291,23 @@ static void hv_update_fiq(void)
+ 
+         //TODO: proper injection
+ #ifdef ENABLE_VGIC_MODULE
+-        if(hv_vgic3_get_free_lr() != -1){
+-            hv_vgic3_inject_irq(
++        if(!hv_vgic3_inject_irq(
+                 18,                         //vintid
+                 hv_vgic3_get_priority(18),  //priority
+                 false,                      //active
+                 true,                       //pending
+                 false,                      //hw_status
+                 0                           //hw_irq
+-            );
+-        }
+-        else{
++            )){
+             virq_t pending = { 
+                 .vintid = 18, 
+                 .priority = 0x20, 
+                 .active = false, 
+                 .pending = true,
+-                .hw_status = false,
++                .hw_status = false, 
+                 .hw_irq = 0,
+             };
+-            virq_queue_push(&PERCPU(timer_queue), &pending);
++            virq_queue_push_unique(&PERCPU(timer_queue), &pending);
+         }
+ #endif
+     } else {
+@@ -467,7 +537,7 @@ static bool hv_handle_msr_unlocked(struct exc_info *ctx, u64 iss)
+                         .hw_status = false,
+                         .hw_irq = 0,
+                     };
+-                    virq_queue_push(&PERCPU_N(cpu, sgi_queue), &pending);
++                    virq_queue_push_unique(&PERCPU_N(cpu, sgi_queue), &pending);
+                     smp_send_ipi(cpu);
+                 }
+             }
+@@ -1252,45 +1322,12 @@ void hv_exc_irq(struct exc_info *ctx)
+             }
+         }
+ 
+-        while(hv_vgic3_get_free_lr() != -1){
+-            virq_t pending;
+-            if (!virq_queue_pop(&PERCPU(timer_queue), &pending))
+-                break;
+-            hv_vgic3_inject_irq(
+-                pending.vintid,
+-                pending.priority,
+-                pending.active,
+-                pending.pending,
+-                pending.hw_status,
+-                pending.hw_irq
+-            );
+-        }
+-        while(hv_vgic3_get_free_lr() != -1){
+-            virq_t pending;
+-            if (!virq_queue_pop(&PERCPU(sgi_queue), &pending))
+-                break;
+-            hv_vgic3_inject_irq(
+-                pending.vintid,
+-                pending.priority,
+-                pending.active,
+-                pending.pending,
+-                pending.hw_status,
+-                pending.hw_irq
+-            );
+-        }
+-        while(hv_vgic3_get_free_lr() != -1){
+-            virq_t pending;
+-            if (!virq_queue_pop(&PERCPU(irq_queue), &pending))
+-                break;
+-            hv_vgic3_inject_irq(
+-                pending.vintid,
+-                pending.priority,
+-                pending.active,
+-                pending.pending,
+-                pending.hw_status,
+-                pending.hw_irq
+-            );
+-        }
++        //
++        // Timers first, then SGIs, then device interrupts.  The drain keeps an
++        // entry the guest has disabled queued instead of dropping it, and does
++        // not let that entry block the ones behind it in the same queue.
++        //
++        hv_vgic3_drain_pending();
+         return;
+     }
+ 
+@@ -1306,17 +1343,18 @@ void hv_exc_irq(struct exc_info *ctx)
+     if (!vintid)
+         return;
+ 
+-    if(hv_vgic3_get_free_lr() != -1){
+-        hv_vgic3_inject_irq(
+-            vintid,                      //vintid
+-            hv_vgic3_get_priority(vintid),  //priority
+-            false,                       //active
+-            true,                        //pending
+-            false,                       //hw_status
+-            0                            //hw_irq
+-        );
+-    }
+-    else{
++    if(!hv_vgic3_inject_irq(
++        vintid,                      //vintid
++        hv_vgic3_get_priority(vintid),  //priority
++        false,                       //active
++        true,                        //pending
++        false,                       //hw_status
++        0                            //hw_irq
++    )){
++        //
++        // The guest has this INTID disabled, or no list register is free.
++        // Queue it; the API's contract is that the interrupt is not lost.
++        //
+         virq_t pending = { 
+             .vintid = vintid, 
+             .priority = 0x40, 
+@@ -1325,7 +1363,7 @@ void hv_exc_irq(struct exc_info *ctx)
+             .hw_status = false, 
+             .hw_irq = 0,
+         };
+-        virq_queue_push(&PERCPU(irq_queue), &pending);
++        virq_queue_push_unique(&PERCPU(irq_queue), &pending);
+     }
+ #else
+     hv_wdt_breadcrumb('I');
+@@ -1402,19 +1440,12 @@ void hv_exc_fiq(struct exc_info *ctx)
+ 
+     if (mrs(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING) {
+ #ifdef ENABLE_VGIC_MODULE
+-        while(hv_vgic3_get_free_lr() != -1){//another CPU sent an IPI, check the sgi_queue
+-            virq_t pending;
+-            if (!virq_queue_pop(&PERCPU(sgi_queue), &pending))
+-                break;
+-            hv_vgic3_inject_irq(
+-                pending.vintid,
+-                pending.priority,
+-                pending.active,
+-                pending.pending,
+-                pending.hw_status,
+-                pending.hw_irq
+-            );
+-        }
++        //
++        // Another CPU sent an IPI.  The send side cannot know the receiver's
++        // GICR_ISENABLER0 state, so an SGI the target has not enabled stays
++        // queued here and is delivered when it is enabled.
++        //
++        hv_vgic3_drain_queue(&PERCPU(sgi_queue));
+ #endif
+         if (PERCPU(ipi_queued)) {
+             PERCPU(ipi_pending) = true;
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+index 518285a..9ad4887 100644
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -262,7 +262,12 @@ vgicv3_vcpu_redist *redistributors;
+ vgicv3_its *interrupt_translation_service;
+ static u64 dist_base, redist_base, its_base;
+ static u16 num_cpus;
+-static bool vgic_inited;
++//
++// Read from hv_exc.c as well: the queues must not run before the emulated
++// distributor exists.  It was file-static while nothing outside this file
++// consulted it, which left the declaration in hv_exc.c with no definition.
++//
++bool vgic_inited;
+ static u64 igrpen1;
+ 
+ extern uint64_t vaddr_bits;
+@@ -396,7 +401,14 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     //
+                     vgic_log("HV vGIC DEBUG [INFO]: guest is clearing EnableGrp0\n");
+                 }
+-                if(((gicd_ctlr_new_val & BIT(0)) == 0) && ((distributor->gicd_ctl_reg & BIT(0)) != 0)) {
++                //
++                // Every virtual interrupt is delivered as Group 1, so this bit
++                // turning on is the moment anything queued behind a disabled
++                // group becomes deliverable.
++                //
++                bool group1_enabled = ((distributor->gicd_ctl_reg & BIT(0)) == 0) &&
++                                      ((gicd_ctlr_new_val & BIT(0)) != 0);
++                if((gicd_ctlr_new_val & BIT(0)) == 0 && (distributor->gicd_ctl_reg & BIT(0)) != 0) {
+                     //
+                     // the guest is clearing EnableGrp1.
+                     //
+@@ -412,6 +424,8 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                 //
+                 gicd_ctlr_new_val &= ~BIT(31);
+                 distributor->gicd_ctl_reg = gicd_ctlr_new_val;
++                if (group1_enabled)
++                    hv_vgic3_drain_pending();
+                 register_handled = true;
+                 break;
+             case GIC_DIST_TYPER:
+@@ -547,7 +561,26 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+             // this for now.
+             //
+ 
+-            distributor->gicd_interrupt_group_regs[reg_num] = *val;
++            if (reg_num == 0) {
++                //
++                // With affinity routing enabled, the group of an SGI or PPI
++                // lives in its redistributor's GICR_IGROUPR0; this bank is
++                // RES0, and QEMU's GICv3 model also reads it as zero.
++                //
++            } else {
++                //
++                // Group 0 delivery is not implemented: every virtual interrupt
++                // is injected with ICH_LR_GRP1 set.  A register that could
++                // report Group 0 would describe a path that does not exist, so
++                // an attempt to move a modelled SPI out of Group 1 is ignored.
++                //
++                if (*val != 0xFFFFFFFF) {
++                    vgic_note(VGIC_NOTE_RO,
++                                 "HV vGIC [WARN]: GICD_IGROUPR%d write 0x%x ignored: no Group 0 delivery path\n",
++                                 reg_num, *val);
++                }
++                distributor->gicd_interrupt_group_regs[reg_num] = 0xFFFFFFFF;
++            }
+             register_handled = true;
+ 
+         }
+@@ -559,6 +592,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+             reg_num = (relative_addr - GIC_DIST_ISENABLER0) / 4;
+             u32 value_is_enabler, value_ic_enabler, current_val;
+             u32 irq_num;
++            bool newly_enabled = false;
+             value_is_enabler = distributor->gicd_interrupt_set_enable_regs[reg_num];
+             value_ic_enabler = distributor->gicd_interrupt_clear_enable_regs[reg_num];
+             current_val = *val;
+@@ -586,6 +620,7 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                     if (aic_irq)
+                         aic_set_mask(aic_irq, false);
+                     vgic_log("HV vGIC DEBUG [Info] [AIC]: unmasking irq %d (AIC %u)\n", irq_num, aic_irq);
++                    newly_enabled = true;
+                 }
+             }
+             if(reg_num == 0) {
+@@ -596,6 +631,15 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+                 distributor->gicd_interrupt_clear_enable_regs[reg_num] = value_ic_enabler;
+             }
+ 
++            //
++            // An SPI that arrived while disabled was queued, not dropped.
++            // Deliver it now that the guest has enabled it; waiting for the
++            // next unrelated interrupt would leave an edge-triggered source
++            // silent indefinitely.
++            //
++            if (newly_enabled)
++                hv_vgic3_drain_pending();
++
+             register_handled = true;
+ 
+         }
+@@ -932,9 +976,15 @@ static bool handle_vgic_dist_access(struct exc_info *ctx, u64 addr, u64 *val, bo
+             //
+             // sets an IRQ to pending
+             //
+-            u32 reg_num, irq_num;
++            u32 reg_num;
+             reg_num = (relative_addr - GIC_DIST_ISPENDR0) / 4;
+-            distributor->gicd_interrupt_set_pending_regs[reg_num];
++            //
++            // A read of ISPENDR returns the pending bitmap.  The previous
++            // statement evaluated the array element and dropped it, so the
++            // guest saw whatever the untouched value register contained --
++            // plain undefined behaviour to the guest.
++            //
++            *val = distributor->gicd_interrupt_set_pending_regs[reg_num];
+             register_handled = true;
+ 
+         }
+@@ -1043,22 +1093,10 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+     register_handled = false;
+     unimplemented_reg_accessed = false;
+     u8 cpu_num;
+-    u32 value_is_enabler, value_ic_enabler, current_val;
+-    u32 irq_num;
+     u32 reg_num;
+     u32 reg_offset;
+-    value_ic_enabler = 0;
+-    value_is_enabler = 0;
+-    current_val = 0;
+-    irq_num = 0;
+     reg_num = 0;
+     reg_offset = 0;
+-    /*
+-     * irq_num exists for the per-access trace below, which vgic_log() compiles
+-     * out by default.  Reference it so enabling the trace later cannot silently
+-     * break the build, and so this does not warn today.
+-     */
+-    (void)irq_num;
+ 
+     cpu_num = (u8)frame;
+     if(write) {
+@@ -1242,178 +1280,81 @@ static bool handle_vgic_redist_access(struct exc_info *ctx, u64 addr, u64 *val,
+             // SGI region
+             //
+             case GIC_REDIST_IGROUPR0:
+-                redistributors[cpu_num].sgi_region.gicr_igroupr0 = *val;
++                //
++                // The same rule as GICD_IGROUPR: every virtual interrupt has
++                // ICH_LR_GRP1 set, so the SGI/PPI group register reports Group 1
++                // and a write that tries to select Group 0 is ignored.
++                //
++                if (*val != 0xFFFFFFFF) {
++                    vgic_note(VGIC_NOTE_RO,
++                                 "HV vGIC [WARN]: GICR_IGROUPR0 write 0x%x ignored for frame %u: no Group 0 delivery path\n",
++                                 *val, frame);
++                }
++                redistributors[cpu_num].sgi_region.gicr_igroupr0 = 0xFFFFFFFF;
+                 register_handled = true;
+                 break;
+             case GIC_REDIST_ISENABLER0:
+-                // u32 value_is_enabler, value_ic_enabler, current_val;
+-                // u32 irq_num;
+-                value_is_enabler = redistributors[cpu_num].sgi_region.gicr_isactiver0;
+-                value_ic_enabler = redistributors[cpu_num].sgi_region.gicr_icactiver0;
+-                current_val = *val;
+-
+                 //
+-                // if 1 is written to the bits in these registers, they need to read 1 in GICR_ICENABLER0 as well.
+-                // also this is banked for the first 8 processor cores - so changes must reflect across all of them.
++                // Write-1-to-set: a write of 0 has no effect.  The previous
++                // handler stored the raw value, so a guest that wrote 0 (or a
++                // value with some bits clear) silently disabled interrupts it
++                // had already enabled.
+                 //
+-                // There has to be a way more efficient way of doing this...
++                u32 sgi_newly_enabled = (*val) &~ redistributors[cpu_num].sgi_region.gicr_isenabler0;
++                redistributors[cpu_num].sgi_region.gicr_isenabler0 |= *val;
++                redistributors[cpu_num].sgi_region.gicr_icenabler0 =
++                    redistributors[cpu_num].sgi_region.gicr_isenabler0;
+                 //
+-
+-                for(u32 i = 0; i < 32; i++) {
+-                    if( ( (current_val & BIT(i)) != 0 ) && ( ( value_is_enabler & BIT(i) ) == 0) ) {
+-                        value_is_enabler |= BIT(i);
+-                        value_ic_enabler |= BIT(i);      
+-                        irq_num = i;
+-                        //
+-                        // TODO: do the AIC operation associated with this.
+-                        //        
+-                    }
+-                }
+-                redistributors[cpu_num].sgi_region.gicr_isactiver0 = value_is_enabler;
+-                redistributors[cpu_num].sgi_region.gicr_icactiver0 = value_ic_enabler;
+-                //TODO: should we also write to gicr_isenabler0?
+-                redistributors[cpu_num].sgi_region.gicr_isenabler0 = *val;
++                // A timer PPI or SGI that fired while disabled is queued; this
++                // is where it becomes deliverable.  The self-test relies on it
++                // for gating.pending (docs/vgic-selftest.md).
++                //
++                if (sgi_newly_enabled)
++                    hv_vgic3_drain_pending();
+                 register_handled = true;
+                 break;
+             case GIC_REDIST_ICENABLER0:
+-                // u32 value_is_enabler, value_ic_enabler, current_val;
+-                // u32 irq_num;
+-                value_is_enabler = redistributors[cpu_num].sgi_region.gicr_isactiver0;
+-                value_ic_enabler = redistributors[cpu_num].sgi_region.gicr_icactiver0;
+-                current_val = *val;
+-
+-                //
+-                // if 1 is written to the bits in these registers, they need to read 1 in GICD_ICENABLER[0:31] as well.
+-                // also this is banked for the first 8 processor cores - so changes must reflect across all of them.
+                 //
+-                // There has to be a way more efficient way of doing this...
++                // Write-1-to-clear, and both enable registers read back the
++                // current enable state (Arm IHI0069; QEMU's GICv3 model does
++                // the same).  The previous handler read and wrote the *active*
++                // bank here, so disabling an SGI or PPI never disabled it.
+                 //
+-
+-                for(u32 i = 0; i < 32; i++) {
+-                    if( ( (current_val & BIT(i)) != 0 ) && ( ( value_is_enabler & BIT(i) ) != 0) ) {
+-                        value_is_enabler &= ~BIT(i);
+-                        value_ic_enabler &= ~BIT(i);      
+-                        irq_num = i;
+-                        //
+-                        // TODO: do the AIC operation associated with this.
+-                        //        
+-                    }
+-                }
+-                redistributors[cpu_num].sgi_region.gicr_isactiver0 = value_is_enabler;
+-                redistributors[cpu_num].sgi_region.gicr_icactiver0 = value_ic_enabler;
++                redistributors[cpu_num].sgi_region.gicr_isenabler0 &= ~*val;
++                redistributors[cpu_num].sgi_region.gicr_icenabler0 =
++                    redistributors[cpu_num].sgi_region.gicr_isenabler0;
+                 register_handled = true;
+                 break;
+             case GIC_REDIST_ISPENDR0:
+-                // u32 value_is_enabler, value_ic_enabler, current_val;
+-                // u32 irq_num;
+-                value_is_enabler = redistributors[cpu_num].sgi_region.gicr_ispendr0;
+-                value_ic_enabler = redistributors[cpu_num].sgi_region.gicr_icpendr0;
+-                current_val = *val;
+-
+                 //
+-                // if 1 is written to the bits in these registers, they need to read 1 in GICD_ICENABLER[0:31] as well.
+-                // also this is banked for the first 8 processor cores - so changes must reflect across all of them.
++                // Pending state, write-1-to-set.  Both pending registers read
++                // the same pending bitmap.  This is state only: this vGIC
++                // raises guest interrupts from ICC_SGI1R and the AIC, not from
++                // a guest write to this bank (docs/vgic-selftest.md records
++                // that gap).
+                 //
+-                // There has to be a way more efficient way of doing this...
+-                //
+-
+-                for(u32 i = 0; i < 32; i++) {
+-                    if( ( (current_val & BIT(i)) != 0 ) && ( ( value_is_enabler & BIT(i) ) == 0) ) {
+-                        value_is_enabler |= BIT(i);
+-                        value_ic_enabler |= BIT(i);      
+-                        irq_num = i;
+-                        //
+-                        // TODO: do the AIC operation associated with this.
+-                        //        
+-                    }
+-                }
++                redistributors[cpu_num].sgi_region.gicr_ispendr0 |= *val;
++                redistributors[cpu_num].sgi_region.gicr_icpendr0 =
++                    redistributors[cpu_num].sgi_region.gicr_ispendr0;
+                 register_handled = true;
+-                redistributors[cpu_num].sgi_region.gicr_isactiver0 = value_is_enabler;
+-                redistributors[cpu_num].sgi_region.gicr_icactiver0 = value_ic_enabler;
+                 break;
+             case GIC_REDIST_ICPENDR0:
+-                // u32 value_is_enabler, value_ic_enabler, current_val;
+-                // u32 irq_num;
+-                value_is_enabler = redistributors[cpu_num].sgi_region.gicr_ispendr0;
+-                value_ic_enabler = redistributors[cpu_num].sgi_region.gicr_icpendr0;
+-                current_val = *val;
+-
+-                //
+-                // if 1 is written to the bits in these registers, they need to read 1 in GICD_ICENABLER[0:31] as well.
+-                // also this is banked for the first 8 processor cores - so changes must reflect across all of them.
+-                //
+-                // There has to be a way more efficient way of doing this...
+-                //
+-
+-                for(u32 i = 0; i < 32; i++) {
+-                    if( ( (current_val & BIT(i)) != 0 ) && ( ( value_is_enabler & BIT(i) ) != 0) ) {
+-                        value_is_enabler &= ~BIT(i);
+-                        value_ic_enabler &= ~BIT(i);      
+-                        irq_num = i;
+-                        //
+-                        // TODO: do the AIC operation associated with this.
+-                        //        
+-                    }
+-                }
++                redistributors[cpu_num].sgi_region.gicr_ispendr0 &= ~*val;
++                redistributors[cpu_num].sgi_region.gicr_icpendr0 =
++                    redistributors[cpu_num].sgi_region.gicr_ispendr0;
+                 register_handled = true;
+-                redistributors[cpu_num].sgi_region.gicr_isactiver0 = value_is_enabler;
+-                redistributors[cpu_num].sgi_region.gicr_icactiver0 = value_ic_enabler;
+                 break;
+             case GIC_REDIST_ISACTIVER0:
+-                // u32 value_is_enabler, value_ic_enabler, current_val;
+-                // u32 irq_num;
+-                value_is_enabler = redistributors[cpu_num].sgi_region.gicr_isactiver0;
+-                value_ic_enabler = redistributors[cpu_num].sgi_region.gicr_icactiver0;
+-                current_val = *val;
+-
+-                //
+-                // if 1 is written to the bits in these registers, they need to read 1 in GICD_ICENABLER[0:31] as well.
+-                // also this is banked for the first 8 processor cores - so changes must reflect across all of them.
+-                //
+-                // There has to be a way more efficient way of doing this...
+-                //
+-
+-                for(u32 i = 0; i < 32; i++) {
+-                    if( ( (current_val & BIT(i)) != 0 ) && ( ( value_is_enabler & BIT(i) ) == 0) ) {
+-                        value_is_enabler |= BIT(i);
+-                        value_ic_enabler |= BIT(i);      
+-                        irq_num = i;
+-                        //
+-                        // TODO: do the AIC operation associated with this.
+-                        //        
+-                    }
+-                }
++                redistributors[cpu_num].sgi_region.gicr_isactiver0 |= *val;
++                redistributors[cpu_num].sgi_region.gicr_icactiver0 =
++                    redistributors[cpu_num].sgi_region.gicr_isactiver0;
+                 register_handled = true;
+-                redistributors[cpu_num].sgi_region.gicr_isactiver0 = value_is_enabler;
+-                redistributors[cpu_num].sgi_region.gicr_icactiver0 = value_ic_enabler;
+                 break;
+             case GIC_REDIST_ICACTIVER0:
+-                // u32 value_is_enabler, value_ic_enabler, current_val;
+-                // u32 irq_num;
+-                value_is_enabler = redistributors[cpu_num].sgi_region.gicr_isactiver0;
+-                value_ic_enabler = redistributors[cpu_num].sgi_region.gicr_icactiver0;
+-                current_val = *val;
+-
+-                //
+-                // if 1 is written to the bits in these registers, they need to read 1 in GICD_ICENABLER[0:31] as well.
+-                // also this is banked for the first 8 processor cores - so changes must reflect across all of them.
+-                //
+-                // There has to be a way more efficient way of doing this...
+-                //
+-
+-                for(u32 i = 0; i < 32; i++) {
+-                    if( ( (current_val & BIT(i)) != 0 ) && ( ( value_is_enabler & BIT(i) ) != 0) ) {
+-                        value_is_enabler &= ~BIT(i);
+-                        value_ic_enabler &= ~BIT(i);      
+-                        irq_num = i;
+-                        //
+-                        // TODO: do the AIC operation associated with this.
+-                        //        
+-                    }
+-                }
++                redistributors[cpu_num].sgi_region.gicr_isactiver0 &= ~*val;
++                redistributors[cpu_num].sgi_region.gicr_icactiver0 =
++                    redistributors[cpu_num].sgi_region.gicr_isactiver0;
+                 register_handled = true;
+-                redistributors[cpu_num].sgi_region.gicr_isactiver0 = value_is_enabler;
+-                redistributors[cpu_num].sgi_region.gicr_icactiver0 = value_ic_enabler;
+                 break;
+             case GIC_REDIST_ICFGR0:
+                 redistributors[cpu_num].sgi_region.gicr_icfgr0 = *val;
+@@ -1658,6 +1599,18 @@ void hv_vgicv3_init_dist_registers(void)
+     distributor->gicd_imp_id_reg = (BIT(10) | BIT(5) | BIT(4) | BIT(3) | BIT(1) | BIT(0));
+     distributor->gicd_type_reg_2 = 0; 
+     distributor->gicd_err_sts = 0;
++    //
++    // Every interrupt this vGIC delivers is injected with ICH_LR_GRP1 set:
++    // there is no Group 0 delivery path.  GICD_IGROUPR therefore has to read
++    // back Group 1 for the SPIs it models, or a guest would read a group the
++    // delivery path does not implement.  (GICD_CTLR.DS=1 does not force this
++    // by itself; it is a property of this implementation, and qemu's GICv3
++    // model lets the group bitmap be whatever the guest wrote.)  Bank 0 covers
++    // INTIDs 0-31, whose group lives in GICR_IGROUPR0 and is RES0 here while
++    // affinity routing is enabled.
++    //
++    for (u32 i = 1; i < 32; i++)
++        distributor->gicd_interrupt_group_regs[i] = 0xFFFFFFFF;
+     return;
+ 
+ }
+@@ -1918,7 +1871,64 @@ void hv_vgic3_write_lr(u32 lr_num, u64 lr_val){
+ }
+ 
+ 
+-void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, bool hw_status, u64 hw_irq){
++bool hv_vgic3_irq_enabled(u32 vintid)
++{
++    //
++    // Before the guest has a distributor there is no enable state to consult,
++    // and the timer path must keep working during bring-up.
++    //
++    if (!vgic_inited || distributor == NULL)
++        return true;
++
++    //
++    // Every virtual interrupt is injected with ICH_LR_GRP1 set, and the
++    // distributor forwards Group 1 only while GICD_CTLR.EnableGrp1 is set.
++    // KVM's vgic_target_oracle() gates SGI/PPI forwarding on the same
++    // distributor-enabled flag.
++    //
++    if ((distributor->gicd_ctl_reg & BIT(0)) == 0)
++        return false;
++
++    if (vintid < 32) {
++        //
++        // SGIs and PPIs live in the redistributor of the PE that will take
++        // them.  hv_vgicv3_assign_redist_affinity_value() gives frame i the
++        // affinity and processor number of CPU i, and the list register is
++        // written on the CPU that took the physical interrupt, so this frame
++        // is the one whose enable bit decides delivery.
++        //
++        u32 cpu = (u32)smp_id();
++        if (cpu >= num_cpus)
++            return false;
++        return (redistributors[cpu].sgi_region.gicr_isenabler0 & BIT(vintid)) != 0;
++    }
++
++    if (vintid < 1024) {
++        u32 bank = vintid / 32;
++        return (distributor->gicd_interrupt_set_enable_regs[bank] & BIT(vintid % 32)) != 0;
++    }
++
++    //
++    // An INTID the distributor does not model must not be delivered: the guest
++    // has no way to EOI it through this vGIC.
++    //
++    return false;
++}
++
++bool hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, bool hw_status, u64 hw_irq){
++    //
++    // A disabled interrupt is not delivered.  Returning false rather than
++    // discarding it leaves the interrupt queued at the caller, which retries
++    // the next time the queue is drained and the enable state is re-checked.
++    // This is the gate the UEFI self-test's gating.sgi check measures.
++    //
++    if (!hv_vgic3_irq_enabled(vintid))
++        return false;
++
++    int free_lr = hv_vgic3_get_free_lr();
++    if (free_lr < 0)
++        return false;
++
+     u64 val = 0;
+     val |= (u64)(vintid & ICH_LR_VIRTUAL_MASK) << ICH_LR_VIRTUAL_SHIFT;
+     val |= (u64)(priority & ICH_LR_PRIORITY_MASK) << ICH_LR_PRIORITY_SHIFT;
+@@ -1935,11 +1945,9 @@ void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, boo
+     else{
+         val |= ICH_LR_MAINTENANCE_IRQ;
+     }
+-    
+-
+-    int free_lr = hv_vgic3_get_free_lr();
+-    hv_vgic3_write_lr(free_lr, val);
++    hv_vgic3_write_lr((u32)free_lr, val);
+     sysop("isb");
++    return true;
+ }
+ 
+ int hv_vgic3_do_iar1(void){
+diff --git a/src/hv_vgic.h b/src/hv_vgic.h
+index 06bc5f4..c60d300 100644
+--- a/src/hv_vgic.h
++++ b/src/hv_vgic.h
+@@ -634,7 +634,24 @@ u64 hv_vgic3_read_lr(u32 lr_num);
+ 
+ void hv_vgic3_write_lr(u32 lr_num, u64 lr_val);
+ 
+-void hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, bool hw_status, u64 hw_irq);
++/*
++ * Queue a virtual interrupt into a list register.
++ *
++ * Returns false when the guest has not enabled the INTID, or when no list
++ * register is free.  A caller that wants the interrupt to survive must keep it
++ * queued: the enable state is re-checked every time the queue is drained, which
++ * is what makes a disabled interrupt stay pending instead of being delivered.
++ */
++bool hv_vgic3_inject_irq(u32 vintid, u8 priority, bool active, bool pending, bool hw_status, u64 hw_irq);
++
++/*
++ * Whether the guest has enabled an INTID for forwarding: the redistributor's
++ * GICR_ISENABLER0 bit for an SGI/PPI, the distributor's GICD_ISENABLER bit for
++ * an SPI, and GICD_CTLR.EnableGrp1 for both.  All virtual interrupts are
++ * delivered as Group 1, so a guest that has disabled Group 1 delivery has
++ * disabled all of them.
++ */
++bool hv_vgic3_irq_enabled(u32 vintid);
+ 
+ int hv_vgic3_do_iar1(void);
+ 
+@@ -666,19 +683,61 @@ static inline void virq_queue_init(virq_queue_t *q)
+     spin_init(&q->p_lock);
+ }
+ 
++static inline bool virq_queue_push_locked(virq_queue_t *q, const virq_t *v)
++{
++    u32 head = __atomic_load_n(&q->head, __ATOMIC_RELAXED);
++    u32 tail = __atomic_load_n(&q->tail, __ATOMIC_ACQUIRE);
++    if ((head - tail) >= VIRQ_QUEUE_SIZE)
++        return false;
++
++    q->buf[head & (VIRQ_QUEUE_SIZE - 1)] = *v;
++    __atomic_store_n(&q->head, head + 1, __ATOMIC_RELEASE);
++    return true;
++}
++
+ static inline bool virq_queue_push(virq_queue_t *q, const virq_t *v)
+ {
+-    bool result = false;
++    spin_lock(&q->p_lock);
++    bool result = virq_queue_push_locked(q, v);
++    sysop("dsb ishst");
++    spin_unlock(&q->p_lock);
++    return result;
++}
++
++/*
++ * Queue an interrupt unless one with the same INTID is already queued.
++ *
++ * A GIC models pending state as one bit per INTID, so a second event for an
++ * interrupt that is already pending does not create a second delivery.  The
++ * injection path needs the same rule: an interrupt the guest has disabled can
++ * be queued on every timer tick or MSI, and without this a long disable would
++ * fill the queue with copies of one vector.
++ *
++ * The probe and the insert share one critical section.  Two CPUs can send the
++ * same SGI to one target at once, and a separate "is it queued" call would let
++ * both see an empty queue and enqueue the vector twice.  Holding the same lock
++ * while scanning also means the scan cannot observe a slot the consumer is
++ * compacting in place (a virq_t is not copied atomically), which a lock-free
++ * scan could mistake for a hit and turn into a dropped interrupt.
++ */
++static inline bool virq_queue_push_unique(virq_queue_t *q, const virq_t *v)
++{
+     spin_lock(&q->p_lock);
+ 
++    bool found = false;
+     u32 head = __atomic_load_n(&q->head, __ATOMIC_RELAXED);
+     u32 tail = __atomic_load_n(&q->tail, __ATOMIC_ACQUIRE);
+-    if ((head - tail) < VIRQ_QUEUE_SIZE) {
+-        q->buf[head & (VIRQ_QUEUE_SIZE - 1)] = *v;
+-        __atomic_store_n(&q->head, head + 1, __ATOMIC_RELEASE);
+-        result = true;
++    for (u32 i = tail; i != head; i++) {
++        if (q->buf[i & (VIRQ_QUEUE_SIZE - 1)].vintid == v->vintid) {
++            found = true;
++            break;
++        }
+     }
+ 
++    bool result = false;
++    if (!found)
++        result = virq_queue_push_locked(q, v);
++
+     sysop("dsb ishst");
+     spin_unlock(&q->p_lock);
+     return result;

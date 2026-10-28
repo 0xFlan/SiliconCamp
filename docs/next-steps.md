@@ -148,19 +148,27 @@ Fix the register interface so a strict guest can program it. Delivered as
 - **Risk:** the emulation is still not a GIC. It shares Apple's physical CPU
   interface, so guest `ICC_*` register behaviour is whatever Apple implements.
 
-### B. Boot-time vGIC conformance self-test in UEFI *(next)*
+### B. Boot-time vGIC conformance self-test in UEFI *(done, `0003`)*
 
-A small DXE application that exercises the contract the way a strict OS would:
-walk every redistributor frame via `GICR_TYPER`, read-modify-write `GICR_WAKER`
-on each and poll `ChildrenAsleep` with a timeout, confirm `GICD_CTLR.RWP` and
-`GICR_CTLR.RWP` read 0, enable the GTDT timer PPI, send a self-SGI, and report
-one line per check.
+A small DXE driver that exercises the contract the way a strict OS would: walk
+every redistributor frame via `GICR_TYPER`, read-modify-write `GICR_WAKER` on each
+and poll `ChildrenAsleep` with a timeout, confirm `GICD_CTLR.RWP` and
+`GICR_CTLR.RWP` read 0, drive the banked SPI registers, enable the GTDT timer PPI,
+send a self-SGI, and report one line per check.
 
 - **Value:** converts **inferred** to **verified** without needing Windows in the
   loop, and produces a pass/fail that is meaningful on the first hardware run.
 - **Cost:** a new firmware module plus the build wiring; no hypervisor change.
 - **Risk:** none to correctness; it is read-mostly and runs before any loader.
+  The risk is the opposite one — a self-test that is wrong, or that stops the boot,
+  is worse than none, so `scripts/check-vgic-selftest.py` pins bounded waits, the
+  handler's EOI, no `ASSERT`/`CpuDeadLoop`, the modelled register set, and the
+  boot order.
 - **Dependency:** the machine, because it is the only way to execute it.
+- **Deliberate limit:** it cannot deliver an SPI. The MSI doorbell is not mapped
+  into the guest and an unmapped IPA is fatal, so the window is checked as a
+  description and the delivery half waits for PCIe (`docs/vgic-selftest.md`).
+
 
 ### C. Single-CPU diagnostic build
 
@@ -298,10 +306,55 @@ reserve as a bisection tool.
    acknowledged physical interrupt to another CPU's queue. **machine-checked.**
 
 4. **Write the UEFI conformance self-test (option B)** so it is in the image
-   before the first hardware boot. It costs nothing offline and is the difference
-   between "the firmware booted" and "the firmware proved the interrupt contract".
-   When it runs, it should also record which PE actually takes each SPI: that
-   turns the affinity gap above from an argument into a measurement.
+   before the first hardware boot. *(done, `0003`)* It costs nothing offline and is
+   the difference between "the firmware booted" and "the firmware proved the
+   interrupt contract". `AppleVgicSelfTestDxe` walks every redistributor frame,
+   performs the guest's wake sequence on each with a bounded poll, drives the
+   banked SPI registers, and delivers a self-SGI and the virtual timer PPI through
+   the real exception path. `docs/vgic-selftest.md` is the per-check reference;
+   `scripts/check-vgic-selftest.py` is the gate that keeps it from becoming a
+   boot hazard itself.
+
+   Two properties it deliberately cannot measure are recorded there rather than
+   approximated: the MSI doorbell is not mapped into the guest, so SPI delivery is
+   a description check only, and no software path can move an SPI to another PE on
+   AICv3, so affinity is a round-trip check rather than a delivery measurement.
+
+5. **Make interrupt delivery honour the enable bits.** *(done, `0007`)* The
+   self-test's three expected gaps were one class of omission: the hypervisor
+   injected a queued interrupt without consulting the guest's enable state, and
+   the redistributor's SGI-frame handlers kept enable and pending state in the
+   active bank. `0007-vgic-enable-gating.patch` fixes both halves:
+
+   - `hv_vgic3_irq_enabled()` is the single predicate. It checks
+     `GICD_CTLR.EnableGrp1` (every list register is injected as Group 1), then
+     `GICR_ISENABLER0` in the **taking PE's** frame for INTIDs below 32, then the
+     SPI's `GICD_ISENABLER` bank. `hv_vgic3_inject_irq()` returns `false` instead
+     of injecting when that predicate fails or no list register is free, and every
+     caller keeps the interrupt queued and retries on the next drain. The drain
+     compacts the queue rather than stopping at the first refusal, so a disabled
+     INTID does not block the ones behind it, and it runs when the guest enables
+     an INTID (or `GICD_CTLR.EnableGrp1`), so pending state is delivered at the
+     point the guest asked for it instead of at the next unrelated interrupt.
+     `gating.pending` measures that without resending the SGI.
+   - The redistributor's `ISENABLER0`/`ICENABLER0`, `ISPENDR0`/`ICPENDR0` and
+     `ISACTIVER0`/`ICACTIVER0` handlers now implement write-1-to-set and
+     write-1-to-clear in their own banks, and mirror each pair's state so both
+     aliases read the same bitmap. `GICD_ISPENDR` also stopped discarding its
+     read-back, and `GICD_IGROUPR`/`GICR_IGROUPR0` report the Group 1 that
+     delivery actually implements.
+
+   The rule is architectural and the read-backs were checked against QEMU's
+   GICv3 model before the patch was written (`scripts/check-gicv3-oracle.py`,
+   26 probes). The self-test gained `VgicCheckRedistributorBanks`, which measures
+   the set/clear pairs on the boot PE's own frame, so the first hardware log says
+   whether these registers behave rather than assuming it.
+
+   The risk that remains is the one the gate was designed around: the injection
+   path is also the path the UART console uses (AIC 1046). The console is not a
+   guest INTID (`hv_vgic3_guest_vintid()` returns 0 for it), so the gate never
+   touches it, but the first hardware log still has to show the console alive
+   after `ArmGicDxe` has programmed the distributor.
 
 ### Hardware-gated
 

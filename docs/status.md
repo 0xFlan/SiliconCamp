@@ -1,4 +1,4 @@
-# Status — 2026-10-27
+# Status — 2026-10-28
 
 Host and target are the same machine: `Mac16,3` iMac (`target-type J624`), Apple M4
 (`T8132`), 10 cores (6 efficiency + 4 performance), 24 GB, macOS 26.6.2 (Darwin 25.6.0),
@@ -16,14 +16,16 @@ firmware `18000.161.10`.
 | QEMU | 11.1.2 |
 | upstream m1n1 build | success, `third_party/m1n1/build/m1n1.bin` |
 | NTASP m1n1-windows build | success, `third_party/m1n1-windows/build/m1n1.bin` |
-| M4 vGIC + PSCI + PCIe/MSI patches | applied in six cumulative patches; the series builds |
+| M4 vGIC + PSCI + PCIe/MSI patches | applied in seven cumulative patches; the series builds |
 | M4 PSCI topology | T8132 tree is 2 clusters (6E+4P); ADT core count checked at init |
 | m1n1 PCIe hand-off | `src/pcie_guest.c` maps ECAM + BAR windows into stage 2 and bypasses every APCIE DART, verifying each stream by read-back |
 | m1n1 guest MSI | `src/guest_msi.c` programs all 256 port MSIMAP entries with read-back, unmasks AIC 1506–1761, and `hv_vgic3_guest_vintid()` maps them to INTIDs 512–767; the firmware advertises the same window as a MADT GIC MSI Frame |
-| Patch integrity | the m1n1-windows series (0001-0006) and both firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-27); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from (`222b6f9b…` / `c59b4f14…`); the firmware platform patch reproduces every file it owns, including the MADT MSI frame |
-| NTASP M4 UEFI build | success, `artifacts/MAC16_3_EFI.fd` (30 MB), published as release `v0.8.0` |
+| Patch integrity | the m1n1-windows series (0001-0007) and the firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-28); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from (`a5636c6d…` / `06247d0e…`, checked 2026-10-28); the firmware platform patch reproduces every file it owns, including the MADT MSI frame. `0003-vgic-selftest.patch` is verified as a continuation of `0001` in the same cumulative worktree, because it edits files `0001` creates |
+| NTASP M4 UEFI build | success, 30 MB `MAC16_3_EFI.fd`, rebuilt 2026-10-28 with the `gating.pending` probe. `artifacts/` still documents release `v0.8.0`, which predates patch `0007` and that probe |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 87 pass (`python3 -m unittest discover -s tests`), including 20 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect |
+| Checker regression tests | 128 pass (`python3 -m unittest discover -s tests`), including 31 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect, 22 that mutate the self-test series or tree and require `check-vgic-selftest.py` to reject it, and 5 for the GICv3 oracle |
+| vGIC conformance self-test | `AppleVgicSelfTestDxe` is linked into the DXE FV and placed before `TimerDxe`; `scripts/check-vgic-selftest.py` passes in both modes (87 checks against the patch series, 86 against the patched tree) and the build script fails if the module is missing. Never executed on hardware |
+| GICv3 reference oracle | `scripts/check-gicv3-oracle.py` drives QEMU 11.1.2's GICv3 model over qtest, with no guest, and passes 26 probes: the set/clear bank aliases read back the same state, a write of 0 to `GICR_ISENABLER0` is ignored, `GICD_IGROUPR` is writable under `DS=1` rather than RAZ/WI, `GICD_CTLR.DS`/`ARE` cannot be cleared, and a redistributor wake completes. Local-only; skips when QEMU is absent |
 | M4 ACPI tables | disassembled and checked (below) |
 | MCFG + PCI0 | MCFG describes ECAM `0x1cb0000000`, buses 0–8; PCI0 `_CRS` matches the captured windows |
 | GIC MSI Frame | MADT entry 0x0D: doorbell `0xfffff000`, SPIs 512–767; cross-checked against `src/guest_msi.h` and rejected if it runs past SPI 1019 |
@@ -113,6 +115,21 @@ architectural reset. `docs/next-steps.md` records the reasoning and the sources.
 series (no submodule, no compiler) and against patched sources, and
 `tests/test_check_vgic.py` puts each defect back and requires the checker to fail.
 
+Patch 0007 adds the delivery half of the contract. `hv_vgic3_irq_enabled()`
+gates every injection on `GICD_CTLR.EnableGrp1` and the INTID's own enable bit,
+and a refusal keeps the interrupt queued instead of dropping it. The queue is
+drained by compaction, not by popping the head, so an INTID the guest has
+disabled cannot block the interrupts behind it, and enabling an INTID — in
+`GICR_ISENABLER0`, a `GICD_ISENABLER` bank, or `GICD_CTLR.EnableGrp1` — drains
+the queues at that write. Without the drain, an edge-triggered interrupt that
+arrived while disabled would stay pending until some unrelated interrupt
+happened to arrive; `gating.pending` in the self-test is the probe that measures
+it. The redistributor's set/clear pairs also stopped sharing the active bank,
+and `GICD_IGROUPR` reports the Group 1 that delivery implements. Queuing is a
+single `virq_queue_push_unique()` critical section rather than a separate
+"is it queued?" test followed by a push, so two CPUs sending the same SGI to one
+target cannot both enqueue it; the GIC has one pending bit per INTID.
+
 Being correct is not the same as being observable, and the second half of this is
 a boot hazard of its own. `hv_vgic.c` built with `ENABLE_VGIC_LOGGING 1`, which
 put three `printf()` calls at the end of every emulated register access. Over a
@@ -158,6 +175,7 @@ correct.
 | M4 USB path | Prepared, untested | Four DWC3 controllers are described by `PcdAppleNumDwc3Controllers`; the low 1 GB MMIO window (USB and USB DARTs) is mapped. The DWC3/XHCI stack still needs hardware validation. |
 | NTASP AIC DXE | Partial | AICv1/v2; AICv3 is an explicit TODO. The M4 package uses the vGIC path. |
 | NTASP Windows drivers | Empty | Repository is README-only. |
+| vGIC conformance self-test | In the image, untested | `AppleVgicSelfTestDxe` in the DXE FV before `TimerDxe`, gated on `AIC_BUILD == FALSE`. Walks every redistributor frame, performs the wake sequence, checks capability bits and `RWP`, drives SPI 512's banked registers, measures the SGI/PPI set/clear banks on the boot PE, and delivers a self-SGI and the virtual timer PPI through the hardware interrupt protocol. It also measures that an SGI refused while disabled is still delivered when the bit is set, without resending. 87 offline checks pin bounded waits, EOI, the modelled register set, the enable gate in both directions, the Windows HAL replay and boot order. Never executed on hardware; with `0007` applied the previously predicted gaps should be `[PASS]` lines. |
 | Internal NVMe/ANS2 | Driver written, untested | `AppleNANDStorageDxe` boots the ANS coprocessor (ASC mailbox, RTKit handshake, SART windows), programs the NVMMU/NVMe queues, runs Identify and publishes `EFI_BLOCK_IO_PROTOCOL`. 36 KB DXE module, linked into the FV, 110 hardware constants checked against m1n1 on every CI run. Never executed on hardware; see `docs/ans2.md`. |
 | Windows kernel boot | Not achieved | Existing project hangs at loader-to-kernel handoff even on M1/M2. |
 | AGX GPU driver | None | No WDDM/D3D driver for any Apple Silicon GPU. |
@@ -167,12 +185,17 @@ correct.
 
 1. **Hardware boot of m1n1 and the UEFI firmware.** The build and ACPI tables are
    coherent, but nothing has run on the M4. This is gated by `docs/safety.md`.
-2. **vGIC conformance self-test.** The contract fixes are arguments about what a
-   strict guest does; the firmware never exercised them. A DXE application that
-   walks every redistributor frame, wakes each PE with a timeout, polls both
-   `RWP` bits, enables the GTDT timer PPI and sends a self-SGI converts them into
-   observations on the first boot. Its predecessor — compiling out the vGIC's
-   per-access logging — is pure code and can be done now (`docs/next-steps.md`).
+2. **Hardware run of the vGIC conformance self-test.** The driver is in the image
+   (`AppleVgicSelfTestDxe`, patch `0003`): it walks every redistributor frame,
+   wakes each frame with a bounded poll, checks both `RWP` bits and the capability
+   bits, drives the banked SPI registers, and delivers a self-SGI and the timer
+   PPI through the real exception path. The checker proves it cannot hang, dead
+   loop or touch an unmodelled register; only the M4 can prove the device it
+   describes (`docs/vgic-selftest.md`). With `0007` applied, no `[GAP ]` is
+   expected from the enable gate: `gating.sgi`, `gating.pending` and
+   `gating.rearm` should all be `[PASS]`. The stated gaps that remain are
+   `GICR_ISPENDR0` being state rather than a trigger, Group 0 delivery, and SPI
+   affinity (`docs/vgic-selftest.md`).
 3. **PCIe and storage.** The host bridge, page tables, MCFG and `PCI0` `_CRS`
    use the captured J624 ECAM (`0x1cb0000000`), 32-bit window (bus
    `0x80000000` → host `0xb80000000`, offset `0xb00000000`), the m1n1 side maps
@@ -229,7 +252,7 @@ To rebuild m1n1 from a clean `m1n1-windows` checkout:
 
 ```bash
 git -C third_party/m1n1-windows checkout -- .
-./scripts/apply-patches.sh       # applies 0001-0005 in order
+./scripts/apply-patches.sh       # applies 0001-0007 in order
 ./scripts/build-m1n1.sh          # also applies them, idempotently
 ```
 
@@ -278,12 +301,13 @@ boots the firmware" is evidence about the firmware, not about the GIC.
 This repository now has a reproducible M4 hypervisor build, the M4
 vGIC/PSCI/PCIe fixes, a vGIC that honours the guest contract a real OS depends
 on (and a checker that fails if it stops doing so), a working-offline MSI path,
-and a compiling M4 UEFI firmware whose CPU, UART, ACPI and PCIe root-bridge
-values match this exact J624 machine. It does **not** have a Windows boot, and
-none of it has run on the M4 hardware yet. The next meaningful milestone is
-still "m1n1 prints its vGIC/CPU topology on the M4, and the NTASP UEFI firmware
-reaches its boot menu on the M4 and enumerates the first PCIe root complex" —
-but the step immediately before it, which needs no hardware, is a UEFI
-conformance self-test that makes the vGIC's behaviour observable instead of
-argued about (`docs/next-steps.md`). Everything after that is debugging the
-handoff and writing drivers.
+a compiling M4 UEFI firmware whose CPU, UART, ACPI and PCIe root-bridge values
+match this exact J624 machine, and a firmware driver that reads the emulated
+interrupt controller back instead of trusting it. It does **not** have a Windows
+boot, and none of it has run on the M4 hardware yet. The next meaningful
+milestone is still "m1n1 prints its vGIC/CPU topology on the M4, and the NTASP
+UEFI firmware reaches its boot menu on the M4 and enumerates the first PCIe root
+complex" — but the self-test now in the image is what makes that first log
+informative about the interrupt path rather than just about the boot loader
+(`docs/vgic-selftest.md`). Everything after that is debugging the handoff and
+writing drivers.

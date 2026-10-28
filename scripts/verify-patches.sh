@@ -39,22 +39,17 @@ verify_one() {
     return 1
 }
 
-# verify_series REPO DIR LABEL
+# verify_series_list REPO LABEL PATCH...
 #
-# Applies every *.patch in DIR, in filename order, to one worktree of REPO@HEAD.
+# Applies the named patches, in the order given, to one worktree of REPO@HEAD.
 # This is what proves the cumulative contract: a later patch is checked against
 # the tree its predecessors produced, exactly as a user would apply them.
-verify_series() {
-    local repo="$1" dir="$2" label="$3"
+verify_series_list() {
+    local repo="$1" label="$2"
+    shift 2
+    local patches=("$@")
     if [ ! -e "$repo/.git" ]; then
         echo "skip: $label (submodule not initialized)"
-        return 0
-    fi
-
-    local patches=("$dir"/*.patch)
-    if [ ! -e "${patches[0]}" ]; then
-        echo "FAIL: $label (no patches in $dir)"
-        fail=1
         return 0
     fi
 
@@ -90,6 +85,22 @@ verify_series() {
     rm -rf "$tmp"
 }
 
+# verify_series REPO DIR LABEL
+#
+# The directory form, used where every patch in DIR belongs to the same repo.
+verify_series() {
+    local repo="$1" dir="$2" label="$3"
+
+    local patches=("$dir"/*.patch)
+    if [ ! -e "${patches[0]}" ]; then
+        echo "FAIL: $label (no patches in $dir)"
+        fail=1
+        return 0
+    fi
+
+    verify_series_list "$repo" "$label" "${patches[@]}"
+}
+
 # verify REPO PATCH LABEL
 #
 # For a standalone patch that is not part of a cumulative series.
@@ -122,9 +133,11 @@ verify_series "$ROOT/third_party/m1n1-windows" \
               "$ROOT/patches/m1n1-windows" \
               "m1n1-windows"
 
-verify "$ROOT/third_party/ntasp-firmware" \
-       "$ROOT/patches/ntasp-firmware/0001-m4-uefi-platform.patch" \
-       "ntasp-firmware 0001 (M4 UEFI platform)"
+# 0003 edits files 0001 creates, so the two are one cumulative series.
+verify_series_list "$ROOT/third_party/ntasp-firmware" \
+                   "ntasp-firmware" \
+                   "$ROOT/patches/ntasp-firmware/0001-m4-uefi-platform.patch" \
+                   "$ROOT/patches/ntasp-firmware/0003-vgic-selftest.patch"
 
 verify "$ROOT/third_party/ntasp-firmware/MU_BASECORE" \
        "$ROOT/patches/ntasp-firmware/0002-nasm-scope.patch" \

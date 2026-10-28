@@ -82,6 +82,30 @@ if [ "$PLATFORM" = "Mac16_3" ]; then
     fi
     echo "FV contains $(basename "$ANS_MODULE")"
     echo
+
+    #
+    # The vGIC self-test is the only thing in the image that reads the emulated
+    # interrupt controller back, and it can be dropped without breaking the
+    # build in any visible way: its depex is satisfied, so its absence just
+    # means no "vgic:" lines in the serial log.  Check that it is there.
+    #
+    VGIC_MODULE="$(find "$ROOT/third_party/ntasp-firmware/Build" -maxdepth 7 -type d \
+        -path '*/FV/Ffs/*AppleVgicSelfTestDxe' | head -n 1)"
+    if [ -z "$VGIC_MODULE" ]; then
+        echo "error: AppleVgicSelfTestDxe is not in the FV; the vGIC would go untested" >&2
+        exit 1
+    fi
+    echo "FV contains $(basename "$VGIC_MODULE")"
+    echo
+
+    #
+    # Presence is not enough: the driver must still be the one the checker
+    # proved cannot hang, dead-loop, skip EOI, or touch an unmodelled
+    # redistributor offset.  Run the same gate CI runs, so a local build
+    # cannot produce an image the repository would reject.
+    #
+    "$ROOT/scripts/check-vgic-selftest.py" --tree "$ROOT/third_party/ntasp-firmware"
+    echo
 fi
 
 if [ "$PLATFORM" = "Mac16_3" ]; then

@@ -131,16 +131,35 @@ an invariant breaks. It parses the tables the build emits and checks:
 - the FD: ARM64 Image header, `text_offset` `0x80000`, and an `image_size` that
   covers the payload.
 
+The M4 build also runs `scripts/check-vgic-selftest.py --tree` after confirming the
+driver is in the FV, so a local image cannot be produced from a self-test the
+checker would reject (an unbounded wait, an `ASSERT`, a handler that skips EOI,
+or a read of an unmodelled redistributor offset).
+
 The tables live inside a compressed FV, which is why the checker reads the
-build-tree `.aml`/`.acpi` output and not the FD.  Two things cannot be seen that
-way, so the build script checks them separately:
+build-tree `.aml`/`.acpi` output and not the FD.  Three things cannot be seen
+that way, so the build script checks them separately:
 
 - `AppleNANDStorageDxe` must be in `FV/Ffs`; a platform build that silently drops
   the internal-storage driver would still pass every ACPI check.
-- The driver's hardware constants are compared against m1n1 by
+- `AppleVgicSelfTestDxe` must be in `FV/Ffs`.  Its absence is equally invisible:
+  the build still links, the depex is still satisfiable, and the only symptom is
+  that the serial log has no `vgic:` lines.  The build script fails instead.
+- The storage driver's hardware constants are compared against m1n1 by
   `scripts/check-ans2-constants.py` (110 checks: register offsets, opcodes, DMA
-  flags, all four SART layouts, every RTKit field position).  It runs in CI
-  rather than in the build, so it also fails on a submodule bump.
+  flags, all four SART layouts, every RTKit field position), and the self-test's
+  register set, waits and boot order are pinned by
+  `scripts/check-vgic-selftest.py`.  Both run in CI rather than in the build, so
+  they also fail on a submodule bump.
+
+The self-test is documented per check in `docs/vgic-selftest.md`; run its gate
+directly with:
+
+```bash
+./scripts/check-vgic-selftest.py                         # the shipped patch series
+./scripts/check-vgic-selftest.py --tree third_party/ntasp-firmware
+python3 -m unittest tests.test_check_vgic_selftest -v
+```
 
 Run it on its own with `./scripts/check-acpi.py`; pass `--build-dir` for a build
 tree somewhere else.
@@ -180,6 +199,9 @@ The M4 package now uses values taken from this exact J624 machine:
 
 - `Silicon/Apple/T8132FamilyPkg` — T8132 SoC PCDs, 10-core MADT, 6E+4P PPTT,
   M4 virtual memory map with the low 1 GB USB window and the J624 PCIe windows.
+- `Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe` — the boot-time
+  vGIC conformance self-test, placed in the FV before `TimerDxe` and only in the
+  GIC (`AIC_BUILD == FALSE`) build.
 - `Platform/Mac16_3Pkg` — Mac16,3/J624 platform DSC/FDF, 6E+4P DSDT with
   `PCI0`, MCFG, ACPI device tables, vGIC build.
 

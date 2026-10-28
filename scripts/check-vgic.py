@@ -50,6 +50,7 @@ SOURCES = (
     "src/hv_vgic.c",
     "src/hv_vgic.h",
     "src/hv_exc.c",
+    "src/hv.h",
     "src/guest_msi.c",
     "src/guest_msi.h",
 )
@@ -241,6 +242,7 @@ def check_tree(ck: Checker, tree: str) -> None:
     vgic = sources["src/hv_vgic.c"]
     vgic_h = sources["src/hv_vgic.h"]
     exc = sources["src/hv_exc.c"]
+    hv_h = sources["src/hv.h"]
     msi = sources["src/guest_msi.c"]
     msi_h = sources["src/guest_msi.h"]
 
@@ -368,6 +370,104 @@ def check_tree(ck: Checker, tree: str) -> None:
              "GICD_IROUTER: the affinity is decoded from the normalised value, "
              "not the raw write")
 
+    ck.section("Enable state: a disabled interrupt is not delivered (patch 0007)")
+    enabled = function_body(vgic, "hv_vgic3_irq_enabled")
+    ck.check(bool(enabled), "hv_vgic.c: found hv_vgic3_irq_enabled()")
+    ck.check(re.search(r"gicd_ctl_reg\s*&\s*BIT\(0\)", enabled) is not None,
+             "irq_enabled(): GICD_CTLR.EnableGrp1 gates delivery, because every LR "
+             "is injected as Group 1")
+    ck.check(re.search(r"gicr_isenabler0\s*&\s*BIT\(", enabled) is not None,
+             "irq_enabled(): an SGI/PPI is gated by GICR_ISENABLER0")
+    ck.check(re.search(r"gicd_interrupt_set_enable_regs\s*\[\s*bank\s*\]\s*&\s*BIT\(",
+                       enabled) is not None,
+             "irq_enabled(): an SPI is gated by its GICD_ISENABLER bank")
+    ck.check(re.search(r"smp_id\s*\(\s*\)", enabled) is not None,
+             "irq_enabled(): the SGI/PPI enable bit is read from the taking PE's "
+             "own redistributor frame")
+    inject = function_body(vgic, "hv_vgic3_inject_irq")
+    ck.check("hv_vgic3_irq_enabled" in inject,
+             "inject(): consults the guest's enable state before writing a list register")
+    ck.check("free_lr < 0" in inject and re.search(r"return\s+false\s*;", inject) is not None,
+             "inject(): reports failure when disabled or out of list registers, so the "
+             "caller can keep the interrupt queued")
+    ck.check(exc.count("virq_queue_push_unique") >= 4,
+             "hv_exc.c: a repeated timer tick, SGI or MSI does not enqueue a second "
+             "copy of an INTID that is already pending")
+    ck.check("virq_queue_push_unique" in vgic_h,
+             "hv_vgic.h: the queue can answer whether an INTID is already pending")
+    push_unique = function_body(vgic_h, "virq_queue_push_unique")
+    ck.check("spin_lock" in push_unique and "spin_unlock" in push_unique,
+             "virq_queue_push_unique(): the dedupe test and the insert share one "
+             "critical section, so two CPUs cannot both enqueue the same INTID")
+    ck.check("virq_queue_push_locked" in push_unique,
+             "virq_queue_push_unique(): the insert goes through the bounded queue "
+             "helper rather than a second copy of the ring arithmetic")
+
+    ck.section("Pending state survives a disable, and enabling delivers it (patch 0007)")
+    drain = function_body(exc, "hv_vgic3_drain_queue")
+    ck.check(bool(drain), "hv_exc.c: found hv_vgic3_drain_queue()")
+    ck.check("hv_vgic3_inject_irq" in drain,
+             "drain_queue(): delivers through the gated injection API")
+    ck.check("break" not in drain,
+             "drain_queue(): a disabled entry does not stop the pass; stopping at "
+             "the head lets one disabled INTID block every interrupt behind it")
+    ck.check("kept" in drain and
+             re.search(r"__atomic_store_n\s*\(\s*&\s*q->head", drain) is not None,
+             "drain_queue(): the queue is compacted and its head republished, so an "
+             "undeliverable entry survives in order")
+    ck.check(re.search(r"spin_lock\s*\(\s*&\s*q->p_lock\s*\)", drain) is not None,
+             "drain_queue(): compaction holds the queue lock against producers on "
+             "other CPUs")
+    drain_all = function_body(exc, "hv_vgic3_drain_pending")
+    ck.check(drain_all.count("hv_vgic3_drain_queue") >= 3,
+             "drain_pending(): drains the timer, SGI and device-interrupt queues")
+    ck.check(re.search(r"void\s+hv_vgic3_drain_pending\s*\(\s*void\s*\)\s*;", hv_h) is not None,
+             "hv.h: drain_pending() is declared for the vGIC register paths")
+
+    ctlr = case_block(dist, "case GIC_DIST_CTLR:")
+    ck.check("group1_enabled" in ctlr and "hv_vgic3_drain_pending" in ctlr,
+             "GICD_CTLR: turning EnableGrp1 on drains what was waiting behind it")
+    ck.check("newly_enabled" in dist and "hv_vgic3_drain_pending" in dist,
+             "GICD_ISENABLER: enabling an SPI drains a queued interrupt for it")
+    redist_enable = case_block(redist, "case GIC_REDIST_ISENABLER0:")
+    ck.check("sgi_newly_enabled" in redist_enable and
+             "hv_vgic3_drain_pending" in redist_enable,
+             "GICR_ISENABLER0: enabling an SGI/PPI drains a queued interrupt for it")
+    ck.check(re.search(r"^\s*bool\s+vgic_inited\s*;", vgic, re.MULTILINE) is not None,
+             "hv_vgic.c: vgic_inited has external linkage, so the drain can tell "
+             "when the distributor exists")
+
+    ck.section("Redistributor SGI/PPI banks: set/clear pairs share state (Arm IHI 0069)")
+    for case, field, alias, desc in (
+        ("case GIC_REDIST_ISENABLER0:", "gicr_isenabler0", "gicr_icenabler0",
+         "ISENABLER0 sets"),
+        ("case GIC_REDIST_ICENABLER0:", "gicr_isenabler0", "gicr_icenabler0",
+         "ICENABLER0 clears"),
+        ("case GIC_REDIST_ISPENDR0:", "gicr_ispendr0", "gicr_icpendr0",
+         "ISPENDR0 sets"),
+        ("case GIC_REDIST_ICPENDR0:", "gicr_ispendr0", "gicr_icpendr0",
+         "ICPENDR0 clears"),
+        ("case GIC_REDIST_ISACTIVER0:", "gicr_isactiver0", "gicr_icactiver0",
+         "ISACTIVER0 sets"),
+        ("case GIC_REDIST_ICACTIVER0:", "gicr_isactiver0", "gicr_icactiver0",
+         "ICACTIVER0 clears"),
+    ):
+        block = case_block(redist, case)
+        ck.check(bool(block), f"hv_vgic.c: found {case}")
+        ck.check(re.search(field + r"\s*(?:\|=|&=\s*~)\s*\*val", block) is not None,
+                 f"{desc} its own bank with write-1-to-set/clear semantics")
+        ck.check(re.search(alias + r"\s*=\s*\n?\s*redistributors\[", block) is not None,
+                 f"{case} mirrors the state into {alias}, which reads the same bitmap")
+    ck.check("gicr_isactiver0 = value_is_enabler" not in vgic,
+             "redistributor: enable and pending writes do not land in the active bank "
+             "(the pre-0007 defect)")
+    ck.check(re.search(r"\*val\s*=\s*distributor->gicd_interrupt_set_pending_regs\s*\[\s*reg_num\s*\]",
+                       dist) is not None,
+             "GICD_ISPENDR: a read returns the pending bitmap instead of leaving *val untouched")
+    ck.check("gicd_interrupt_group_regs[i] = 0xFFFFFFFF" in vgic,
+             "GICD_IGROUPR: modelled SPIs reset to Group 1, the only group the delivery "
+             "path implements")
+
     ck.section("Diagnostics: the hot path never writes to the UART")
     ck.check(re.search(r"#define\s+ENABLE_VGIC_LOGGING\s+0\b", vgic) is not None,
              "hv_vgic.c: ENABLE_VGIC_LOGGING is 0, so vgic_log() is compiled out")
@@ -493,6 +593,43 @@ MUST_ADD = (
      "GICD_IROUTER.IRM=1 is treated as 0, consistent with No1N"),
     ("src/hv_vgic.c", r"gicd_interrupt_router_regs\s*\[\s*reg_num\s*\]\s*=\s*route\s*;",
      "the stored routing value never contains IRM, so read-back agrees with the model"),
+    # --- 0007: enable-bit gating --------------------------------------------
+    ("src/hv_vgic.h", r"bool\s+hv_vgic3_irq_enabled\s*\(\s*u32\s+vintid\s*\)",
+     "the enable-state predicate is declared for the injection path"),
+    ("src/hv_vgic.c", r"bool\s+hv_vgic3_irq_enabled\s*\(\s*u32\s+vintid\s*\)",
+     "the enable-state predicate is implemented"),
+    ("src/hv_vgic.c", r"gicd_ctl_reg\s*&\s*BIT\(0\)",
+     "GICD_CTLR.EnableGrp1 gates delivery"),
+    ("src/hv_vgic.c", r"gicr_isenabler0\s*\|=\s*\*val",
+     "GICR_ISENABLER0 is write-1-to-set"),
+    ("src/hv_vgic.c", r"gicr_isenabler0\s*&=\s*~\s*\*val",
+     "GICR_ICENABLER0 clears the enable state it shares with ISENABLER0"),
+    ("src/hv_vgic.c", r"\*val\s*=\s*distributor->gicd_interrupt_set_pending_regs",
+     "GICD_ISPENDR reads back the pending bitmap"),
+    ("src/hv_vgic.c", r"gicd_interrupt_group_regs\[i\]\s*=\s*0xFFFFFFFF",
+     "modelled SPIs report Group 1, the group delivery implements"),
+    ("src/hv_exc.c", r"void\s+hv_vgic3_drain_queue\s*\(",
+     "the drain compacts the queue instead of stopping at a disabled entry"),
+    ("src/hv_exc.c", r"void\s+hv_vgic3_drain_pending\s*\(\s*void\s*\)",
+     "all three per-CPU queues have one drain entry point"),
+    ("src/hv.h", r"void\s+hv_vgic3_drain_pending\s*\(\s*void\s*\)\s*;",
+     "drain_pending() is declared for the vGIC register paths"),
+    ("src/hv_vgic.c", r"if\s*\(\s*newly_enabled\s*\)",
+     "enabling an SPI drains an interrupt that arrived while it was disabled"),
+    ("src/hv_vgic.c", r"if\s*\(\s*sgi_newly_enabled\s*\)",
+     "enabling an SGI/PPI drains an interrupt that arrived while it was disabled"),
+    ("src/hv_vgic.c", r"if\s*\(\s*group1_enabled\s*\)",
+     "enabling Group 1 drains everything that was waiting behind it"),
+    ("src/hv_vgic.c", r"^\s*bool\s+vgic_inited\s*;",
+     "vgic_inited is linkable from hv_exc.c, where the drain gates on it"),
+    ("src/hv_exc.c", r"if\s*\(\s*!\s*hv_vgic3_inject_irq",
+     "every injection site handles a refusal by keeping the interrupt queued"),
+    ("src/hv_vgic.h", r"bool\s+virq_queue_push_unique\s*\(",
+     "the queue can report an INTID that is already pending"),
+    ("src/hv_exc.c", r"virq_queue_push_unique\s*\(\s*&PERCPU",
+     "a refused interrupt is queued once per INTID, not once per retry"),
+    ("src/hv_vgic.c", r"if\s*\(\s*!\s*hv_vgic3_irq_enabled\s*\(\s*vintid\s*\)\s*\)",
+     "injection itself refuses an INTID the guest has not enabled"),
 )
 
 MUST_REMOVE = (
@@ -525,6 +662,16 @@ MUST_REMOVE = (
      "the per-access trace is no longer enabled by default"),
     ("src/hv_vgic.c", r"\[Written\]",
      "the per-access '[Written]' trace lines are gone"),
+    # --- 0007: enable-bit gating --------------------------------------------
+    ("src/hv_vgic.c", r"redistributors\[cpu_num\]\.sgi_region\.gicr_isactiver0\s*=\s*"
+                      r"value_is_enabler\s*;",
+     "enable and pending writes no longer land in the active bank"),
+    ("src/hv_vgic.c", r"redistributors\[cpu_num\]\.sgi_region\.gicr_isenabler0\s*=\s*\*val\s*;",
+     "GICR_ISENABLER0 no longer stores the raw write, where a 0 would clear it"),
+    ("src/hv_vgic.c", r"^distributor->gicd_interrupt_set_pending_regs\[reg_num\];$",
+     "a GICD_ISPENDR read no longer discards the bitmap"),
+    ("src/hv_exc.c", r"if\s*\(\s*hv_vgic3_get_free_lr\(\)\s*!=\s*-1\s*\)",
+     "injection no longer depends on list-register availability alone"),
 )
 
 MUST_NOT_ADD = (
@@ -550,6 +697,10 @@ MUST_NOT_ADD = (
      "no patch may turn the per-access UART trace back on"),
     ("src/hv_vgic.c", r'vgic_log\s*\(\s*"HV vGIC \[(WARN|ERR)',
      "an exceptional event must go through the budgeted vgic_note()"),
+    ("src/hv_vgic.c", r"gicr_isactiver0\s*=\s*value_is_enabler",
+     "enable and pending state must not be maintained in the active bank"),
+    ("src/hv_vgic.c", r"redistributors\[cpu_num\]\.sgi_region\.gicr_isenabler0\s*=\s*\*val",
+     "GICR_ISENABLER0 is write-1-to-set, never a raw store"),
 )
 
 
@@ -561,7 +712,14 @@ def code_only(line: str) -> str:
     a forbid-rule from firing on the comment that documents the fix.
     """
     stripped = line.strip()
-    if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+    #
+    # A block-comment continuation starts with "* " or "*/".  A line that
+    # starts with "*val" is a dereference, not a comment: treating every
+    # leading "*" as prose silently dropped the added "*val = ..." lines from
+    # the parsed series, which made a real contract check unfalsifiable.
+    #
+    if (stripped.startswith("//") or stripped.startswith("/*")
+            or re.match(r"^\*(?:\s|/)", stripped)):
         return ""
     stripped = re.sub(r"/\*.*?\*/", "", stripped)
     stripped = re.sub(r"//.*$", "", stripped)
