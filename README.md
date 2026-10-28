@@ -68,17 +68,24 @@ third_party/ntasp-firmware/Build/Mac16_3-AARCH64/DEBUG_CLANGPDB/FV/MAC16_3_EFI.f
 
 ## User interface
 
-`tools/siliconcamp-assistant/` is the first user-facing piece: a loopback-only
-readiness panel, not an installer.
+`tools/siliconcamp-assistant/` is a six-step Boot Camp-shaped walkthrough, not an
+installer. It runs as a native macOS window and as a loopback-only page.
 
 ```bash
+# real app window
+./tools/siliconcamp-assistant/build-app.sh
+open "tools/siliconcamp-assistant/build/SiliconCamp Assistant.app"
+
+# or the browser page
 python3 tools/siliconcamp-assistant/server.py   # http://127.0.0.1:8770/
 ```
 
-It reports this Mac, the pinned image hashes and build commands, the safety
-gates, the diagnostic checks and the Boot Camp-shaped gaps. The install control
-is disabled because Windows has no boot path yet, and the panel says so instead
-of offering an install that cannot work. See
+It follows the old Boot Camp sequence — Introduction, Select Tasks, Readiness,
+Safety, Review and Install — and shows this Mac, the pinned image hashes, the
+read-only diagnostics, the boot chain and the five blockers. The Install control
+is disabled because Windows has no boot path yet, and the walkthrough says so
+instead of offering an install that cannot work. The native app starts or reuses
+the loopback server and stops only one it started. See
 `tools/siliconcamp-assistant/README.md`.
 
 ## Layout
@@ -91,7 +98,7 @@ patches/m1n1-windows/   original patches against the NTASP m1n1 fork
 patches/ntasp-firmware/ M4 UEFI platform, the ANS storage driver and build patches
 scripts/                host check, build, patch application, ACPI and ANS2 constant
                         checkers, SoC coverage
-tools/                  SiliconCamp Assistant, the local readiness panel
+tools/                  SiliconCamp Assistant, the native/browser setup walkthrough
 tests/                  checker regression tests and real M4 ACPI fixtures
 third_party/m1n1/            upstream Asahi m1n1 (reference)
 third_party/m1n1-windows/    NTASP vGIC/PSCI Windows fork (build target)

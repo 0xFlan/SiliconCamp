@@ -23,7 +23,8 @@ firmware `18000.161.10`.
 | Patch integrity | the m1n1-windows series (0001-0007) and the firmware patches apply to their pinned commits, in order, in one worktree (checked 2026-10-28); applying the series to a pristine `HEAD` reproduces the submodule's working tree byte-for-byte, and that patched tree builds to the same `m1n1.macho`/`m1n1.bin` hashes as the working tree it was generated from (`a5636c6d…` / `06247d0e…`, checked 2026-10-28); the firmware platform patch reproduces every file it owns, including the MADT MSI frame. `0003-vgic-selftest.patch` is verified as a continuation of `0001` in the same cumulative worktree, because it edits files `0001` creates |
 | NTASP M4 UEFI build | success, 30 MB `MAC16_3_EFI.fd`, rebuilt 2026-10-28 with the `gating.pending` and `gating.group1` probes. `artifacts/` documents release `v0.9.0`, which carries patch `0007` and both enable-gate probes |
 | M4 ACPI/image checker | `./scripts/check-acpi.py` passes; run by the build script |
-| Checker regression tests | 136 pass (`python3 -m unittest discover -s tests`), including 31 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect, 25 that mutate the self-test series or tree and require `check-vgic-selftest.py` to reject it, 5 for the GICv3 oracle, and 5 for the assistant's status, skip and submodule handling |
+| Checker regression tests | 139 pass (`python3 -m unittest discover -s tests`), including 31 that mutate the vGIC series or patched sources and require `check-vgic.py` to reject each defect, 25 that mutate the self-test series or tree and require `check-vgic-selftest.py` to reject it, 5 for the GICv3 oracle, and 8 for the assistant's status, skip, submodule, walkthrough and native-bundle handling |
+| Assistant walkthrough | Six-step Boot Camp-shaped AppKit/WKWebView window and browser page. The native shell starts and stops the loopback server it owns, and `--screenshot` produced a 1080×720 render; the Install control is disabled. Still not an installer |
 | vGIC conformance self-test | `AppleVgicSelfTestDxe` is linked into the DXE FV and placed before `TimerDxe`; `scripts/check-vgic-selftest.py` passes in both modes (94 checks against the patch series, 93 against the patched tree) and the build script fails if the module is missing. Never executed on hardware |
 | GICv3 reference oracle | `scripts/check-gicv3-oracle.py` drives QEMU 11.1.2's GICv3 model over qtest, with no guest, and passes 26 probes: the set/clear bank aliases read back the same state, a write of 0 to `GICR_ISENABLER0` is ignored, `GICD_IGROUPR` is writable under `DS=1` rather than RAZ/WI, `GICD_CTLR.DS`/`ARE` cannot be cleared, and a redistributor wake completes. Local-only; skips when QEMU is absent |
 | M4 ACPI tables | disassembled and checked (below) |
@@ -171,6 +172,7 @@ correct.
 | SMMU/DART abstraction | Stub | `hv_smmu.c` is 45 lines; not a real IOMMU. |
 | vTPM | Stub | `hv_vtpm.c` is 16 lines; no TPM 2.0. |
 | NTASP UEFI firmware | Builds | M2 reference and M4 `Mac16_3` package both build in the Lima VM. |
+| User-facing assistant | Builds, not an installer | Native AppKit/WKWebView window plus a six-step walkthrough: machine, image hashes, diagnostics, safety, blockers and the Boot Camp gap. The Install control is disabled; the app reads this checkout and writes nothing. |
 | M4 platform package | Builds, ACPI checked | `Silicon/Apple/T8132FamilyPkg` + `Platform/Mac16_3Pkg`; CPU/RAM/UART/PPTT match the J624 hardware. PCIe uses the captured J624 ECAM, bus window and host offset (`docs/pcie.md`); MCFG, `PCI0`/`_CRS` and the GIC MSI Frame are in the firmware. The `apciec` complexes and `_PRT`/IORT are still missing. |
 | m1n1 PCIe guest hand-off | Patched, builds | Patch 0003 adds `pcie_guest.c`: ADT walk for controllers/DARTs/MSI, stage-2 mapping of ECAM and BAR windows, DART bypass with per-stream verification, and a one-line failure if any stream cannot be bypassed. Not hardware-tested. |
 | PCIe MSI to a guest | Patched, builds | Patch 0003 adds `guest_msi.c`: port MSIMAP entries programmed to `0x80000000 \| i` with read-back, AIC 1506–1761 unmasked, and `hv_vgic3_guest_vintid()` translating them to SPIs 512–767. AIC interrupts with no INTID representation are masked and logged once instead of injected verbatim. Deliberately not an emulated ITS: Apple's hardware never writes `GITS_TRANSLATER`. Not hardware-tested. |
@@ -232,6 +234,7 @@ Every item below is blocked on the machine, not on code:
 ./scripts/check-host.sh
 ./scripts/build-m1n1.sh
 ./scripts/build-uefi-linux.sh Mac16_3
+./tools/siliconcamp-assistant/build-app.sh
 ```
 
 UEFI build output:

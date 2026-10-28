@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-SiliconCamp Assistant — a local, read-only readiness panel.
+SiliconCamp Assistant — a local, read-only setup walkthrough.
 
 The project can build m1n1 and the NTASP UEFI firmware, and it cannot yet boot
-Windows.  This serves a small UI that says exactly that: which images are
-present and match their pinned hashes, what the machine is, which safety gates
-are acknowledged, and which checks still pass.  It is deliberately not an
-installer.
+Windows.  This serves a small Boot Camp-shaped UI that says exactly that: which
+images are present and match their pinned hashes, what the machine is, which
+safety gates are acknowledged, and which checks still pass.  It is deliberately
+not an installer.
 
 Safety properties:
 
@@ -141,7 +141,7 @@ ROADMAP = (
     {
         "feature": "One setup assistant",
         "state": "preview",
-        "detail": "This panel is the first step: it makes the state and the blockers visible before any install path is offered.",
+        "detail": "This walkthrough is the first step: it makes the state and the blockers visible before any install path is offered.",
     },
 )
 
@@ -324,7 +324,7 @@ def build_status() -> dict[str, object]:
     ready = bool(artifacts) and all(row["status"] == "match" for row in artifacts)
     return {
         "product": "SiliconCamp Assistant",
-        "version": "0.1",
+        "version": "0.2",
         "preview": True,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "machine": machine_info(),
@@ -346,7 +346,7 @@ def build_status() -> dict[str, object]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SiliconCampAssistant/0.1"
+    server_version = "SiliconCampAssistant/0.2"
     sys_version = ""
 
     def log_message(self, fmt: str, *args: object) -> None:
