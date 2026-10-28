@@ -140,12 +140,17 @@ ROADMAP = (
     {
         "feature": "Create a bootable Windows installer",
         "state": "available",
-        "detail": "Validates a Windows Arm64 ISO and writes FAT32 UEFI media to a USB disk or a disk image, then reads every file back.",
+        "detail": "Validates a Windows Arm64 ISO, checks the boot application's PE machine type, writes FAT32 UEFI media to a USB disk or a disk image, and reads every file back.",
+    },
+    {
+        "feature": "Windows Setup answer file",
+        "state": "available",
+        "detail": "Autounattend.xml on the media accepts the license, sets the locale and bypasses the TPM, Secure Boot and RAM checks. It never selects or formats a disk.",
     },
     {
         "feature": "Reserve space for Windows",
-        "state": "planned",
-        "detail": "The BOOTCAMP size is computed from the live APFS container. The resize stays disabled until Windows can boot.",
+        "state": "engine ready",
+        "detail": "The resize and restore commands are implemented and rehearse end to end on a throwaway APFS image. The internal disk stays disabled until Windows can boot.",
     },
     {
         "feature": "Install Windows from an ISO",
@@ -353,7 +358,7 @@ def build_status() -> dict[str, object]:
     ready = bool(artifacts) and all(row["status"] == "match" for row in artifacts)
     return {
         "product": "SiliconCamp Assistant",
-        "version": "0.3",
+        "version": "0.4",
         "preview": True,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "machine": machine_info(),
@@ -636,6 +641,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/allocation/plan":
             self._plan_allocation()
             return
+        if path == "/api/allocation/rehearse":
+            self._rehearse_allocation()
+            return
         if path != "/api/check":
             self._error(HTTPStatus.NOT_FOUND, "not found")
             return
@@ -767,6 +775,35 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
             return
         self._json(allocation.plan_space(gib, stats=stats))
+
+    def _rehearse_allocation(self) -> None:
+        """Run the real resize and restore against a throwaway APFS image."""
+        if not self._authorised_write():
+            return
+        payload = self._body()
+        if payload is None:
+            return
+        try:
+            gib = int(payload.get("gb", 0))
+        except (TypeError, ValueError):
+            self._error(HTTPStatus.BAD_REQUEST, "bad size")
+            return
+        if gib < allocation.MIN_WINDOWS_GB:
+            self._error(
+                HTTPStatus.BAD_REQUEST,
+                f"Windows 11 Arm64 needs at least {allocation.MIN_WINDOWS_GB} GB",
+            )
+            return
+
+        def work(log):
+            return allocation.rehearse_space(gib, log=log)
+
+        try:
+            job_id = JOBS.start("rehearsal", work)
+        except RuntimeError as exc:
+            self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        self._json({"job": job_id}, status=HTTPStatus.ACCEPTED)
 
 
 def main() -> int:

@@ -186,6 +186,13 @@
                 is erased, formatted as one FAT32 partition, written with the
                 setup files and read back.
               </p>
+              <p class="fine">
+                The Arm64 boot application is checked for its PE machine type, not
+                just its name. The media also carries Autounattend.xml: it accepts
+                the license, fixes the locale and bypasses the TPM, Secure Boot and
+                RAM checks this Mac cannot satisfy. It never chooses or formats a
+                disk.
+              </p>
 
               <section class="group">
                 <h2>Windows ISO</h2>
@@ -252,9 +259,16 @@
 
               <div class="button-row">
                 <button class="button default" id="allocate" type="button" disabled>Allocate Space</button>
+                <button class="button" id="rehearse-space" type="button" disabled>Rehearse on a Disk Image</button>
                 <span class="status-text" id="space-state"></span>
               </div>
               <p class="fine" id="allocate-reason"></p>
+              <p class="fine" id="rehearse-note">
+                The rehearsal creates a throwaway APFS image, runs the same shrink,
+                FAT32 partition and restore commands the internal disk would use, and
+                deletes the image. The internal disk is not changed.
+              </p>
+              <pre class="output" id="space-log" tabindex="0" aria-live="polite" hidden></pre>
             </section>
 
             <section class="pane" data-pane="safety" aria-labelledby="safety-title" hidden>

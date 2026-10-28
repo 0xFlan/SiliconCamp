@@ -24,7 +24,10 @@ This is the first hardware step and the first irreversible one. It requires the 
 - Confirm the machine owner accepts the risk of a DFU restore.
 - Set the boot policy to Permissive Security only for the experiment.
 - Install `m1n1.bin` with the modern raw path, or boot it through the project's existing recovery flow.
-- Capture the m1n1 serial/UART log.
+- Capture the m1n1 serial/UART log:
+  `python3 tools/siliconcamp-assistant/serial.py capture --device /dev/cu.usbmodem… --out probes/m4-first-boot.log`
+  keeps per-line timestamps and a counted footer, so a truncated or silent run is
+  visible in the artefact itself.
 
 **Exit criteria:** m1n1 reaches its console on the M4 and prints the vGIC topology line:
 

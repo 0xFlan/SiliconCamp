@@ -2,17 +2,19 @@
 """
 Installer media engine for SiliconCamp.
 
-Turns a Windows 11 Arm64 ISO into a bootable UEFI installer on a GPT disk or on
-a disk image.  It is the part of the old Boot Camp flow that does not depend on
-a Windows kernel existing: validating the media, choosing a destination,
-partitioning it FAT32, copying the setup files and reading them back.
+Turns a Windows 11 Arm64 ISO into a bootable UEFI installer on a USB disk or a
+disk image.  It is the part of the old Boot Camp flow that does not depend on a
+Windows kernel existing: validating the media, choosing a destination,
+partitioning it FAT32, copying the setup files, writing the answer file and
+reading it all back.
 
 What the media must contain (Microsoft, "Install Windows from a USB flash
 drive"):
 
-    \\EFI\\BOOT\\BOOTAA64.EFI    the removable-media boot application
+    \\EFI\\BOOT\\BOOTAA64.EFI    the removable-media boot application (PE/AA64)
     \\sources\\boot.wim          Windows PE / Setup
     \\sources\\install.wim       the image, or install.swm parts of it
+    \\Autounattend.xml          license, locale and the hardware-gate bypass
 
 FAT32 cannot hold a single file larger than 4 GiB.  When ``sources/install.wim``
 is bigger than that, the parts have to be written as ``install.swm`` with
@@ -83,6 +85,14 @@ DISKUTIL = "/usr/sbin/diskutil"
 
 REQUIRED_BOOT = "efi/boot/bootaa64.efi"
 REQUIRED_BOOT_WIM = "sources/boot.wim"
+
+#: IMAGE_FILE_MACHINE_ARM64.  The file name alone is not proof: an x64 ISO
+#: renamed to look like an Arm64 one would otherwise be written and fail in
+#: firmware with no useful message.
+ARM64_MACHINE = 0xAA64
+
+#: Windows Setup reads this file from the root of the media, without a prompt.
+UNATTEND_NAME = "Autounattend.xml"
 INSTALL_CANDIDATES = (
     "sources/install.wim",
     "sources/install.esd",
@@ -111,6 +121,7 @@ class PayloadFile:
 class Payload:
     root: str
     boot_efi: str
+    boot_machine: int
     boot_wim: str
     install_image: str
     install_kind: str
@@ -125,6 +136,7 @@ class Payload:
         return {
             "root": self.root,
             "boot_efi": self.boot_efi,
+            "boot_machine": self.boot_machine,
             "boot_wim": self.boot_wim,
             "install_image": self.install_image,
             "install_kind": self.install_kind,
@@ -134,6 +146,32 @@ class Payload:
             "total_bytes": self.total_bytes,
             "file_count": self.file_count,
         }
+
+
+def pe_machine(path: str | Path) -> int:
+    """The PE `IMAGE_FILE_HEADER.Machine` of an EFI application.
+
+    Raises :class:`MediaError` when the file is not a PE image at all, so a
+    truncated or renamed file is reported as such rather than as a wrong
+    architecture.
+    """
+    try:
+        with Path(path).open("rb") as handle:
+            if handle.read(2) != b"MZ":
+                raise MediaError(f"{Path(path).name} is not a PE image (no MZ header)")
+            handle.seek(0x3C)
+            offset_bytes = handle.read(4)
+            if len(offset_bytes) != 4:
+                raise MediaError(f"{Path(path).name} is truncated before its PE header")
+            handle.seek(int.from_bytes(offset_bytes, "little"))
+            if handle.read(4) != b"PE\0\0":
+                raise MediaError(f"{Path(path).name} has no PE signature")
+            machine = handle.read(2)
+            if len(machine) != 2:
+                raise MediaError(f"{Path(path).name} is truncated before its machine type")
+            return int.from_bytes(machine, "little")
+    except OSError as exc:
+        raise MediaError(f"cannot read {path}: {exc}") from exc
 
 
 def scan_payload(root: str | Path) -> Payload:
@@ -175,6 +213,13 @@ def scan_payload(root: str | Path) -> Payload:
         raise MediaError(
             "not a Windows Arm64 installer: EFI/BOOT/BOOTAA64.EFI is missing"
         )
+    machine = pe_machine(base / boot_efi)
+    if machine != ARM64_MACHINE:
+        raise MediaError(
+            f"{boot_efi} is a 0x{machine:04x} PE image, not Arm64 (0x{ARM64_MACHINE:04x}); "
+            "this is not a Windows Arm64 installer"
+        )
+
     boot_wim = seen.get(REQUIRED_BOOT_WIM)
     if not boot_wim:
         raise MediaError("not a Windows installer: sources/boot.wim is missing")
@@ -220,6 +265,7 @@ def scan_payload(root: str | Path) -> Payload:
     return Payload(
         root=str(base),
         boot_efi=boot_efi,
+        boot_machine=machine,
         boot_wim=boot_wim,
         install_image=install_image,
         install_kind=install_kind,
@@ -409,6 +455,7 @@ def plan_media(
     *,
     target: dict[str, object],
     splitter: str = "",
+    unattend: bool = True,
 ) -> dict[str, object]:
     """Decide whether a destination can hold this payload, before touching it.
 
@@ -480,6 +527,11 @@ def plan_media(
         steps.append(
             f"wimlib-imagex split sources/install.wim sources/install.swm 3800"
         )
+    if unattend:
+        steps.append(
+            f"write {UNATTEND_NAME} (license, locale and the TPM / Secure Boot "
+            "checks; it never chooses or formats a disk)"
+        )
     steps.append("read every copied file back and compare it with the source")
 
     if capacity and not blockers:
@@ -496,11 +548,160 @@ def plan_media(
         "required_bytes": payload.total_bytes,
         "split": payload.needs_split,
         "splitter": splitter,
+        "unattend": bool(unattend),
         "blockers": blockers,
         "warnings": warnings,
         "steps": steps,
         "payload": payload.summary(),
     }
+
+
+# ---------------------------------------------------------------------------
+# The answer file Windows Setup reads from the media root.
+# ---------------------------------------------------------------------------
+
+#: The gates Windows 11 applies that this hardware cannot satisfy.  Apple
+#: silicon has no TPM 2.0 and m1n1/ntasp do not implement Microsoft's Secure
+#: Boot database, so Setup would stop before touching the partition.
+LAB_GATES = (
+    "BypassTPMCheck",
+    "BypassSecureBootCheck",
+    "BypassRAMCheck",
+    "BypassCPUCheck",
+)
+
+UNATTEND_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Written by the SiliconCamp Assistant to the root of the installer media.
+  Windows Setup reads it automatically; delete it to get the stock checks back.
+
+  It never chooses, creates or formats a partition.  Disk selection stays in
+  Setup's own UI, so a wrong disk number cannot destroy a volume from here.
+  It only accepts the license for this unattended run, fixes the setup locale,
+  and bypasses the hardware gates this Mac cannot satisfy.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <SetupUILanguage>
+        <UILanguage>{locale}</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>{locale}</InputLocale>
+      <SystemLocale>{locale}</SystemLocale>
+      <UILanguage>{locale}</UILanguage>
+      <UserLocale>{locale}</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="arm64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <RunSynchronous>
+{commands}
+      </RunSynchronous>
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+    </component>
+  </settings>
+</unattend>
+"""
+
+UNATTEND_NS = "urn:schemas-microsoft-com:unattend"
+
+
+def render_unattend(*, locale: str = "en-US") -> str:
+    """The answer file, with one command per gate Windows 11 would stop at."""
+    commands = []
+    for order, gate in enumerate(LAB_GATES, start=1):
+        commands.append(
+            "        <RunSynchronousCommand wcm:action=\"add\">\n"
+            f"          <Order>{order}</Order>\n"
+            f"          <Description>Bypass {gate} for hardware without TPM 2.0 or Microsoft Secure Boot.</Description>\n"
+            "          <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v "
+            f"{gate} /t REG_DWORD /d 1 /f</Path>\n"
+            "        </RunSynchronousCommand>"
+        )
+    return UNATTEND_TEMPLATE.format(locale=locale, commands="\n".join(commands))
+
+
+def validate_unattend(text: str) -> list[str]:
+    """Return what is wrong with an answer file; an empty list means usable.
+
+    The safety property checked here is as important as the schema ones: the
+    file must not contain a disk or image configuration, because a fixed disk
+    number on a machine with several disks could format the wrong volume.
+    """
+    import xml.etree.ElementTree as ElementTree
+
+    problems: list[str] = []
+    try:
+        root = ElementTree.fromstring(text)
+    except ElementTree.ParseError as exc:
+        return [f"not well-formed XML: {exc}"]
+    if root.tag != f"{{{UNATTEND_NS}}}unattend":
+        return [f"root element is {root.tag!r}, not an unattend document"]
+
+    settings = root.findall(f"{{{UNATTEND_NS}}}settings")
+    if not any(node.get("pass") == "windowsPE" for node in settings):
+        problems.append("no windowsPE settings pass")
+
+    components = [node for node in root.iter(f"{{{UNATTEND_NS}}}component")]
+    by_name = {node.get("name"): node for node in components}
+    setup = by_name.get("Microsoft-Windows-Setup")
+    if setup is None:
+        problems.append("no Microsoft-Windows-Setup component")
+    else:
+        if setup.get("processorArchitecture") != "arm64":
+            problems.append("Microsoft-Windows-Setup is not for arm64")
+        if setup.find(f".//{{{UNATTEND_NS}}}DiskConfiguration") is not None:
+            problems.append("the answer file configures a disk; disk selection must stay manual")
+        if setup.find(f".//{{{UNATTEND_NS}}}ImageInstall") is not None:
+            problems.append("the answer file chooses an install target; that must stay manual")
+        paths = [
+            (node.text or "")
+            for node in setup.iter(f"{{{UNATTEND_NS}}}Path")
+        ]
+        for gate in LAB_GATES:
+            if not any(gate in path for path in paths):
+                problems.append(f"no LabConfig command for {gate}")
+        eula = setup.find(f".//{{{UNATTEND_NS}}}AcceptEula")
+        if eula is None or (eula.text or "").strip().lower() != "true":
+            problems.append("the EULA is not accepted")
+
+    locale = by_name.get("Microsoft-Windows-International-Core-WinPE")
+    if locale is None:
+        problems.append("no Microsoft-Windows-International-Core-WinPE component")
+    else:
+        language = locale.find(f"{{{UNATTEND_NS}}}UILanguage")
+        if language is None or not (language.text or "").strip():
+            problems.append("the setup language is not set")
+
+    return problems
+
+
+def write_unattend(volume: str | Path, *, locale: str = "en-US", log=print) -> dict[str, object]:
+    """Write, read back and validate the answer file on the media root."""
+    text = render_unattend(locale=locale)
+    problems = validate_unattend(text)
+    if problems:
+        raise MediaError("the answer file is not usable: " + "; ".join(problems))
+    target = Path(volume) / UNATTEND_NAME
+    encoded = text.encode("utf-8")
+    target.write_bytes(encoded)
+    written = target.read_bytes()
+    if written != encoded:
+        raise MediaError(f"{UNATTEND_NAME} did not read back byte-for-byte")
+    log(f"wrote {UNATTEND_NAME} ({len(written)} bytes): license, locale, TPM/Secure Boot bypass")
+    return {"path": UNATTEND_NAME, "bytes": len(written), "gates": list(LAB_GATES)}
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +944,7 @@ def create_media(
     target: dict[str, object],
     confirm: bool = False,
     splitter: str = "",
+    unattend: bool = True,
     log=print,
 ) -> dict[str, object]:
     """Mount the ISO, partition, format, copy and verify.
@@ -754,7 +956,12 @@ def create_media(
     try:
         payload = scan_payload(mount)
         return _write_media(
-            payload, target=target, confirm=confirm, splitter=splitter, log=log
+            payload,
+            target=target,
+            confirm=confirm,
+            splitter=splitter,
+            unattend=unattend,
+            log=log,
         )
     finally:
         detach(iso_device)
@@ -766,11 +973,12 @@ def _write_media(
     target: dict[str, object],
     confirm: bool = False,
     splitter: str = "",
+    unattend: bool = True,
     log=print,
 ) -> dict[str, object]:
     """Partition, format, copy and verify.  Refuses before the first write."""
     started = time.monotonic()
-    plan = plan_media(payload, target=target, splitter=splitter)
+    plan = plan_media(payload, target=target, splitter=splitter, unattend=unattend)
     if plan["blockers"]:
         raise MediaError("; ".join(str(item) for item in plan["blockers"]))
 
@@ -817,6 +1025,7 @@ def _write_media(
             )
 
         copied = _copy_payload(Path(volume), payload, splitter=splitter, log=log)
+        answer = write_unattend(volume, log=log) if unattend else None
         removed = clean_metadata(volume, log=log)
         verified = verify_media(volume, payload, log=log)
         if not verified["ok"]:
@@ -824,6 +1033,15 @@ def _write_media(
                 "verification failed: "
                 + ", ".join(verified["missing"] + verified["mismatched"])[:400]
             )
+        if answer is not None:
+            readback = (Path(volume) / UNATTEND_NAME).read_text(encoding="utf-8")
+            problems = validate_unattend(readback)
+            if problems:
+                raise MediaError(
+                    f"{UNATTEND_NAME} is on the media but not usable: "
+                    + "; ".join(problems)
+                )
+            answer["validated"] = True
         finished = True
         return {
             "ok": True,
@@ -834,6 +1052,7 @@ def _write_media(
             "label": label,
             "seconds": round(time.monotonic() - started, 1),
             "copied": copied,
+            "unattend": answer,
             "metadata_removed": removed,
             "verified": verified,
         }
