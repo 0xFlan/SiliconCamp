@@ -31,6 +31,14 @@ ROOT = os.path.dirname(TESTS_DIR)
 CHECKER = os.path.join(ROOT, "scripts", "check-vgic-selftest.py")
 PATCH_DIR = os.path.join(ROOT, "patches", "ntasp-firmware")
 FIRMWARE = os.path.join(ROOT, "third_party", "ntasp-firmware")
+#: The driver only exists once the submodule is initialised and 0003 is applied.
+#: A CI checkout can leave an empty `third_party/ntasp-firmware` directory, so
+#: testing the directory alone is not enough to know the tree is usable.
+SELFTEST_DRIVER = os.path.join(
+    FIRMWARE,
+    "Silicon", "Apple", "AppleSiliconPkg", "Drivers",
+    "AppleVgicSelfTestDxe", "AppleVgicSelfTestDxe.c",
+)
 PATCH = "0003-vgic-selftest.patch"
 
 
@@ -261,7 +269,8 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertIn("only EnableGrp1NS is cleared", result.stdout)
 
 
-@unittest.skipUnless(os.path.isdir(FIRMWARE), "firmware submodule not initialised")
+@unittest.skipUnless(os.path.isfile(SELFTEST_DRIVER),
+                     "firmware submodule is not initialised or patched")
 class FirmwareTreeTests(unittest.TestCase):
     """The same contract against the materialised tree a contributor edits."""
 
