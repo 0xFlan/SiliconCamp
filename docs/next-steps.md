@@ -336,7 +336,9 @@ reserve as a bisection tool.
      INTID does not block the ones behind it, and it runs when the guest enables
      an INTID (or `GICD_CTLR.EnableGrp1`), so pending state is delivered at the
      point the guest asked for it instead of at the next unrelated interrupt.
-     `gating.pending` measures that without resending the SGI.
+     `gating.pending` measures that without resending the SGI, and
+     `gating.group1` / `gating.group1-pending` measure the distributor's Group 1
+     half of the same predicate.
    - The redistributor's `ISENABLER0`/`ICENABLER0`, `ISPENDR0`/`ICPENDR0` and
      `ISACTIVER0`/`ICACTIVER0` handlers now implement write-1-to-set and
      write-1-to-clear in their own banks, and mirror each pair's state so both

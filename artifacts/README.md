@@ -1,18 +1,30 @@
 # Build artifacts
 
-These are the outputs of the 2026-10-27 build on the `Mac16,3` / `J624` M4 iMac,
-published as release **v0.8.0**.
+These are the outputs of the 2026-10-28 build on the `Mac16,3` / `J624` M4 iMac,
+published as release **v0.9.0**.
 
-All three images changed since v0.7.0.
+All three images changed since v0.8.0.
 
-- the UEFI MADT now carries a **GIC MSI Frame**: doorbell `0xfffff000` (the
-  captured APCIE `msi-address`), SPIs 512–767. This is how a guest that has no
-  APCIE driver is told how to signal through an Apple controller.
-- the hypervisor now has the other half: `guest_msi.c` programs each APCIE port's
+- the UEFI image now carries **`AppleVgicSelfTestDxe`** (firmware patch `0003`).
+  It runs after `ArmGicDxe` and before `TimerDxe`, walks every redistributor
+  frame, performs the guest wake sequence with a bounded poll, drives the banked
+  SPI registers, and delivers a self-SGI and the virtual timer PPI through the
+  real exception path. It measures both halves of the hypervisor's enable gate,
+  including `gating.pending` (an SGI sent while disabled has to arrive when the
+  bit is set, without a resend) and `gating.group1` / `gating.group1-pending`
+  (the distributor's Group 1 enable). It has never run on hardware;
+  `../docs/vgic-selftest.md` is the per-check reference.
+- the hypervisor now carries patch `0007-vgic-enable-gating.patch`: injection
+  consults `GICD_CTLR.EnableGrp1` and the INTID's own enable bit, a refused
+  interrupt stays queued, the drain compacts instead of stopping at it, enabling
+  an INTID drains the queues, and queueing is one atomic test-and-insert so two
+  CPUs cannot enqueue the same SGI.
+- the v0.8.0 changes remain: the UEFI MADT carries a **GIC MSI Frame** (doorbell
+  `0xfffff000`, SPIs 512–767), and `guest_msi.c` programs each APCIE port's
   256-entry MSI map (read back, because iBoot hands over with it cleared),
   unmasks AIC 1506–1761, and `hv_vgic3_guest_vintid()` translates those AIC
   interrupts into the SPIs the firmware advertises. An AIC interrupt with no
-  guest INTID is now masked and logged instead of being injected verbatim.
+  guest INTID is masked and logged instead of being injected verbatim.
 - the v0.7.0 changes remain: `AppleNANDStorageDxe`, a real driver for the
   internal ANS/ANS2 SSD, is in the UEFI image. It has never run on hardware, so
   USB storage remains the install target until the first boot log says otherwise
@@ -41,20 +53,20 @@ checked against.
 ## SHA-256
 
 ```
-31416f196b404889f57fd190c7b46084adb6ebbc690cbbf231f0ad0f981c6cfc  MAC16_3_EFI.fd
-571aafe38ef267656c4068f39af87b5b16d70c2b67e0c1cc669c904994b1eb31  m1n1-windows.bin
-c3346f007c1e90d30a6aac14409547662779adaf3765b2e65386f3912e91211c  m1n1-windows.macho
+89e7cbb3669b08a903ee5663c618867518c2a26782ed1412e2b91b7c29a16739  MAC16_3_EFI.fd
+06247d0eb94bdb68b123c8163871a4777e8635ac725fc2bee87249223cb556bc  m1n1-windows.bin
+a5636c6de757508c4f791f3216c804f93c68924a7ecba4f95239d1cab2a6f148  m1n1-windows.macho
 ```
 
 The m1n1 hashes come from a detached worktree of the pinned submodule commit
-with `patches/m1n1-windows/0001`–`0003` applied (0003 now carries both the PCIe
-and the MSI hand-off). A recursive `diff -r` of that
+with `patches/m1n1-windows/0001`–`0007` applied. A recursive `diff -r` of that
 tree against the working tree the patches were developed in reports no
 difference outside `.git`, `build/` and `target/`, and both trees build the same
-`m1n1.bin` byte for byte — so the hashes identify clean-checkout + patches, not
-a dirty tree. The UEFI image was built from the firmware tree that
-`patches/ntasp-firmware/0001` reproduces from its pinned commit; a `diff -r`
-ignoring `__pycache__` reports no difference.
+`m1n1.bin` and `m1n1.macho` byte for byte — so the hashes identify
+clean-checkout + patches, not a dirty tree. The UEFI image was built from the
+firmware tree that `patches/ntasp-firmware/0001` reproduces from its pinned
+commit with `0003` applied on top; a `diff -r` ignoring `__pycache__` reports no
+difference.
 
 ## What the UEFI image contains
 
@@ -83,6 +95,10 @@ ignoring `__pycache__` reports no difference.
   ANS coprocessor, programs the SART and NVMMU/NVMe queues and publishes the
   disk as `EFI_BLOCK_IO_PROTOCOL`. It has not run on hardware; `docs/ans2.md`
   maps the serial log to its bring-up steps.
+- The vGIC conformance self-test, `AppleVgicSelfTestDxe` (a DXE module before
+  `TimerDxe`, behind `!if $(AIC_BUILD) == FALSE`): it prints one `vgic:` line per
+  check and never halts the boot. It has not run on hardware; `docs/vgic-selftest.md`
+  lists every check and its stated limits.
 
 The final FD stores the ACPI tables compressed inside the Project Mu FV; the
 values above were checked from the build-tree `.aml`/`.acpi` files and the
@@ -117,8 +133,9 @@ larger than the whole image.
 
 - No *validated* MSI path. The frame, the port map programming and the
   translation are written, but the port map offset on T8132, the meaning of
-  `msi-vector-offset`, the AIC target CPU, and whether Windows accepts a MSI
-  frame without an IORT are unproven on hardware (`../docs/pcie.md`).
+  `msi-vector-offset`, the AIC target CPU, and whether an APCIE device actually
+  raises the AIC interrupt from an MSI-X write to the frame are unproven on
+  hardware (`../docs/pcie.md`).
 - No description of the four `apciec0`–`apciec3` root complexes; `PCI0`
   describes only the first `apcie` node. Their DARTs are bypassed by the m1n1
   hand-off, and the hand-off prints their ECAMs at boot for the next capture.

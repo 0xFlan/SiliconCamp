@@ -418,6 +418,57 @@ def check_driver(ck: Checker, source: str, inf: str) -> None:
              "gating.pending does not send a second SGI before waiting: a resend "
              "would hide an interrupt the vGIC dropped instead of queueing")
 
+    #
+    # The group gate is the other half of the predicate: every list register
+    # is injected as Group 1, so clearing GICD_CTLR.EnableGrp1 with the SGI's
+    # own bit set has to stop delivery.  Restoring it has to deliver the SGI
+    # that was sent in between, without a resend.
+    #
+    #
+    # function_body() blanks string literals, so the probe names have to be
+    # located in the raw slice, not in the blanked body used for structure.
+    # Slice from this function to the next one so the Windows HAL replay's own
+    # GICD_CTLR write cannot satisfy these checks by accident.
+    #
+    gating_start = raw.find("VgicCheckSgiGating")
+    gating_end = raw.find("VgicCheckPpiDelivery", gating_start)
+    gating_raw = (
+        raw[gating_start:gating_end]
+        if gating_start > 0 and gating_end > gating_start
+        else ""
+    )
+    group_at = gating_raw.find('"gating.group1"')
+    ck.check(gating_start > 0 and group_at > 0,
+             "the test measures delivery while GICD_CTLR.EnableGrp1 is clear "
+             "(gating.group1)")
+    before_group = gating_raw[:group_at] if group_at > 0 else ""
+    group_disable_at = before_group.rfind(
+        "SavedCtlr & ~GICD_CTLR_ENABLEGRP1NS"
+    )
+    group_send_at = before_group.rfind("IccSgi1r")
+    ck.check(group_disable_at > 0 and group_send_at > group_disable_at,
+             "gating.group1 clears EnableGrp1 before sending the SGI")
+    ck.check(has(
+                 before_group[group_disable_at:],
+                 r"SavedCtlr\s*&\s*~\s*GICD_CTLR_ENABLEGRP1NS"),
+             "gating.group1 clears only EnableGrp1, preserving DS and ARE")
+    ck.check(has(before_group[group_disable_at:], r"VgicWaitCount"),
+             "gating.group1 waits before concluding the SGI was not delivered")
+    ck.check(has(
+                 gating,
+                 r"MmioWrite32\s*\(\s*DistBase\s*\+\s*GICD_CTLR\s*,\s*SavedCtlr\s*\)"),
+             "gating.group1 restores GICD_CTLR from the value that was read")
+    group_pending_at = gating_raw.find('"gating.group1-pending"')
+    ck.check(group_pending_at > group_at,
+             "the test measures that the Group 1 refusal stayed pending "
+             "(gating.group1-pending)")
+    if group_pending_at > group_at:
+        restore_at = gating_raw.find("GICD_CTLR, SavedCtlr)", group_at)
+        between = gating_raw[restore_at:group_pending_at] if restore_at > 0 else ""
+        ck.check(restore_at > 0 and "IccSgi1r" not in between,
+                 "gating.group1-pending does not send a second SGI before "
+                 "waiting: a resend would hide an interrupt the vGIC dropped")
+
     ck.section("Delivery uses the platform's own interrupt numbers")
     ck.check("PcdArmArchTimerVirtIntrNum" in code,
              "the virtual timer PPI comes from PcdArmArchTimerVirtIntrNum")
