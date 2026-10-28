@@ -158,7 +158,7 @@ BOOT_CHAIN = (
 # ---------------------------------------------------------------------------
 
 
-def _run(argv: list[str], timeout: float = 3.0) -> str:
+def _run(argv: list[str], timeout: float = 3.0, strip: bool = True) -> str:
     try:
         result = subprocess.run(
             argv,
@@ -170,15 +170,15 @@ def _run(argv: list[str], timeout: float = 3.0) -> str:
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    return result.stdout.strip()
+    return result.stdout.strip() if strip else result.stdout
 
 
 def _sysctl(name: str) -> str:
     return _run(["sysctl", "-n", name], timeout=2.0)
 
 
-def _git(*args: str) -> str:
-    return _run(["git", "--no-pager", *args], timeout=4.0)
+def _git(*args: str, strip: bool = True) -> str:
+    return _run(["git", "--no-pager", *args], timeout=4.0, strip=strip)
 
 
 def sha256_file(path: Path) -> str:
@@ -274,7 +274,12 @@ def _submodule_paths() -> set[str]:
 
 
 def repo_info() -> dict[str, object]:
-    porcelain = _git("status", "--porcelain")
+    #
+    # Do not strip the whole output: the first porcelain line starts with a
+    # space when the change is in the worktree, and stripping it shifts the
+    # path by one character.  That made m1n1-windows look like a source edit.
+    #
+    porcelain = _git("status", "--porcelain", strip=False)
     known_submodules = _submodule_paths()
     dirty = [
         line for line in porcelain.splitlines()
