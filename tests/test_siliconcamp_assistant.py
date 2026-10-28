@@ -223,7 +223,10 @@ class MediaPayloadTests(unittest.TestCase):
 
     def test_files_differing_only_by_case_are_rejected(self) -> None:
         # FAT32 is case-insensitive, so both cannot exist on the destination.
-        # The walk is mocked because this Mac's APFS cannot hold both names.
+        # The walk and the sizes are mocked so the test behaves the same on a
+        # case-insensitive APFS checkout and a case-sensitive Linux runner.
+        import stat as statmod
+        import types
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,7 +237,13 @@ class MediaPayloadTests(unittest.TestCase):
                 (str(root / "efi" / "boot"), [], ["bootaa64.efi"]),
                 (str(sources), [], ["boot.wim", "install.wim", "Install.wim"]),
             ]
-            with mock.patch.object(self.media.os, "walk", return_value=walked):
+            # is_dir() goes through Path.stat too, so the fake needs a mode.
+            fake = types.SimpleNamespace(
+                st_size=1024, st_mode=statmod.S_IFDIR | 0o644
+            )
+            with mock.patch.object(self.media.os, "walk", return_value=walked), mock.patch.object(
+                self.media.Path, "stat", return_value=fake
+            ):
                 with self.assertRaises(self.media.MediaError) as caught:
                     self.media.scan_payload(root)
             self.assertIn("case", str(caught.exception))
