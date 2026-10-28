@@ -17,9 +17,18 @@ CLI::
     python3 serial.py ports
     python3 serial.py capture --device /dev/cu.usbmodem1101 --out m4-boot.log
     python3 serial.py capture --device /dev/cu.usbmodem1101 --seconds 60 --echo
+    python3 serial.py verdict --in probes/m4-first-boot.log
 
 Stop a capture with Ctrl-C; the log's footer records the byte and line count so
 a truncated log is obvious.
+
+The ``verdict`` command reads a capture and answers the question the first
+bring-up session will actually ask: did m1n1 reach the M4 with the expected
+topology, did the firmware run its vGIC self-test, and did either of them fail
+or fault?  It parses the fixed, line-oriented markers the two programs print
+(``HV vGIC:``, ``PSCI DEBUG:``, ``vgic: [PASS]``, ``vgic: RESULT:``) rather
+than guessing from prose.  A log that contains none of them is reported as
+``incomplete``, never as a pass.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import errno
 import glob
 import json
 import os
+import re
 import select
 import sys
 import termios
@@ -44,6 +54,35 @@ SERIAL_HINTS = ("usbmodem", "usbserial", "slab", "wchusbserial", "serial", "debu
 
 #: Ports macOS creates for itself and that are never the M4 console.
 IGNORED = {"cu.Bluetooth-Incoming-Port"}
+
+
+#: Markers written by m1n1, its PSCI patch and the firmware self-test.  The
+#: firmware's format is documented in AppleVgicSelfTestDxe.c ("the log format is
+#: deliberately fixed and line-oriented so a captured serial log can be diffed
+#: between boots and checked by a script").
+STAMP = re.compile(r"^\[(\d\d:\d\d:\d\d\.\d{3})\] (.*)$")
+TOPOLOGY = re.compile(
+    r"HV vGIC: (\d+) CPUs, (\d+)-bit PA, dist=(0x[0-9a-fA-F]+) "
+    r"redist=(0x[0-9a-fA-F]+) its=(0x[0-9a-fA-F]+|\(nil\))"
+)
+PSCI_CORES = re.compile(r"PSCI DEBUG: Number of cores for PSCI nodes is (\d+)")
+PSCI_CLUSTERS = re.compile(r"PSCI DEBUG: Number of clusters for PSCI nodes is (\d+)")
+SELFTEST_LINE = re.compile(r"vgic: \[(PASS|FAIL|GAP |SKIP)\] ([^:]+): (.*)")
+SELFTEST_RESULT = re.compile(r"vgic: RESULT: (PASS-WITH-GAPS|PASS|FAIL)")
+SELFTEST_TOTALS = re.compile(
+    r"vgic: totals: pass=(\d+) fail=(\d+) gap=(\d+) skip=(\d+)"
+)
+FOOTER = re.compile(
+    r"^# ended: .* after ([\d.]+)s, (\d+) bytes, (\d+) lines$"
+)
+HEADER = re.compile(r"^# device: (.*)$")
+FAULT_MARKERS = (
+    "Unhandled exception",
+    "panic",
+    "PANIC",
+    "ESR_EL",
+    "Exception class",
+)
 
 
 class SerialError(RuntimeError):
@@ -219,6 +258,245 @@ def capture(
             pass
 
 
+def read_capture(path: str | Path) -> dict[str, object]:
+    """Read a capture into timestamped rows plus what its header/footer recorded."""
+    log_path = Path(path).expanduser()
+    if not log_path.is_file():
+        raise SerialError(f"no such capture: {log_path}")
+    rows: list[tuple[str, str]] = []
+    device = ""
+    duration: float | None = None
+    byte_count = 0
+    line_count = 0
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise SerialError(f"cannot read {log_path}: {exc}") from exc
+    for raw in text.splitlines():
+        stamp = STAMP.match(raw)
+        if stamp:
+            rows.append((stamp.group(1), stamp.group(2)))
+            continue
+        if raw.startswith("#"):
+            header = HEADER.match(raw)
+            if header:
+                device = header.group(1).strip()
+            footer = FOOTER.match(raw)
+            if footer:
+                duration = float(footer.group(1))
+                byte_count = int(footer.group(2))
+                line_count = int(footer.group(3))
+            continue
+        # A line without a timestamp (for example a log pasted from another
+        # tool) is still evidence, so it is kept rather than dropped.
+        if raw.strip():
+            rows.append(("", raw))
+    return {
+        "log": str(log_path),
+        "device": device,
+        "duration": duration,
+        "bytes": byte_count,
+        "lines": line_count or len(rows),
+        "rows": rows,
+    }
+
+
+def judge_capture(
+    path: str | Path,
+    *,
+    expect_cpus: int = 10,
+    expect_clusters: int = 2,
+    min_pa_bits: int = 42,
+) -> dict[str, object]:
+    """Judge one boot log against the bring-up exit criteria.
+
+    A capture is only a pass when it contains positive evidence for each stage:
+    m1n1's vGIC topology, PSCI's agreement with it, and the firmware self-test's
+    own RESULT.  Silence is ``incomplete``; a fault or a self-test failure is
+    ``fail`` regardless of anything else in the log.
+    """
+    capture = read_capture(path)
+    topology = None
+    cores: int | None = None
+    clusters: int | None = None
+    results = {"pass": 0, "fail": 0, "gap": 0, "skip": 0}
+    failed_checks: list[dict[str, str]] = []
+    gaps: list[dict[str, str]] = []
+    self_result: str | None = None
+    totals: dict[str, int] | None = None
+    firmware_reached = False
+    faults: list[str] = []
+    no_cpu_nodes = False
+
+    for _stamp, text in capture["rows"]:
+        if text.startswith("vgic:"):
+            firmware_reached = True
+        found = TOPOLOGY.search(text)
+        if found and topology is None:
+            topology = {
+                "cpus": int(found.group(1)),
+                "pa_bits": int(found.group(2)),
+                "dist": found.group(3),
+                "redist": found.group(4),
+                "its": found.group(5),
+            }
+        if cores is None:
+            found = PSCI_CORES.search(text)
+            if found:
+                cores = int(found.group(1))
+        if clusters is None:
+            found = PSCI_CLUSTERS.search(text)
+            if found:
+                clusters = int(found.group(1))
+        if "no CPU nodes found" in text:
+            no_cpu_nodes = True
+        check = SELFTEST_LINE.search(text)
+        if check:
+            kind = check.group(1).strip()
+            entry = {"name": check.group(2).strip(), "detail": check.group(3).strip()}
+            if kind == "FAIL":
+                results["fail"] += 1
+                failed_checks.append(entry)
+            elif kind == "GAP":
+                results["gap"] += 1
+                gaps.append(entry)
+            elif kind == "SKIP":
+                results["skip"] += 1
+            else:
+                results["pass"] += 1
+        if self_result is None:
+            found = SELFTEST_RESULT.search(text)
+            if found:
+                self_result = found.group(1)
+        if totals is None:
+            found = SELFTEST_TOTALS.search(text)
+            if found:
+                totals = {
+                    "pass": int(found.group(1)),
+                    "fail": int(found.group(2)),
+                    "gap": int(found.group(3)),
+                    "skip": int(found.group(4)),
+                }
+        if len(faults) < 12 and any(marker in text for marker in FAULT_MARKERS):
+            if text.strip() not in faults:
+                faults.append(text.strip())
+
+    if totals:
+        # The summary line is authoritative; the per-check counters are a
+        # cross-check, not a second opinion.
+        results = dict(totals)
+    if self_result == "FAIL":
+        results["fail"] = max(results["fail"], 1)
+
+    m1n1_reached = bool(topology or cores is not None or no_cpu_nodes)
+    failures: list[str] = []
+    missing: list[str] = []
+
+    if topology:
+        if topology["cpus"] != expect_cpus:
+            failures.append(
+                f"m1n1 reports {topology['cpus']} CPUs, expected {expect_cpus}"
+            )
+        if topology["pa_bits"] < min_pa_bits:
+            failures.append(
+                f"m1n1 reports a {topology['pa_bits']}-bit PA, expected at least "
+                f"{min_pa_bits}"
+            )
+    elif m1n1_reached:
+        missing.append("m1n1 started but did not print its vGIC topology line")
+
+    if cores is not None and cores != expect_cpus:
+        failures.append(f"PSCI built {cores} cores, expected {expect_cpus}")
+    if clusters is not None and clusters != expect_clusters:
+        failures.append(f"PSCI built {clusters} clusters, expected {expect_clusters}")
+    if no_cpu_nodes:
+        failures.append("m1n1 found no CPU nodes in the ADT")
+    if m1n1_reached and cores is None:
+        missing.append("PSCI did not print its core count")
+
+    if not firmware_reached:
+        missing.append("the firmware's vGIC self-test did not run")
+    elif self_result is None:
+        missing.append("the self-test printed checks but no RESULT line")
+    if results["fail"] or failed_checks:
+        names = ", ".join(check["name"] for check in failed_checks[:5])
+        failures.append(
+            "the vGIC self-test failed" + (f": {names}" if names else "")
+        )
+    elif self_result == "FAIL":
+        failures.append("the vGIC self-test reported FAIL")
+    if faults:
+        failures.append(f"the console contains a fault: {faults[0]}")
+
+    if failures:
+        verdict = "fail"
+    elif not capture["rows"]:
+        verdict = "incomplete"
+        missing.append("the capture contains no console output")
+    elif not m1n1_reached:
+        verdict = "incomplete"
+        missing.append("no m1n1 console markers were found")
+    elif missing:
+        verdict = "incomplete"
+    elif self_result == "PASS-WITH-GAPS":
+        verdict = "pass-with-gaps"
+    else:
+        verdict = "pass"
+
+    return {
+        "ok": verdict in ("pass", "pass-with-gaps"),
+        "verdict": verdict,
+        "capture": {k: capture[k] for k in ("log", "device", "duration", "bytes", "lines")},
+        "m1n1": topology,
+        "psci": {"cores": cores, "clusters": clusters},
+        "selftest": {
+            "ran": firmware_reached,
+            "result": self_result,
+            "pass": results["pass"],
+            "fail": results["fail"],
+            "gap": results["gap"],
+            "skip": results["skip"],
+            "failed_checks": failed_checks,
+            "gaps": gaps,
+        },
+        "faults": faults,
+        "failures": failures,
+        "missing": missing,
+    }
+
+
+def format_verdict(report: dict[str, object]) -> str:
+    """A short human-readable summary of `judge_capture`."""
+    lines = [f"{report['capture']['log']}: {str(report['verdict']).upper()}"]
+    topology = report["m1n1"]
+    if topology:
+        lines.append(
+            f"  m1n1: {topology['cpus']} CPUs, {topology['pa_bits']}-bit PA, "
+            f"dist={topology['dist']} redist={topology['redist']} its={topology['its']}"
+        )
+    psci = report["psci"]
+    if psci["cores"] is not None:
+        lines.append(
+            f"  PSCI: {psci['cores']} cores in {psci['clusters']} clusters"
+            if psci["clusters"] is not None
+            else f"  PSCI: {psci['cores']} cores"
+        )
+    selftest = report["selftest"]
+    if selftest["ran"]:
+        lines.append(
+            f"  self-test: {selftest['result'] or 'no result'} "
+            f"({selftest['pass']} pass, {selftest['fail']} fail, "
+            f"{selftest['gap']} gap, {selftest['skip']} skip)"
+        )
+    for failure in report["failures"]:
+        lines.append(f"  FAIL: {failure}")
+    for item in report["missing"]:
+        lines.append(f"  missing: {item}")
+    for check in report["selftest"]["gaps"]:
+        lines.append(f"  gap: {check['name']}: {check['detail']}")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SiliconCamp serial capture")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -232,6 +510,13 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     run.add_argument("--seconds", type=float, default=None)
     run.add_argument("--echo", action="store_true")
+
+    check = sub.add_parser("verdict", help="judge a captured boot log")
+    check.add_argument("--in", dest="input", required=True)
+    check.add_argument("--json", action="store_true")
+    check.add_argument("--expect-cpus", type=int, default=10)
+    check.add_argument("--expect-clusters", type=int, default=2)
+    check.add_argument("--min-pa-bits", type=int, default=42)
 
     args = parser.parse_args(argv)
 
@@ -247,6 +532,18 @@ def main(argv: list[str] | None = None) -> int:
                     mark = "*" if row["likely_serial"] else " "
                     print(f"{mark} {row['device']}")
             return 0
+        if args.command == "verdict":
+            report = judge_capture(
+                args.input,
+                expect_cpus=args.expect_cpus,
+                expect_clusters=args.expect_clusters,
+                min_pa_bits=args.min_pa_bits,
+            )
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print(format_verdict(report))
+            return 0 if report["ok"] else 1 if report["verdict"] == "fail" else 2
         result = capture(
             args.device,
             args.out,

@@ -570,6 +570,38 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(partition["format"], "FAT32")
         self.assertEqual(partition["bytes"], 64 * 10**9)
         self.assertEqual(plan["after"]["free"], 36 * 10**9)
+        self.assertIsNone(plan["existing"])
+        self.assertFalse(plan["remove"]["enabled"])
+
+    def test_an_existing_partition_blocks_a_second_allocation(self) -> None:
+        existing = {
+            "device": "/dev/disk0s4",
+            "bytes": 64 * 10**9,
+            "filesystem": "msdos",
+            "mount": "/Volumes/BOOTCAMP",
+        }
+        plan = self.allocation.plan_space(
+            64, stats=self.fake_host(), existing=existing
+        )
+        self.assertFalse(plan["apply"]["enabled"])
+        self.assertIn("remove it", plan["apply"]["reason"])
+        self.assertEqual(plan["existing"]["device"], "/dev/disk0s4")
+        self.assertTrue(plan["remove"]["enabled"])
+        self.assertEqual(plan["remove"]["device"], "/dev/disk0s4")
+
+    def test_removal_is_allowed_before_windows_boots_but_allocation_is_not(self) -> None:
+        # Removing a partition only returns capacity to macOS; refusing it would
+        # leave a partition this tool made impossible to reclaim.
+        info = {"is_system": True}
+        self.allocation._assert_writable(info, removing=True)
+        with self.assertRaises(self.allocation.AllocationError) as caught:
+            self.allocation._assert_writable(info)
+        self.assertIn("never reached the kernel", str(caught.exception))
+
+    def test_removal_still_requires_an_explicit_confirmation(self) -> None:
+        with self.assertRaises(self.allocation.AllocationError) as caught:
+            self.allocation.remove_space(confirm=False, log=lambda _: None)
+        self.assertIn("confirm=True", str(caught.exception))
 
     def test_the_resize_is_disabled_until_windows_can_boot(self) -> None:
         plan = self.allocation.plan_space(64, stats=self.fake_host())
@@ -751,6 +783,39 @@ class ServerWriteGuardTests(unittest.TestCase):
         status, payload = self.post("/api/allocation/rehearse", {"gb": 64})
         self.assertEqual(status, 403)
         self.assertIn("token", payload["error"])
+
+    def test_apply_and_remove_need_the_token(self) -> None:
+        for path in ("/api/allocation/apply", "/api/allocation/remove"):
+            status, payload = self.post(path, {"gb": 64, "confirm": "disk0"})
+            self.assertEqual(status, 403, path)
+            self.assertIn("token", payload["error"])
+
+    @unittest.skipUnless(sys.platform == "darwin", "needs diskutil")
+    def test_apply_is_refused_on_this_mac_before_the_disk_is_touched(self) -> None:
+        stats = self.server_module.allocation.read_host_space()
+        before = self.server_module.allocation.container_info(stats["container"])["capacity"]
+        status, payload = self.post(
+            "/api/allocation/apply",
+            {"gb": 64, "confirm": stats["container"]},
+            headers={"X-SiliconCamp-Token": self.server_module.TOKEN},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("never reached the kernel", payload["error"])
+        after = self.server_module.allocation.container_info(stats["container"])["capacity"]
+        self.assertEqual(before, after)
+
+    @unittest.skipUnless(sys.platform == "darwin", "needs diskutil")
+    def test_removal_without_a_bootcamp_partition_is_refused(self) -> None:
+        info = self.server_module.allocation.container_info()
+        if self.server_module.allocation.existing_partition(info):
+            self.skipTest("this Mac really has a BOOTCAMP partition")
+        status, payload = self.post(
+            "/api/allocation/remove",
+            {"confirm": "disk0s4"},
+            headers={"X-SiliconCamp-Token": self.server_module.TOKEN},
+        )
+        self.assertEqual(status, 409)
+        self.assertIn("no BOOTCAMP", payload["error"])
 
     def test_a_rehearsal_below_the_windows_minimum_is_refused(self) -> None:
         status, payload = self.post(

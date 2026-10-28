@@ -257,6 +257,15 @@
                 <div class="plan-box" id="space-plan"><p class="fine">Waiting for the disk.</p></div>
               </section>
 
+              <section class="group" id="existing-group" hidden>
+                <h2>Existing Windows Partition</h2>
+                <dl class="spec-list" id="existing-facts"></dl>
+                <p class="fine" id="existing-note"></p>
+                <div class="button-row">
+                  <button class="button" id="remove-space" type="button">Remove Windows Partition</button>
+                </div>
+              </section>
+
               <div class="button-row">
                 <button class="button default" id="allocate" type="button" disabled>Allocate Space</button>
                 <button class="button" id="rehearse-space" type="button" disabled>Rehearse on a Disk Image</button>
@@ -268,6 +277,21 @@
                 FAT32 partition and restore commands the internal disk would use, and
                 deletes the image. The internal disk is not changed.
               </p>
+
+              <div class="confirm-box" id="space-confirm" hidden>
+                <h3 id="space-confirm-title">Allocate Space</h3>
+                <p id="space-confirm-text"></p>
+                <div class="field-row">
+                  <input class="field" type="text" id="space-confirm-field" spellcheck="false"
+                         autocomplete="off" aria-label="Type the disk identifier to confirm">
+                </div>
+                <div class="button-row">
+                  <button class="button" id="space-confirm-cancel" type="button">Cancel</button>
+                  <button class="button default" id="space-confirm-ok" type="button" disabled>Allocate</button>
+                </div>
+                <p class="fine" id="space-confirm-hint"></p>
+              </div>
+
               <pre class="output" id="space-log" tabindex="0" aria-live="polite" hidden></pre>
             </section>
 

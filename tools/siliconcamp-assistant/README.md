@@ -63,9 +63,12 @@ instead of picked.
    a background job whose log is on screen.
 5. **Reserve Space for Windows** — the live APFS container, the macOS reserve,
    the largest partition that fits, and a slider for the size. **Allocate Space**
-   is disabled with its reason. **Rehearse on a Disk Image** runs the actual
-   shrink, FAT32 partition, mount check and restore against a throwaway APFS
-   image and reports each command as it runs; the internal disk is untouched.
+   is disabled with its reason until the boot path exists; when it is enabled it
+   asks you to type the container name before it resizes anything. An existing
+   `BOOTCAMP` partition is listed with **Remove Windows Partition**, which
+   requires typing that partition's device. **Rehearse on a Disk Image** runs the
+   actual shrink, FAT32 partition, mount check and restore against a throwaway
+   APFS image and reports each command as it runs; the internal disk is untouched.
 6. **Before You Continue** — tested backup, a second Mac for DFU, a data-capable
    cable and owner approval. Stored in `localStorage`, never sent to the server.
 7. **Review** — the five blockers, the four-stage boot chain and the row-by-row
@@ -149,12 +152,21 @@ Measured details it encodes:
 - a failed add, format or verification erases any partition it created and
   grows the container back, and reports if the rollback itself failed.
 
-`BOOT_PATH_READY = False` makes `apply_space()` and `remove_space()` refuse the
-container that holds `/` before the first write. This is the policy gate, not a
-missing implementation: `rehearse_space()` runs the same functions against a
-fresh APFS disk image, verifies the mounted FAT32 `BOOTCAMP` volume, deletes it,
-restores the container and removes the image. It takes about 10–12 seconds and
-needs no hardware.
+`BOOT_PATH_READY = False` makes `apply_space()` refuse the container that holds
+`/` before the first write. This is the policy gate, not a missing
+implementation: `rehearse_space()` runs the same functions against a fresh APFS
+disk image, verifies the mounted FAT32 `BOOTCAMP` volume, deletes it, restores
+the container and removes the image. It takes about 10–12 seconds and needs no
+hardware.
+
+Removal is deliberately not behind that gate. Deleting `BOOTCAMP` only returns
+capacity to macOS, and refusing it would leave a partition this tool created
+impossible to reclaim if a later boot attempt failed. Both directions need
+`confirm=True`, and the server additionally requires the disk identifier typed
+into the page (`disk3` to resize, `disk0s4` to remove); a click alone cannot
+resize or erase. A plan for a disk that already has a `BOOTCAMP` partition
+reports removal as the next step instead of offering a second allocation, which
+`addPartition` would refuse after the container had already shrunk.
 
 ## Serial capture
 
@@ -174,6 +186,21 @@ obvious. `--seconds` bounds a run, `--echo` also prints to the terminal, and
 `ports` lists every `/dev/cu.*` device with likely USB-UART adapters first. It
 is tested against a pseudo-terminal, which exercises the same termios and read
 path as a real adapter.
+
+The capture is only evidence; `verdict` turns it into an answer:
+
+```bash
+python3 tools/siliconcamp-assistant/serial.py verdict --in probes/m4-first-boot.log
+```
+
+It parses the markers m1n1 and the firmware actually print — `HV vGIC: N CPUs,
+N-bit PA`, the `PSCI DEBUG:` core and cluster counts, `vgic: [PASS|FAIL|GAP |
+SKIP]` and `vgic: RESULT:` — and exits `0` for a pass (including
+`PASS-WITH-GAPS`), `1` for a failure and `2` when the log cannot support a
+verdict. A `[FAIL]`, a wrong CPU count or PA width, an `Unhandled exception`, or
+a fault after a green self-test is a failure; a silent or truncated log is
+`incomplete`, never a pass. `--json` emits the parsed topology, self-test
+counters and named failures for an issue or probe record.
 
 ## What is not done
 
@@ -201,6 +228,8 @@ checks; it cannot manufacture a Windows kernel that reaches the display.
 | `GET /api/allocation` | live APFS container and the default plan |
 | `POST /api/allocation/plan` | plan a partition for a requested size |
 | `POST /api/allocation/rehearse` | run the resize and restore on a throwaway image (token required) |
+| `POST /api/allocation/apply` | shrink the container and create `BOOTCAMP`; needs the container name typed (token required) |
+| `POST /api/allocation/remove` | delete `BOOTCAMP` and return the space; needs the partition device typed (token required) |
 
 ## Safety
 
@@ -213,9 +242,10 @@ checks; it cannot manufacture a Windows kernel that reaches the display.
   the page, and reject a foreign `Origin`. Another web page cannot drive the
   loopback server into erasing a disk or resizing a container.
 - One destructive job at a time.
-- The panic-button property: with no Windows boot path, the Install control and
-  the internal Allocate control stay disabled, and the internal disk is never a
-  media destination.
+- The panic-button property: with no Windows boot path, the Install and internal
+  Allocate controls stay disabled, and the internal disk is never a media
+  destination. Removal stays available because it only returns space, and it
+  requires the partition device typed into the page.
 
 ## Files
 
@@ -224,7 +254,7 @@ checks; it cannot manufacture a Windows kernel that reaches the display.
 | `server.py` | loopback HTTP server, token, job runner, status API |
 | `media.py` | ISO and PE validation, destination checks, FAT32 media, answer file, verification |
 | `allocation.py` | APFS measurement, resize/partition/restore, disk-image rehearsal |
-| `serial.py` | raw 115200 8N1 console capture with timestamps and a counted footer |
+| `serial.py` | raw 115200 8N1 console capture, plus `verdict` over a captured boot log |
 | `web/index.html` | the eight-step walkthrough |
 | `web/app.css` | window, sidebar, panes, controls, plan boxes |
 | `web/app.js` | navigation, tasks, installer job, space slider, rehearsal job, diagnostics |
@@ -240,19 +270,23 @@ checks; it cannot manufacture a Windows kernel that reaches the display.
 python3 -m unittest tests.test_siliconcamp_assistant
 ```
 
-51 tests. They cover the status payload, the checker allow-list, skip handling,
+57 tests. They cover the status payload, the checker allow-list, skip handling,
 dirty-submodule classification, the step order, local-only assets, the token
 boundary, the media engine's validation (including an x64 `BOOTAA64.EFI` and a
 non-PE file), the answer file's contents and its refusal of disk configuration,
-the APFS arithmetic, the write gate on the system container, and the engine
-itself: three end-to-end media builds against real disk images (plain, single
-MBR FAT32 shape, oversized `install.wim` split), a failed build that must leave
-no image behind, and a full resize + restore rehearsal on a throwaway APFS
-image. The disk-image tests skip on Linux CI; everything else runs there.
+the APFS arithmetic, both write gates, an existing partition blocking a second
+allocation while offering removal, and the engine itself: three end-to-end media
+builds against real disk images (plain, single MBR FAT32 shape, oversized
+`install.wim` split), a failed build that must leave no image behind, and a full
+resize + restore rehearsal on a throwaway APFS image. The disk-image tests skip
+on Linux CI; everything else runs there.
 
-`python3 -m unittest tests.test_siliconcamp_serial` adds four tests for the
-capture tool, including a pseudo-terminal run that checks the header, per-line
-timestamps, the unterminated last line and the footer counts.
+`python3 -m unittest tests.test_siliconcamp_serial` adds thirteen tests: four for
+the capture tool (including a pseudo-terminal run that checks the header,
+per-line timestamps, the unterminated last line and the footer counts) and nine
+for `verdict`, covering a clean pass, `PASS-WITH-GAPS`, a self-test failure, a
+fault after a pass, a topology mismatch, a silent log, a truncated log, and the
+CLI's exit status.
 
 The native shell is verified by launching it with `--screenshot <path>`: the app
 starts or reuses its server, renders the page at 1080×720, writes one PNG and
@@ -261,6 +295,7 @@ exits.
 ## Limits
 
 This is not an installer and not Boot Camp. It cannot install Windows, cannot
-make Windows boot, and cannot give you a working desktop on this hardware. What
-it can do is prepare the media, write the answer file, and prove the partition
-engine, so those are done when the boot path lands.
+make Windows boot, and cannot give you a working desktop on this hardware. The
+media, answer file, partition engine, restore path and first-boot verdict are
+done, so those are ready when the boot path lands; the hardware is the remaining
+test.

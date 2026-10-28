@@ -31,6 +31,8 @@
     jobTimer: null,
     spaceJob: null,
     spaceTimer: null,
+    spaceKind: "",
+    confirm: null,
     armed: "",
     busy: false,
     current: 0,
@@ -133,8 +135,11 @@
         }
         return "A new disk image will be created, written and verified.";
       }
-      case "allocation":
+      case "allocation": {
+        if (state.spacePlan?.existing) return "A BOOTCAMP partition is present; remove it before allocating another.";
+        if (state.spacePlan?.apply?.enabled) return "Allocating resizes the internal disk.";
         return "The internal disk is not changed; the rehearsal runs the real commands on a throwaway image.";
+      }
       case "safety": {
         const checked = Array.from(document.querySelectorAll("[data-gate]")).filter(
           (box) => box.checked
@@ -724,11 +729,43 @@
     for (const blocker of plan.blockers) box.append(el("p", "plan-block", blocker));
     for (const warning of plan.warnings) box.append(el("p", "plan-warn", warning));
 
-    const apply = $("#allocate");
-    apply.disabled = !plan.apply.enabled;
     $("#allocate-reason").textContent = plan.apply.reason || "";
-    $("#rehearse-space").disabled = !plan.fit || Boolean(state.spaceJob);
+    renderExisting(plan);
+    spaceButtons();
     if (!state.spaceJob) $("#space-state").textContent = "";
+  }
+
+  function renderExisting(plan) {
+    const existing = plan.existing;
+    $("#existing-group").hidden = !existing;
+    if (!existing) {
+      closeSpaceConfirm();
+      return;
+    }
+    const facts = $("#existing-facts");
+    facts.replaceChildren();
+    const rows = [
+      ["Partition", existing.device],
+      ["Size", formatBytes(existing.bytes)],
+      ["Format", existing.filesystem ? existing.filesystem.toUpperCase() : "unknown"],
+      ["Mounted at", existing.mount || "not mounted"],
+    ];
+    for (const [term, value] of rows) {
+      const wrap = el("div");
+      wrap.append(el("dt", null, term), el("dd", null, value));
+      facts.append(wrap);
+    }
+    $("#existing-note").textContent =
+      "Removing it erases the partition and returns its space to macOS. Any Windows " +
+      "installation on it is lost.";
+  }
+
+  function spaceButtons() {
+    const plan = state.spacePlan;
+    const busy = Boolean(state.spaceJob);
+    $("#allocate").disabled = busy || !plan?.apply?.enabled;
+    $("#remove-space").disabled = busy || !plan?.remove?.enabled;
+    $("#rehearse-space").disabled = busy || !plan?.fit;
   }
 
   async function planSpace() {
@@ -759,52 +796,111 @@
     if (wasHidden) log.scrollIntoView({ block: "nearest" });
   }
 
-  function endRehearsal(label, kind) {
+  function closeSpaceConfirm() {
+    $("#space-confirm").hidden = true;
+    $("#space-confirm-field").value = "";
+    $("#space-confirm-ok").disabled = true;
+    state.confirm = null;
+  }
+
+  function openSpaceConfirm(kind) {
+    const plan = state.spacePlan;
+    if (!plan || state.spaceJob) return;
+    const applying = kind === "apply";
+    if (applying && !plan.apply.enabled) return;
+    if (!applying && !plan.remove.enabled) return;
+    const expected = applying
+      ? plan.host.container
+      : String(plan.remove.device || "").replace("/dev/", "");
+    const free = formatBytes(plan.after.reserve);
+    state.confirm = { kind, expected };
+    $("#space-confirm-title").textContent = applying
+      ? "Allocate Space"
+      : "Remove Windows Partition";
+    $("#space-confirm-text").textContent = applying
+      ? `macOS will shrink ${plan.host.container} by ${formatGib(plan.requested_gb)} and create one FAT32 partition named BOOTCAMP. ${free} stays reserved for macOS. This changes the internal disk.`
+      : `This erases ${plan.remove.device} (${formatBytes(plan.remove.bytes)}) and returns its space to macOS. Any Windows installation on it is lost.`;
+    $("#space-confirm-hint").textContent = `Type ${expected} to confirm.`;
+    $("#space-confirm-field").placeholder = expected;
+    $("#space-confirm-field").value = "";
+    $("#space-confirm-ok").textContent = applying ? "Allocate" : "Remove";
+    $("#space-confirm-ok").disabled = true;
+    $("#space-confirm").hidden = false;
+    $("#space-confirm-field").focus();
+  }
+
+  function confirmTyped() {
+    if (!state.confirm) return;
+    const typed = $("#space-confirm-field").value.trim().replace(/^\/dev\//, "");
+    $("#space-confirm-ok").disabled = typed !== state.confirm.expected;
+  }
+
+  async function confirmSpace() {
+    const pending = state.confirm;
+    if (!pending) return;
+    const typed = $("#space-confirm-field").value.trim().replace(/^\/dev\//, "");
+    if (typed !== pending.expected) return;
+    const gb = Number($("#space-slider").value);
+    const body = pending.kind === "apply" ? { gb, confirm: typed } : { confirm: typed };
+    const path =
+      pending.kind === "apply" ? "/api/allocation/apply" : "/api/allocation/remove";
+    closeSpaceConfirm();
+    await startSpaceJob(pending.kind, path, body);
+  }
+
+  function endSpaceJob(label, kind) {
     if (state.spaceTimer) clearTimeout(state.spaceTimer);
     state.spaceTimer = null;
     state.spaceJob = null;
     $("#space-state").textContent = label;
     $("#space-state").className = `status-text ${kind}`;
-    $("#rehearse-space").disabled = !state.spacePlan?.fit;
+    spaceButtons();
   }
 
-  async function rehearseSpace() {
+  async function startSpaceJob(kind, path, body) {
     if (state.spaceJob) return;
-    const gb = Number($("#space-slider").value);
+    state.spaceKind = kind;
     $("#space-log").textContent = "";
     $("#space-log").hidden = false;
-    $("#space-state").textContent = "Rehearsing";
+    $("#space-state").textContent = { rehearsal: "Rehearsing", apply: "Allocating", remove: "Removing" }[kind] || "Working";
     $("#space-state").className = "status-text warn";
-    $("#rehearse-space").disabled = true;
+    spaceButtons();
     try {
-      const response = await fetch("/api/allocation/rehearse", {
+      const response = await fetch(path, {
         method: "POST",
         headers: writeHeaders(),
-        body: JSON.stringify({ gb }),
+        body: JSON.stringify(body),
       });
       const payload = await response.json();
       if (!response.ok) {
         appendSpaceLog(`error: ${payload.error || response.statusText}`);
-        endRehearsal("Refused", "bad");
+        endSpaceJob("Refused", "bad");
         return;
       }
       state.spaceJob = { id: payload.job, seen: 0 };
       pollSpaceJob();
     } catch (error) {
       appendSpaceLog(`cannot reach the assistant: ${error}`);
-      endRehearsal("Offline", "bad");
+      endSpaceJob("Offline", "bad");
     }
+  }
+
+  function rehearseSpace() {
+    return startSpaceJob("rehearsal", "/api/allocation/rehearse", {
+      gb: Number($("#space-slider").value),
+    });
   }
 
   async function pollSpaceJob() {
     const job = state.spaceJob;
     if (!job) return;
+    const kind = state.spaceKind;
     try {
       const response = await fetch(`/api/jobs/${job.id}`, { cache: "no-store" });
       const payload = await response.json();
       if (!response.ok) {
         appendSpaceLog(payload.error || "the job disappeared");
-        endRehearsal("Failed", "bad");
+        endSpaceJob("Failed", "bad");
         return;
       }
       for (const line of payload.notes.slice(job.seen)) appendSpaceLog(line);
@@ -813,22 +909,45 @@
         state.spaceTimer = setTimeout(pollSpaceJob, 700);
         return;
       }
-      if (payload.state === "done") {
-        const created = payload.result?.created;
-        const restored = payload.result?.restored;
+      if (payload.state !== "done") {
+        endSpaceJob("Failed", "bad");
+        return;
+      }
+      const result = payload.result || {};
+      if (kind === "rehearsal" && result.created && result.restored) {
         appendSpaceLog(
-          created && restored
-            ? `done in ${payload.seconds}s: ${created.mount || created.device} was created ` +
-              `and removed; the container returned to ${formatBytes(restored.container_after)}`
-            : `done in ${payload.seconds}s`
+          `done in ${payload.seconds}s: ${result.created.mount || result.created.device} was ` +
+            `created and removed; the container returned to ${formatBytes(result.restored.container_after)}`
         );
-        endRehearsal("Rehearsed", "ok");
+      } else if (kind === "apply" && result.device) {
+        appendSpaceLog(
+          `done in ${payload.seconds}s: ${result.device} is ${formatBytes(result.bytes)} FAT32; ` +
+            `the container is now ${formatBytes(result.container_after)}`
+        );
+      } else if (kind === "remove" && result.removed) {
+        appendSpaceLog(
+          `done in ${payload.seconds}s: ${result.removed} was removed; the container grew to ` +
+            `${formatBytes(result.container_after)}`
+        );
       } else {
-        endRehearsal("Failed", "bad");
+        appendSpaceLog(`done in ${payload.seconds}s`);
+      }
+      endSpaceJob(
+        { rehearsal: "Rehearsed", apply: "Allocated", remove: "Removed" }[kind] || "Done",
+        "ok"
+      );
+      if (kind !== "rehearsal") {
+        showToast(
+          kind === "remove" ? "Space returned to macOS." : "Windows partition created."
+        );
+        // The live container changed; read it again rather than keeping the
+        // numbers this page planned against.
+        state.allocation = null;
+        loadAllocation();
       }
     } catch (error) {
       appendSpaceLog(`lost contact with the assistant: ${error}`);
-      endRehearsal("Failed", "bad");
+      endSpaceJob("Failed", "bad");
     }
   }
 
@@ -929,6 +1048,8 @@
     } else if (event.metaKey && event.key === "]") {
       event.preventDefault();
       nextStep();
+    } else if (event.key === "Escape" && !$("#space-confirm").hidden) {
+      closeSpaceConfirm();
     }
   });
 
@@ -949,6 +1070,17 @@
   });
   $("#space-slider").addEventListener("change", planSpace);
   $("#rehearse-space").addEventListener("click", rehearseSpace);
+  $("#allocate").addEventListener("click", () => openSpaceConfirm("apply"));
+  $("#remove-space").addEventListener("click", () => openSpaceConfirm("remove"));
+  $("#space-confirm-field").addEventListener("input", confirmTyped);
+  $("#space-confirm-field").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      confirmSpace();
+    }
+  });
+  $("#space-confirm-cancel").addEventListener("click", closeSpaceConfirm);
+  $("#space-confirm-ok").addEventListener("click", confirmSpace);
 
   renderStepList();
   load();
