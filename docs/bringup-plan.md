@@ -19,6 +19,10 @@ This is ordered by dependency, not by excitement. Do not start the GPU or anti-c
 
 This is the first hardware step and the first irreversible one. It requires the safety checklist.
 
+- Run `python3 tools/siliconcamp-assistant/probe.py preflight`. It checks the
+  target model, the three boot images against `artifacts/SHA256SUMS`, a USB-UART
+  adapter, and that a record can be written. It cannot detect the second Mac or
+  the boot policy, so those stay warnings for a person to clear.
 - Back up the Mac (Time Machine) and verify the backup.
 - Have a second Mac with Apple Configurator 2 and a USB-C cable for DFU recovery.
 - Confirm the machine owner accepts the risk of a DFU restore.
@@ -33,6 +37,14 @@ This is the first hardware step and the first irreversible one. It requires the 
   exits 0 for `pass`/`pass-with-gaps`, 1 for a self-test failure, a topology
   mismatch or a fault, and 2 when the log cannot support a verdict. `--json`
   records the parsed topology and the named failures in the probe log.
+- Bundle the evidence while it is still current:
+  `python3 tools/siliconcamp-assistant/probe.py record --in probes/m4-first-boot.log`
+  writes a new `probes/<UTC>-first-boot/` with the untouched capture, the verdict,
+  the machine facts, the artifact hashes, the commit and a manifest. `probe.py
+  verify --dir <record>` re-hashes every file and re-judges the log; a record
+  whose capture changed does not verify. Raw records are gitignored because a
+  capture can contain machine identifiers; redacted notes belong in
+  `docs/probes/`.
 
 **Exit criteria:** m1n1 reaches its console on the M4 and prints the vGIC topology line:
 

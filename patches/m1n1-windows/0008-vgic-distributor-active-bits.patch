@@ -1,0 +1,97 @@
+Fix GICD active-bit semantics.
+
+The distributor handlers for GICD_ISACTIVER and GICD_ICACTIVER kept the
+old "not implemented" placeholder: a write to ISACTIVER cleared the bit
+instead of setting it, so the vGIC could never report an SPI active.  The
+firmware self-test's dist.active probe writes ISACTIVER and reads it back,
+which would fail on the first hardware boot even though the image ships
+that probe.
+
+Make both registers write-1-to-set / write-1-to-clear over the same
+bitmap, mirror the aliases, and drop the placeholder errors.
+
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -779,7 +779,7 @@
+             //
+             // clears the pending state from an IRQ
+             //
+-            u32 reg_num, irq_num;
++            u32 reg_num;
+             reg_num = (relative_addr - GIC_DIST_ISACTIVER0) / 4;
+             u32 value_is_enabler, value_ic_enabler, current_val;
+             value_is_enabler = distributor->gicd_interrupt_set_active_regs[reg_num];
+@@ -787,21 +787,22 @@
+             current_val = *val;
+ 
+             //
+-            // if 1 is written to the bits in these registers, they need to read 0 in GICD_ISACTIVER[0:31] as well.
+-            // also this is banked for the first 8 processor cores - so changes must reflect across all of them.
++            // ISACTIVER is write-1-to-set: writing 1 marks the INTID active and
++            // leaves it active.  The previous loop cleared the bit instead, so
++            // the self-test's dist.active probe -- which writes ISACTIVER and
++            // reads it back -- failed on every SPI, and a guest restoring GIC
++            // state could not mark anything active.
+             //
+-            // There has to be a way more efficient way of doing this...
++            // ICACTIVER reads the same bitmap, so both aliases are updated
++            // together, as patch 0007 does for the redistributor's bank pairs.
+             //
+             for (u32 i = 0; i < 32; i++) {
+-                if( ( (current_val & BIT(i)) != 0 ) && ( ( value_ic_enabler & BIT(i) ) == 0) ) {
+-                    value_is_enabler &= ~BIT(i);
+-                    value_ic_enabler &= ~BIT(i);
+-                    irq_num = (32 * reg_num) + i;
+-                    //
+-                    // TODO: do this
+-                    //
+-                    vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [ERROR]: ISACTIVER not implemented for irq %d\n", irq_num);
+-                }  
++                if( (current_val & BIT(i)) == 0 )
++                    continue;
++                if( (value_is_enabler & BIT(i)) != 0 )
++                    continue;
++                value_is_enabler |= BIT(i);
++                value_ic_enabler |= BIT(i);
+             }
+             if(reg_num == 0) {
+ 
+@@ -816,7 +817,7 @@
+             //
+             // clears the pending state from an IRQ
+             //
+-            u32 reg_num, irq_num;
++            u32 reg_num;
+             reg_num = (relative_addr - GIC_DIST_ICACTIVER0) / 4;
+             u32 value_is_enabler, value_ic_enabler, current_val;
+             value_is_enabler = distributor->gicd_interrupt_set_active_regs[reg_num];
+@@ -824,21 +825,15 @@
+             current_val = *val;
+ 
+             //
+-            // if 1 is written to the bits in these registers, they need to read 0 in GICD_ISACTIVER[0:31] as well.
+-            // also this is banked for the first 8 processor cores - so changes must reflect across all of them.
++            // ICACTIVER is write-1-to-clear.  The clear is applied to the same
++            // bitmap ISACTIVER reads, not only to the clear alias, so a bit the
++            // guest marks inactive is inactive through both registers.
+             //
+-            // There has to be a way more efficient way of doing this...
+-            //
+             for (u32 i = 0; i < 32; i++) {
+-                if( ( (current_val & BIT(i)) != 0 ) && ( ( value_ic_enabler & BIT(i) ) != 0) ) {
+-                    value_is_enabler &= ~BIT(i);
+-                    value_ic_enabler &= ~BIT(i);
+-                    irq_num = (32 * reg_num) + i;
+-                    //
+-                    // TODO: do this
+-                    //
+-                    vgic_note(VGIC_NOTE_UNMODELLED, "HV vGIC [ERROR]: ICACTIVER not implemented for irq %d\n", irq_num);
+-                }  
++                if( (current_val & BIT(i)) == 0 )
++                    continue;
++                value_is_enabler &= ~BIT(i);
++                value_ic_enabler &= ~BIT(i);
+             }
+             if(reg_num == 0) {
+ 

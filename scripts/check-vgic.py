@@ -461,6 +461,25 @@ def check_tree(ck: Checker, tree: str) -> None:
     ck.check("gicr_isactiver0 = value_is_enabler" not in vgic,
              "redistributor: enable and pending writes do not land in the active bank "
              "(the pre-0007 defect)")
+
+    ck.section("Distributor active bits: set and clear share one bitmap (Arm IHI 0069)")
+    active_start = dist.find("GIC_DIST_ISACTIVER0")
+    active_end = dist.find("GIC_DIST_IPRIORITYR0", active_start)
+    active_block = dist[active_start:active_end] if active_start >= 0 and active_end > active_start else ""
+    ck.check(bool(active_block),
+             "hv_vgic.c: the GICD ISACTIVER/ICACTIVER handlers are present")
+    ck.check(re.search(r"value_is_enabler\s*\|=\s*BIT\(i\)", active_block) is not None,
+             "GICD_ISACTIVER is write-1-to-set, not a no-op or a clear")
+    ck.check(re.search(r"value_ic_enabler\s*\|=\s*BIT\(i\)", active_block) is not None,
+             "GICD_ISACTIVER mirrors the active bitmap into the ICACTIVER alias")
+    ck.check(re.search(r"value_is_enabler\s*&=\s*~\s*BIT\(i\)", active_block) is not None,
+             "GICD_ICACTIVER clears the bitmap ISACTIVER reads")
+    ck.check(re.search(r"value_ic_enabler\s*&=\s*~\s*BIT\(i\)", active_block) is not None,
+             "GICD_ICACTIVER clears its own alias too")
+    ck.check("ISACTIVER not implemented" not in vgic,
+             "GICD_ISACTIVER is implemented rather than reported as a placeholder")
+    ck.check("ICACTIVER not implemented" not in vgic,
+             "GICD_ICACTIVER is implemented rather than reported as a placeholder")
     ck.check(re.search(r"\*val\s*=\s*distributor->gicd_interrupt_set_pending_regs\s*\[\s*reg_num\s*\]",
                        dist) is not None,
              "GICD_ISPENDR: a read returns the pending bitmap instead of leaving *val untouched")
@@ -630,6 +649,11 @@ MUST_ADD = (
      "a refused interrupt is queued once per INTID, not once per retry"),
     ("src/hv_vgic.c", r"if\s*\(\s*!\s*hv_vgic3_irq_enabled\s*\(\s*vintid\s*\)\s*\)",
      "injection itself refuses an INTID the guest has not enabled"),
+    # --- 0008: distributor active bits --------------------------------------
+    ("src/hv_vgic.c", r"value_is_enabler\s*\|=\s*BIT\(i\)\s*;",
+     "GICD_ISACTIVER sets the active bit"),
+    ("src/hv_vgic.c", r"value_ic_enabler\s*\|=\s*BIT\(i\)\s*;",
+     "GICD_ISACTIVER updates the alias ICACTIVER reads"),
 )
 
 MUST_REMOVE = (
@@ -672,6 +696,11 @@ MUST_REMOVE = (
      "a GICD_ISPENDR read no longer discards the bitmap"),
     ("src/hv_exc.c", r"if\s*\(\s*hv_vgic3_get_free_lr\(\)\s*!=\s*-1\s*\)",
      "injection no longer depends on list-register availability alone"),
+    # --- 0008: distributor active bits --------------------------------------
+    ("src/hv_vgic.c", r"ISACTIVER not implemented for irq",
+     "GICD_ISACTIVER is no longer a placeholder that clears the bit"),
+    ("src/hv_vgic.c", r"ICACTIVER not implemented for irq",
+     "GICD_ICACTIVER is no longer a placeholder"),
 )
 
 MUST_NOT_ADD = (

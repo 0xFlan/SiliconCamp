@@ -10,6 +10,10 @@
 __pycache__/
 *.pyc
 
+# Raw probe captures are local evidence: they can contain MAC addresses and
+# other machine identifiers.  Redacted notes belong in docs/probes/ instead.
+/probes/
+
 # Editor and OS noise
 .DS_Store
 *.swp

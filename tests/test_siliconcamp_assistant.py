@@ -286,6 +286,29 @@ class MediaPayloadTests(unittest.TestCase):
             self.assertTrue(payload.needs_split)
             self.assertEqual(payload.install_kind, "wim")
 
+    def test_an_oversized_esd_is_a_blocker_not_a_silent_copy(self) -> None:
+        # wimlib cannot split an ESD.  Excluding every install image from the
+        # oversized list let a >4 GiB install.esd pass the plan, only to fail
+        # on the FAT32 write after the destination had been erased.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.payload_tree(root)
+            (root / "sources" / "install.wim").rename(root / "sources" / "install.esd")
+            with (root / "sources" / "install.esd").open("wb") as handle:
+                handle.truncate(self.media.FAT32_FILE_LIMIT + 1)
+            payload = self.media.scan_payload(root)
+            self.assertEqual(payload.install_kind, "esd")
+            self.assertFalse(payload.needs_split)
+            self.assertIn("sources/install.esd", payload.oversized)
+            plan = self.media.plan_media(
+                payload,
+                target={"kind": "image", "path": str(pathlib.Path(tmp) / "x.sparseimage")},
+            )
+            self.assertTrue(
+                any("cannot be split" in blocker for blocker in plan["blockers"]),
+                plan["blockers"],
+            )
+
     def test_an_oversized_boot_wim_is_a_blocker_not_a_split(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -745,6 +768,25 @@ class ServerWriteGuardTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.httpd.shutdown()
         cls.httpd.server_close()
+
+    def test_a_foreign_host_header_is_refused(self) -> None:
+        # A DNS-rebinding page reaches 127.0.0.1 with its own name in Host and
+        # is same-origin from the browser's view, so it could read the page and
+        # its write token.  The server is only this loopback origin.
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/status",
+            headers={"Host": "attacker.example"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(caught.exception.code, 421)
+
+    def test_a_loopback_host_header_is_accepted(self) -> None:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{self.port}/api/status", timeout=10
+        ) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read()) ["product"], "SiliconCamp Assistant")
 
     def post(self, path: str, body: dict, headers: dict | None = None):
         request = urllib.request.Request(

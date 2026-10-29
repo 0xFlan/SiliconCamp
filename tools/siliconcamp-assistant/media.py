@@ -251,14 +251,18 @@ def scan_payload(root: str | Path) -> Payload:
             "not a Windows installer: sources/install.wim, .esd or .swm is missing"
         )
 
+    # Only a WIM can be split with wimlib; an ESD or SWM set cannot be
+    # rewritten this way.  Keep the install image out of the oversized list
+    # only when it is the file that is actually going to be split -- otherwise
+    # a >4 GiB install.esd is neither split nor reported, and the first write
+    # to FAT32 fails after the destination has been erased.
     needs_split = install_kind == "wim" and install_bytes > FAT32_FILE_LIMIT
 
-    # An oversized boot.wim or a big driver file cannot be split the way the
-    # install image can, so it is a blocker rather than something to retry.
     oversized = tuple(
         entry.relative
         for entry in files
-        if entry.size > FAT32_FILE_LIMIT and entry.relative != install_image
+        if entry.size > FAT32_FILE_LIMIT
+        and not (needs_split and entry.relative == install_image)
     )
 
     total = sum(entry.size for entry in files)
@@ -563,6 +567,12 @@ def plan_media(
 #: The gates Windows 11 applies that this hardware cannot satisfy.  Apple
 #: silicon has no TPM 2.0 and m1n1/ntasp do not implement Microsoft's Secure
 #: Boot database, so Setup would stop before touching the partition.
+#:
+#: `BypassCPUCheck` is the weak one.  Microsoft documents these values only as
+#: undocumented lab configuration, and Arm64 reports are mixed: on some builds
+#: the CPU gate still stops Setup even with both values set.  It stays in the
+#: file because it is harmless where it is ignored, but nothing here should
+#: promise that Setup cannot stop at the processor check.
 LAB_GATES = (
     "BypassTPMCheck",
     "BypassSecureBootCheck",
@@ -619,13 +629,19 @@ UNATTEND_NS = "urn:schemas-microsoft-com:unattend"
 
 
 def render_unattend(*, locale: str = "en-US") -> str:
-    """The answer file, with one command per gate Windows 11 would stop at."""
+    """The answer file, with one command per gate Windows 11 would stop at.
+
+    Windows Setup reads `Autounattend.xml` from the root of the installation
+    media on its own.  What is not documented is that `RunSynchronous` runs
+    before the compatibility check rather than after it; the file is the best
+    available lever, not a guarantee that Setup proceeds.
+    """
     commands = []
     for order, gate in enumerate(LAB_GATES, start=1):
         commands.append(
             "        <RunSynchronousCommand wcm:action=\"add\">\n"
             f"          <Order>{order}</Order>\n"
-            f"          <Description>Bypass {gate} for hardware without TPM 2.0 or Microsoft Secure Boot.</Description>\n"
+            f"          <Description>Set LabConfig {gate} for this hardware.</Description>\n"
             "          <Path>reg add HKLM\\SYSTEM\\Setup\\LabConfig /v "
             f"{gate} /t REG_DWORD /d 1 /f</Path>\n"
             "        </RunSynchronousCommand>"
@@ -700,7 +716,7 @@ def write_unattend(volume: str | Path, *, locale: str = "en-US", log=print) -> d
     written = target.read_bytes()
     if written != encoded:
         raise MediaError(f"{UNATTEND_NAME} did not read back byte-for-byte")
-    log(f"wrote {UNATTEND_NAME} ({len(written)} bytes): license, locale, TPM/Secure Boot bypass")
+    log(f"wrote {UNATTEND_NAME} ({len(written)} bytes): license, locale, hardware-gate bypasses")
     return {"path": UNATTEND_NAME, "bytes": len(written), "gates": list(LAB_GATES)}
 
 

@@ -189,6 +189,15 @@ alias reads the same bitmap; before `0007` the enable and pending handlers wrote
 the active bank, and `GICR_ICENABLER0` cleared nothing. `GICD_IGROUPR` and
 `GICR_IGROUPR0` report Group 1 because every injection sets `ICH_LR_GRP1`.
 
+`0008` fixes the other half of the same bank logic at the distributor: the
+`GICD_ISACTIVER`/`GICD_ICACTIVER` pair. `ISACTIVER` is write-1-to-set and
+`ICACTIVER` write-1-to-clear; both operate on one active bitmap and each reads
+back the same state. The pre-`0008` handler cleared the bit on `ISACTIVER` and
+reported the register as unimplemented, which the firmware's `dist.active` probe
+would have exposed on the first hardware boot. The fix is small because the
+state was already there; the failure would not have been, because it was in the
+path the probe was written to measure.
+
 `scripts/check-vgic.py` asserts all of it, against the patch series and against
 patched sources; `docs/next-steps.md` explains why the firmware could not have
 caught any of it, and `scripts/check-gicv3-oracle.py` checks the read-backs

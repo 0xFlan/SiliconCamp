@@ -503,7 +503,26 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._json({"error": message}, status=status)
 
+    def _host_ok(self) -> bool:
+        """Reject a request addressed to a name that is not this loopback server.
+
+        Binding to 127.0.0.1 stops a remote connection, not a browser that has
+        been pointed at an attacker-controlled DNS name resolving to 127.0.0.1.
+        In that case the request arrives with ``Host: evil.example`` and the page
+        is same-origin from the browser's point of view, so it can read the page
+        (and the write token) without any CORS error.  The port is part of the
+        check because loopback names on another port are a different server.
+        """
+        host = (self.headers.get("Host") or "").strip().lower()
+        port = self.server.server_address[1]
+        if host in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            return True
+        self._error(HTTPStatus.MISDIRECTED_REQUEST, "unexpected Host header")
+        return False
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if not self._host_ok():
+            return
         path = urlparse(self.path).path
         if path == "/api/status":
             self._json(build_status())
@@ -632,6 +651,8 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if not self._host_ok():
+            return
         path = urlparse(self.path).path
         if path == "/api/installer/inspect":
             self._inspect_iso()
