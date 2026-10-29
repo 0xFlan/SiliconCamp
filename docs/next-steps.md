@@ -358,13 +358,24 @@ reserve as a bisection tool.
    touches it, but the first hardware log still has to show the console alive
    after `ArmGicDxe` has programmed the distributor.
 
+6. **Audit every self-test probe against the handler it measures.** *(done, `0008`)*
+   The self-test was written against ARM IHI 0069, but nobody had checked that
+   the hypervisor agreed with it. `dist.active` writes `GICD_ISACTIVER` and
+   reads it back; the distributor handler cleared the bit on a write of 1 and
+   called the register unimplemented, so the probe would have failed on the
+   first boot. `0008-vgic-distributor-active-bits.patch` makes both active-bit
+   directions write-1-to-set/clear over one bitmap. The lesson is the method:
+   list every `VgicPass` name, find the handler behind it, and compare. The
+   remaining placeholder notes in `hv_vgic.c` are the places to look next, and
+   `scripts/check-vgic.py` now pins the fixed pair in the series and the tree.
+
 ### Hardware-gated
 
-5. Boot m1n1, then the firmware, and capture the serial log (`docs/bringup-plan.md`
+7. Boot m1n1, then the firmware, and capture the serial log (`docs/bringup-plan.md`
    phases 1–2). The vGIC self-test runs here and its output is the first real
    data this project will have about the M4 interrupt path.
 
-6. Only then: `_PRT`/`IORT`/`_OSC` and the `apciec` complexes, informed by what
+8. Only then: `_PRT`/`IORT`/`_OSC` and the `apciec` complexes, informed by what
    the log says about the first root complex.
 
 ### Explicitly deferred

@@ -91,7 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         // a server it cannot talk to.
         //
         if portIsOpen() {
-            loadWalkthrough()
+            verifyExistingServer()
         } else {
             startServer(root: root)
         }
@@ -254,7 +254,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = [serverScript.path, "--port", "\(port)"]
+        // -u keeps the log useful while the server is still running; without
+        // it a crash can leave the last lines in Python's buffer.
+        process.arguments = ["-u", serverScript.path, "--port", "\(port)"]
         process.currentDirectoryURL = root
 
         if let handle = try? FileHandle(forWritingTo: logURL) {
@@ -275,6 +277,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
                 detail: "python3 could not run tools/siliconcamp-assistant/server.py: \(error.localizedDescription)"
             )
         }
+    }
+
+    /// Reuse an existing server only when it says it is this app.
+    ///
+    /// Port 8770 is not reserved.  Loading whatever is listening would show an
+    /// unrelated page in a WebView that exposes the file-picker bridge, and the
+    /// user would have no idea why the assistant looked wrong.  This probe is
+    /// async because a synchronous HTTP request on the main thread can deadlock
+    /// the launch (it did once, with a healthy server).
+    private func verifyExistingServer() {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/status") else {
+            loadWalkthrough()
+            return
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2.0
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let data,
+                   let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   payload["product"] as? String == "SiliconCamp Assistant" {
+                    self.loadWalkthrough()
+                } else {
+                    self.showFailure(
+                        title: "Port \(self.port) is already in use",
+                        detail: "Another program is listening there, so the assistant did not load it. Stop that program, or run tools/siliconcamp-assistant/server.py on another port and open it in a browser."
+                    )
+                }
+            }
+        }.resume()
     }
 
     private func waitForServer(attempts: Int) {

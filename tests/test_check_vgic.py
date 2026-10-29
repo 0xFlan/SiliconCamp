@@ -229,6 +229,19 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("GICD_ISPENDR reads back the pending bitmap", result.stdout)
 
+    def test_series_that_clears_on_active_is_rejected(self) -> None:
+        # GICD_ISACTIVER is write-1-to-set.  The pre-0008 handler cleared the
+        # bit, so the firmware self-test's dist.active probe would fail on the
+        # first hardware boot with code that had never been executed.
+        tmp = self._mutated_series(
+            "0008-vgic-distributor-active-bits.patch",
+            "value_is_enabler |= BIT(i);",
+            "value_is_enabler &= ~BIT(i);",
+        )
+        result = run_checker("--patches", tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GICD_ISACTIVER sets the active bit", result.stdout)
+
 
 class PatchedTreeTests(unittest.TestCase):
     """The checker's structural pass, run against real patched sources."""
@@ -383,6 +396,17 @@ class PatchedTreeTests(unittest.TestCase):
         result = run_checker("--tree", tree)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("returns the pending bitmap", result.stdout)
+
+    def test_tree_that_clears_on_isactiver_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_vgic.c",
+                     """                if( (value_is_enabler & BIT(i)) != 0 )
+                    continue;
+                value_is_enabler |= BIT(i);""",
+                     """                value_is_enabler &= ~BIT(i);""")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GICD_ISACTIVER is write-1-to-set", result.stdout)
 
     def test_verbatim_waker_store_is_rejected(self) -> None:
         # Storing the write verbatim leaves ChildrenAsleep set, so a conforming

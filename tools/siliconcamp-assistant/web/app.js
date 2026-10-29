@@ -30,6 +30,7 @@
     job: null,
     jobTimer: null,
     spaceJob: null,
+    spaceStarting: false,
     spaceTimer: null,
     spaceKind: "",
     confirm: null,
@@ -762,7 +763,7 @@
 
   function spaceButtons() {
     const plan = state.spacePlan;
-    const busy = Boolean(state.spaceJob);
+    const busy = Boolean(state.spaceJob) || state.spaceStarting;
     $("#allocate").disabled = busy || !plan?.apply?.enabled;
     $("#remove-space").disabled = busy || !plan?.remove?.enabled;
     $("#rehearse-space").disabled = busy || !plan?.fit;
@@ -805,7 +806,7 @@
 
   function openSpaceConfirm(kind) {
     const plan = state.spacePlan;
-    if (!plan || state.spaceJob) return;
+    if (!plan || state.spaceJob || state.spaceStarting) return;
     const applying = kind === "apply";
     if (applying && !plan.apply.enabled) return;
     if (!applying && !plan.remove.enabled) return;
@@ -858,7 +859,14 @@
   }
 
   async function startSpaceJob(kind, path, body) {
-    if (state.spaceJob) return;
+    //
+    // The request is async, so the job is not known until it returns.  Without
+    // this flag a second click during that window posts a second job; the
+    // server refuses it, but the refusal can arrive before the first job's id,
+    // leaving a running write unobserved.
+    //
+    if (state.spaceJob || state.spaceStarting) return;
+    state.spaceStarting = true;
     state.spaceKind = kind;
     $("#space-log").textContent = "";
     $("#space-log").hidden = false;
@@ -882,6 +890,9 @@
     } catch (error) {
       appendSpaceLog(`cannot reach the assistant: ${error}`);
       endSpaceJob("Offline", "bad");
+    } finally {
+      state.spaceStarting = false;
+      spaceButtons();
     }
   }
 

@@ -38,6 +38,21 @@ class SerialCaptureTests(unittest.TestCase):
         if likely:
             self.assertIn(likely[0], rows[: len(likely)])
 
+    def test_a_builtin_debug_console_is_not_a_usb_adapter(self) -> None:
+        # macOS always exposes /dev/cu.debug-console.  Treating that as the
+        # hardware console made a machine with no adapter look ready.
+        from unittest import mock
+
+        with mock.patch.object(
+            self.serial.glob,
+            "glob",
+            return_value=["/dev/cu.debug-console", "/dev/cu.usbmodem1234"],
+        ):
+            rows = self.serial.list_ports()
+        by_name = {os.path.basename(row["device"]): row for row in rows}
+        self.assertFalse(by_name["cu.debug-console"]["likely_serial"])
+        self.assertTrue(by_name["cu.usbmodem1234"]["likely_serial"])
+
     def test_an_unsupported_baud_is_refused(self) -> None:
         with self.assertRaises(self.serial.SerialError):
             self.serial._baud_constant(12345)
@@ -51,6 +66,19 @@ class SerialCaptureTests(unittest.TestCase):
                     seconds=0.1,
                 )
         self.assertIn("/dev/cu.siliconcamp-does-not-exist", str(caught.exception))
+
+    def test_capture_refuses_to_mix_two_boots_into_one_file(self) -> None:
+        # A verdict reads one run.  Appending a second boot to the same file
+        # could let a clean first run mask a silent second one.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "m4-boot.log"
+            log.write_text("previous run\n", encoding="utf-8")
+            with self.assertRaises(self.serial.SerialError) as caught:
+                self.serial.capture(
+                    "/dev/cu.siliconcamp-does-not-exist", log, seconds=0.1
+                )
+            self.assertIn("already exists", str(caught.exception))
+            self.assertEqual(log.read_text(encoding="utf-8"), "previous run\n")
 
     def test_capture_timestamps_lines_and_keeps_a_partial_one(self) -> None:
         # A pseudo-terminal is a real serial device as far as termios is

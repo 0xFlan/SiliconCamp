@@ -1,6 +1,6 @@
 # m1n1-windows patches
 
-Seven patches apply to the NTASP `m1n1_windows` commit pinned by this
+Eight patches apply to the NTASP `m1n1_windows` commit pinned by this
 repository. They are cumulative (each assumes every earlier one), so the order
 below is part of the contract, and `verify-patches.sh` applies the whole series,
 in order, to one pristine worktree:
@@ -14,6 +14,7 @@ in order, to one pristine worktree:
 | `0005-vgic-diagnostics.patch` | `src/hv_vgic.c` | Takes the UART write off the interrupt-controller hot path: the per-access trace becomes a 64-entry ring buffer plus counters in a global, and only genuinely exceptional events print, through a 32-line budget. Without this, a guest that programs ~1020 SPIs stalls for minutes in `printf()`, which looks exactly like a hang in the vGIC. |
 | `0006-vgic-honest-spi-routing.patch` | `src/hv_vgic.c`, `src/hv_vgic.h` | Sets `GICD_TYPER.No1N` so the distributor does not claim 1-of-N SPI selection it never performs, treats a `GICD_IROUTER.IRM` write of 1 as 0 (the behaviour the architecture permits when `No1N` is set), and keeps bit 31 out of the stored routing value so read-back cannot report a mode that never runs. |
 | `0007-vgic-enable-gating.patch` | `src/hv_vgic.c`, `src/hv_vgic.h`, `src/hv_exc.c` | Makes delivery obey the guest's enable state (`GICD_CTLR.EnableGrp1`, `GICR_ISENABLER0`, `GICD_ISENABLER`), keeps a refused interrupt queued instead of dropping it, and repairs the redistributor's SGI-frame bank handlers, which kept enable and pending state in the active bank. Also makes `GICD_ISPENDR` read back and reports the Group 1 that delivery implements. |
+| `0008-vgic-distributor-active-bits.patch` | `src/hv_vgic.c` | Makes `GICD_ISACTIVER` write-1-to-set and `GICD_ICACTIVER` write-1-to-clear over the shared active bitmap. The placeholder handlers did the opposite for `ISACTIVER`, so the firmware self-test's `dist.active` probe would have failed on the first hardware boot. |
 
 ## Why 0002 is not optional on M4
 
@@ -327,6 +328,30 @@ store again, if the drain stops at a refused entry, if enabling an INTID stops
 draining the queue, or if an enqueue site separates the duplicate test from the
 insert.
 
+## Why 0008 exists
+
+The firmware self-test added in patch `0003` writes one modelled SPI to
+`GICD_ISACTIVER`, reads it back, and reports `dist.active`; it then clears the
+bit through `GICD_ICACTIVER` and reports `dist.unactive`. Both probes shipped in
+v0.9.0. The distributor handler behind them was still the upstream placeholder:
+for every bit written to `ISACTIVER` it cleared `gicd_interrupt_set_active_regs`,
+logged `ISACTIVER not implemented`, and returned. The read-back was therefore
+always zero, so `dist.active` would fail on the first hardware boot -- in code
+that had never executed, on a register the self-test was written to measure.
+
+`0008-vgic-distributor-active-bits.patch` implements both directions. A write of
+1 to `ISACTIVER` sets the bit and mirrors it into the `ICACTIVER` alias; a write
+of 1 to `ICACTIVER` clears both. Reads of either register return the same active
+bitmap, as they do for the redistributor's bank pairs after `0007`. The two
+`not implemented` notes are gone, so a diagnostic capture no longer reports a
+defect in a path that is now modelled.
+
+This patch changes only `src/hv_vgic.c`; the UEFI image is unchanged because it
+already contained the probe. `scripts/check-vgic.py` pins the set/clear
+directions in both the series and the patched tree, and
+`tests/test_check_vgic.py` puts the clearing behaviour back and requires the
+checker to reject it.
+
 ## The SMC trace
 
 `hv_handle_smc()` used to print the PSCI function ID on every guest SMC. That is
@@ -339,7 +364,7 @@ bring-up. It is now behind `DEBUG_PSCI_SMC` (off by default); define it in
 
 ```bash
 ./scripts/apply-patches.sh          # the whole series, idempotent
-./scripts/verify-patches.sh         # applies 0001-0007 in order to a clean worktree of the pin
+./scripts/verify-patches.sh         # applies 0001-0008 in order to a clean worktree of the pin
 ./scripts/check-vgic.py             # asserts the vGIC contract against the series
 ```
 
@@ -359,7 +384,8 @@ diff against the commit:
 TMP=$(mktemp -d)
 git -C third_party/m1n1-windows worktree add --detach "$TMP/tree" HEAD
 for p in 0001-vgic-m4-topology 0002-psci-t8132 0003-pcie-guest-handoff \
-         0004-vgic-guest-contract 0005-vgic-diagnostics 0006-vgic-honest-spi-routing; do
+         0004-vgic-guest-contract 0005-vgic-diagnostics 0006-vgic-honest-spi-routing \
+         0007-vgic-enable-gating; do
     git -C "$TMP/tree" apply "$PWD/patches/m1n1-windows/$p.patch"
 done
 # make the base a commit, so the diff below contains only this patch
@@ -368,7 +394,7 @@ git -C "$TMP/tree" -c user.email=build@local -c user.name=build commit -qm base
 
 # copy the files this patch owns out of the working tree, then:
 git -C "$TMP/tree" add -A
-git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0007-vgic-enable-gating.patch
+git -C "$TMP/tree" diff --cached > patches/m1n1-windows/0008-vgic-distributor-active-bits.patch
 ```
 
 Skipping the base commit is the mistake that silently produces a 1000-line patch
@@ -383,6 +409,6 @@ diff -r --exclude=.git --exclude=build --exclude='*.o' \
 Then run `./scripts/verify-patches.sh`, `./scripts/check-vgic.py --tree
 third_party/m1n1-windows`, and rebuild with `./scripts/build-m1n1.sh`. As a
 reproducibility check, the series as committed builds
-`m1n1.macho` = `a5636c6de757…` and `m1n1.bin` = `06247d0eb94b…` (SHA-256),
+`m1n1.macho` = `68f5e54aa5ca…` and `m1n1.bin` = `2caed3502823…` (SHA-256),
 the same bytes as the working tree it was generated from (checked 2026-10-28).
 

@@ -1,9 +1,12 @@
 # Build artifacts
 
-These are the outputs of the 2026-10-28 build on the `Mac16,3` / `J624` M4 iMac,
-published as release **v0.9.0**.
+These are the outputs of the 2026-10-28 build on the `Mac16,3` / `J624` M4 iMac.
+The UEFI image is the one published as release **v0.9.0**; the hypervisor was
+rebuilt after patch `0008` and its current hashes are below. No release tag
+carries that hypervisor yet, so use v0.9.0 only for the firmware, never for the
+`dist.active` self-test.
 
-All three images changed since v0.8.0.
+All three images changed between v0.8.0 and v0.9.0.
 
 - the UEFI image now carries **`AppleVgicSelfTestDxe`** (firmware patch `0003`).
   It runs after `ArmGicDxe` and before `TimerDxe`, walks every redistributor
@@ -46,20 +49,20 @@ checked against.
 | File | Size | What it is |
 |---|---|---|
 | `MAC16_3_EFI.fd` | 30 MB | NTASP Project Mu UEFI firmware for the M4 iMac, `Mac16,3` |
-| `m1n1-windows.bin` | 1.2 MB | raw m1n1-windows hypervisor image |
-| `m1n1-windows.macho` | 933 KB | Mach-O form of the same m1n1-windows build |
+| `m1n1-windows.bin` | 1.1 MB | raw m1n1-windows hypervisor image |
+| `m1n1-windows.macho` | 896 KB | Mach-O form of the same m1n1-windows build |
 | `SHA256SUMS` | — | SHA-256 of the three images above |
 
 ## SHA-256
 
 ```
 89e7cbb3669b08a903ee5663c618867518c2a26782ed1412e2b91b7c29a16739  MAC16_3_EFI.fd
-06247d0eb94bdb68b123c8163871a4777e8635ac725fc2bee87249223cb556bc  m1n1-windows.bin
-a5636c6de757508c4f791f3216c804f93c68924a7ecba4f95239d1cab2a6f148  m1n1-windows.macho
+2caed35028234b761322c2e69093bf5c73120f517bef5789a774437fe46bb96f  m1n1-windows.bin
+68f5e54aa5caadc5ecd969f8c2908f61ef1498e00eb8e0b243c557f1d354ca16  m1n1-windows.macho
 ```
 
 The m1n1 hashes come from a detached worktree of the pinned submodule commit
-with `patches/m1n1-windows/0001`–`0007` applied. A recursive `diff -r` of that
+with `patches/m1n1-windows/0001`–`0008` applied. A recursive `diff -r` of that
 tree against the working tree the patches were developed in reports no
 difference outside `.git`, `build/` and `target/`, and both trees build the same
 `m1n1.bin` and `m1n1.macho` byte for byte — so the hashes identify
@@ -126,6 +129,11 @@ larger than the whole image.
   translated to SPIs 512–767 (`guest_msi.c`, `hv_vgic3_guest_vintid()`). AIC
   interrupts above SPI 1019 with no INTID representation — the UART at 1046, the
   root complexes at 1231–1249 — are masked and logged once.
+- distributor active bits (patch 0008): `GICD_ISACTIVER` sets and
+  `GICD_ICACTIVER` clears the shared active bitmap. Without it, the firmware's
+  `dist.active` probe fails on the first boot; the probe was already in the
+  v0.9.0 image, which is why this hypervisor build and that image are meant to
+  be used together.
 - `HV_QUIESCE_PCIE` in `config.h` restores upstream's `pcie_shutdown()` — it is
   **not** defined in this build.
 

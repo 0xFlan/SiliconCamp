@@ -50,7 +50,10 @@ DEFAULT_BAUD = 115200
 
 #: tty modes commonly used by USB-UART bridges on macOS.  Everything in
 #: /dev/cu.* is listed; these are marked as likely console devices first.
-SERIAL_HINTS = ("usbmodem", "usbserial", "slab", "wchusbserial", "serial", "debug")
+#: `/dev/cu.debug-console` and `cu.wlan-debug` are built-in macOS consoles, not
+#: USB-UART adapters; matching "debug" made a machine with no adapter at all
+#: look ready for a hardware session.
+SERIAL_HINTS = ("usbmodem", "usbserial", "slab", "wchusbserial", "serial")
 
 #: Ports macOS creates for itself and that are never the M4 console.
 IGNORED = {"cu.Bluetooth-Incoming-Port"}
@@ -156,6 +159,7 @@ def capture(
     stop=None,
     echo: bool = False,
     quiet: bool = False,
+    append: bool = False,
 ) -> dict[str, object]:
     """Read the port until ``stop`` is set or ``seconds`` elapse.
 
@@ -170,6 +174,16 @@ def capture(
     log_path = Path(out).expanduser()
     if not log_path.parent.is_dir():
         raise SerialError(f"no such folder for the log: {log_path.parent}")
+    if log_path.exists() and not append:
+        #
+        # Appending would put two boots in one "capture", and the verdict would
+        # read them as a single run: a clean first boot could make a later
+        # silent failure look like a pass.  A hardware record has to be one
+        # file per run unless the caller says otherwise.
+        #
+        raise SerialError(
+            f"{log_path} already exists; choose a new file or pass append=True"
+        )
 
     fd = _open(device)
     try:
@@ -183,7 +197,9 @@ def capture(
     total = 0
     interrupted = False
     try:
-        with log_path.open("a", encoding="utf-8", newline="\n") as log:
+        # Line buffering keeps a crash from losing the last few lines; at
+        # 115200 baud the flush cost is irrelevant and the evidence matters.
+        with log_path.open("a" if append else "w", encoding="utf-8", newline="\n", buffering=1) as log:
             log.write("# SiliconCamp serial capture\n")
             log.write(f"# device: {device}\n# baud: {baud}\n")
             log.write(f"# started: {started_wall.isoformat(timespec='seconds')}\n")
@@ -510,6 +526,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     run.add_argument("--seconds", type=float, default=None)
     run.add_argument("--echo", action="store_true")
+    run.add_argument(
+        "--append",
+        action="store_true",
+        help="add another run to an existing capture (the verdict then reads both)",
+    )
 
     check = sub.add_parser("verdict", help="judge a captured boot log")
     check.add_argument("--in", dest="input", required=True)
@@ -550,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
             baud=args.baud,
             seconds=args.seconds,
             echo=args.echo,
+            append=args.append,
         )
         print(json.dumps(result, indent=2))
         return 130 if result.get("interrupted") else 0

@@ -550,12 +550,27 @@ def remove_space(*, container: str = "", confirm: bool = False, log=print) -> di
     if find_bootcamp(info["whole_disk"]):
         raise AllocationError(f"{PARTITION_NAME} is still present after the erase")
     after = container_info(info["reference"])
+    before_capacity = int(info["capacity"])
+    returned = int(after["capacity"]) - before_capacity
+    #
+    # `resizeContainer 0` reporting success is not the same as the space being
+    # back.  If the container did not grow by roughly the partition's size, the
+    # partition is gone but the capacity is still unassigned, and reporting a
+    # clean removal would hide that.
+    #
+    if returned < int(detail["bytes"]) * 0.99:
+        raise AllocationError(
+            f"{PARTITION_NAME} was deleted, but the container grew by only "
+            f"{returned / GB:.1f} GB of {detail['bytes'] / GB:.1f} GB; the rest "
+            "is unassigned rather than returned to macOS"
+        )
     return {
         "ok": True,
         "container": info["reference"],
         "removed": device,
         "bytes": detail["bytes"],
-        "container_before": int(info["capacity"]),
+        "returned": returned,
+        "container_before": before_capacity,
         "container_after": int(after["capacity"]),
         "seconds": round(time.monotonic() - started, 1),
     }

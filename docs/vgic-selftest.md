@@ -111,10 +111,17 @@ log can be column-diffed between boots.
 | `dist.igroupr` | The SPI reads as Group 1. Under `DS = 1`, `GICD_IGROUPR` is RAZ/WI and must read all ones. The emulation does not model it, so this is a **measured gap**, not a failure. |
 | `dist.enable` / `dist.disable` | `GICD_ISENABLER` sets and `GICD_ICENABLER` clears the bit. |
 | `dist.pending` / `dist.unpending` | `ISPENDR` / `ICPENDR` round-trip. |
-| `dist.active` / `dist.unactive` | `ISACTIVER` / `ICACTIVER` round-trip. |
+| `dist.active` / `dist.unactive` | `ISACTIVER` / `ICACTIVER` round-trip. Patch `0008` makes `ISACTIVER` write-1-to-set; before it, the hypervisor cleared the bit on a write of 1, so this row would have failed on the first boot while every other distributor probe passed. |
 | `dist.priority` | A priority written as `0xa5` reads back as `0xa5`. The probe uses a 32-bit read-modify-write of `GICD_IPRIORITYR`, because the emulator decodes accesses at the width the instruction used, and a byte access would test the hook's width handling instead of the register. |
 
 Every write is undone before the next check.
+
+The active-bit pair is the one row that was changed after the image was built.
+The probe was written against ARM IHI 0069, where `ISACTIVER` is write-1-to-set,
+but the distributor handler was still upstream's placeholder and did the
+opposite. The hypervisor now implements both directions (patch `0008`) and
+`scripts/check-vgic.py` rejects the clearing behaviour; the UEFI image did not
+need a rebuild because the probe was already in it.
 
 ### Routing (`VgicCheckIrouter`, SPI 512)
 

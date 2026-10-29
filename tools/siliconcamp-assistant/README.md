@@ -120,6 +120,15 @@ validated before and after it is written. It:
   silicon has no TPM 2.0 and the firmware does not implement Microsoft's Secure
   Boot database.
 
+Two limits are worth knowing before a hardware session. Windows Setup picks up
+`Autounattend.xml` from the media root by itself, but Microsoft does not
+document that `RunSynchronous` commands run *before* its compatibility checks;
+the file is the best available lever, not a guarantee. And `BypassCPUCheck` is
+honoured on some builds only — reports differ for Arm64 — so Setup may still
+stop at the processor check even though the media is valid. Neither limit is
+worked around by pretending otherwise: when Setup does stop, the failure is in
+Setup, before this project's partition step, and the disk is untouched.
+
 It deliberately contains no `DiskConfiguration` or `ImageInstall` element. A
 fixed disk number on a machine with several disks could format the wrong volume,
 so partition selection stays in Setup's own UI. `validate_unattend()` rejects a
@@ -202,6 +211,31 @@ a fault after a green self-test is a failure; a silent or truncated log is
 `incomplete`, never a pass. `--json` emits the parsed topology, self-test
 counters and named failures for an issue or probe record.
 
+## First-boot evidence
+
+`probe.py` turns that verdict into a record that can be checked later. It writes
+a new directory under `probes/` with the untouched capture, `verdict.json` and
+`verdict.txt`, the machine facts, the artifact hashes, the repository commit and
+a `README.md` summary, then hashes every file into `MANIFEST.json`:
+
+```bash
+python3 tools/siliconcamp-assistant/probe.py preflight
+python3 tools/siliconcamp-assistant/probe.py record --in probes/m4-first-boot.log
+python3 tools/siliconcamp-assistant/probe.py verify --dir probes/20261028T164100Z-first-boot
+```
+
+`preflight` checks the Mac model, the three boot images against
+`artifacts/SHA256SUMS`, a USB-UART adapter (macOS's `cu.debug-console` does not
+count), the capture directory and disk space. It fails rather than warns when a
+boot image is missing or unpinned; the second Mac and the boot-policy approval
+stay visible warnings because no software can detect them.
+
+`record` refuses to overwrite a record and refuses to mix two runs in one
+capture. `verify` re-hashes every file, cross-checks `verdict.json` against the
+manifest, and re-judges the capture, so a truncated or edited record is reported
+as a failure. Raw records are gitignored: a capture can contain MAC addresses
+and other machine identifiers. Redacted notes belong in `docs/probes/`.
+
 ## What is not done
 
 The internal-disk resize remains unavailable by policy. Taking tens of gigabytes
@@ -238,6 +272,10 @@ checks; it cannot manufacture a Windows kernel that reaches the display.
   not allow inline script or external origins.
 - The only command execution outside the media and allocation engines is the
   fixed `CHECKS` allow-list; no request body can name a command.
+- Every request must carry a loopback `Host` header. Binding to `127.0.0.1`
+  alone does not stop a browser pointed at an attacker-controlled DNS name that
+  resolves to loopback; that page would be same-origin and could read the write
+  token. A foreign Host is answered with 421.
 - Write endpoints require `X-SiliconCamp-Token`, a per-run secret injected into
   the page, and reject a foreign `Origin`. Another web page cannot drive the
   loopback server into erasing a disk or resizing a container.
@@ -255,6 +293,7 @@ checks; it cannot manufacture a Windows kernel that reaches the display.
 | `media.py` | ISO and PE validation, destination checks, FAT32 media, answer file, verification |
 | `allocation.py` | APFS measurement, resize/partition/restore, disk-image rehearsal |
 | `serial.py` | raw 115200 8N1 console capture, plus `verdict` over a captured boot log |
+| `probe.py` | hardware-session preflight, immutable probe records, and record verification |
 | `web/index.html` | the eight-step walkthrough |
 | `web/app.css` | window, sidebar, panes, controls, plan boxes |
 | `web/app.js` | navigation, tasks, installer job, space slider, rehearsal job, diagnostics |
@@ -270,23 +309,31 @@ checks; it cannot manufacture a Windows kernel that reaches the display.
 python3 -m unittest tests.test_siliconcamp_assistant
 ```
 
-57 tests. They cover the status payload, the checker allow-list, skip handling,
+60 tests. They cover the status payload, the checker allow-list, skip handling,
 dirty-submodule classification, the step order, local-only assets, the token
-boundary, the media engine's validation (including an x64 `BOOTAA64.EFI` and a
-non-PE file), the answer file's contents and its refusal of disk configuration,
-the APFS arithmetic, both write gates, an existing partition blocking a second
-allocation while offering removal, and the engine itself: three end-to-end media
-builds against real disk images (plain, single MBR FAT32 shape, oversized
-`install.wim` split), a failed build that must leave no image behind, and a full
-resize + restore rehearsal on a throwaway APFS image. The disk-image tests skip
-on Linux CI; everything else runs there.
+boundary, the loopback `Host` check, the media engine's validation (including an
+x64 `BOOTAA64.EFI`, a non-PE file, and an oversized `install.esd` that is
+neither splittable nor acceptable on FAT32), the answer file's contents and its
+refusal of disk configuration, the APFS arithmetic, both write gates, an
+existing partition blocking a second allocation while offering removal, and the
+engine itself: three end-to-end media builds against real disk images (plain,
+single MBR FAT32 shape, oversized `install.wim` split), a failed build that must
+leave no image behind, and a full resize + restore rehearsal on a throwaway APFS
+image. The disk-image tests skip on Linux CI; everything else runs there.
 
-`python3 -m unittest tests.test_siliconcamp_serial` adds thirteen tests: four for
+`python3 -m unittest tests.test_siliconcamp_serial` adds fifteen tests: six for
 the capture tool (including a pseudo-terminal run that checks the header,
-per-line timestamps, the unterminated last line and the footer counts) and nine
-for `verdict`, covering a clean pass, `PASS-WITH-GAPS`, a self-test failure, a
-fault after a pass, a topology mismatch, a silent log, a truncated log, and the
-CLI's exit status.
+per-line timestamps, the unterminated last line and the footer counts, plus the
+refusal to mix two runs in one file and the built-in debug console not counting
+as a USB adapter) and nine for `verdict`, covering a clean pass,
+`PASS-WITH-GAPS`, a self-test failure, a fault after a pass, a topology
+mismatch, a silent log, a truncated log, and the CLI's exit status.
+
+`python3 -m unittest tests.test_siliconcamp_probe` adds eight tests for the
+evidence bundle: a record contains every file and verifies, a second record
+refuses to overwrite, a tampered capture and a missing file are reported, a
+manifest that disagrees with the verdict is reported, records are listed, labels
+cannot escape the probe directory, and the preflight returns the expected shape.
 
 The native shell is verified by launching it with `--screenshot <path>`: the app
 starts or reuses its server, renders the page at 1080×720, writes one PNG and
