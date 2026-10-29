@@ -10,12 +10,18 @@ permissions:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
     strategy:
       matrix:
-        # 3.9 is the system Python on the supported macOS, so it is the floor the
-        # assistant has to keep working on; 3.12 is what most contributors run.
-        python-version: ["3.9", "3.12"]
+        include:
+          # 3.9 is the system Python on the supported macOS, so it is the floor
+          # the assistant has to keep working on.  ubuntu-latest is 26.04 now
+          # and setup-python has no 3.9 build for it, so that leg stays on
+          # 22.04; 3.12 is what most contributors run.
+          - python-version: "3.9"
+            os: ubuntu-22.04
+          - python-version: "3.12"
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
