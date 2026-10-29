@@ -294,6 +294,29 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("restores the enable bit and the group register", result.stdout)
 
+    def test_series_without_the_ppi_priority_readback_is_rejected(self) -> None:
+        # The hypervisor's PPI priority read once overwrote the value it returned.
+        # Without a read-back probe the firmware can still pass while a HAL that
+        # saves timer priorities corrupts them.
+        series = self._mutated_series(
+            "+  Value = (MmioRead32 (PriorityWord) >> PriorityShift) & 0xFF;",
+            "+  Value = 0xA5;",
+            patch="0005-vgic-selftest-ppi-priority.patch",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("compares it after a read", result.stdout)
+
+    def test_series_that_leaves_the_ppi_priority_unrestored_is_rejected(self) -> None:
+        series = self._mutated_series(
+            "+  MmioWrite32 (PriorityWord, OriginalPriority);",
+            "+  (void)0;",
+            patch="0005-vgic-selftest-ppi-priority.patch",
+        )
+        result = run_checker("--patches", series)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PPI priority word is restored", result.stdout)
+
     def test_series_that_clears_ds_or_are_in_the_replay_is_rejected(self) -> None:
         # DS and ARE cannot be cleared on this platform; doing it in the replay
         # would model a reset the vGIC does not perform.

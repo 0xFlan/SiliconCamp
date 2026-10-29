@@ -1,6 +1,6 @@
 # m1n1-windows patches
 
-Nine patches apply to the NTASP `m1n1_windows` commit pinned by this
+Ten patches apply to the NTASP `m1n1_windows` commit pinned by this
 repository. They are cumulative (each assumes every earlier one), so the order
 below is part of the contract, and `verify-patches.sh` applies the whole series,
 in order, to one pristine worktree:
@@ -16,6 +16,7 @@ in order, to one pristine worktree:
 | `0007-vgic-enable-gating.patch` | `src/hv_vgic.c`, `src/hv_vgic.h`, `src/hv_exc.c` | Makes delivery obey the guest's enable state (`GICD_CTLR.EnableGrp1`, `GICR_ISENABLER0`, `GICD_ISENABLER`), keeps a refused interrupt queued instead of dropping it, and repairs the redistributor's SGI-frame bank handlers, which kept enable and pending state in the active bank. Also makes `GICD_ISPENDR` read back and reports the Group 1 that delivery implements. |
 | `0008-vgic-distributor-active-bits.patch` | `src/hv_vgic.c` | Makes `GICD_ISACTIVER` write-1-to-set and `GICD_ICACTIVER` write-1-to-clear over the shared active bitmap. The placeholder handlers did the opposite for `ISACTIVER`, so the firmware self-test's `dist.active` probe would have failed on the first hardware boot. |
 | `0009-vgic-group1-bit.patch` | `src/hv_vgic.c` | Uses `GICD_CTLR` bit 1 as `EnableGrp1`, the DS=1 field the architecture defines, instead of bit 0 (`EnableGrp0`). The vGIC was self-consistent with a self-test that made the same mistake, but a Windows HAL programming the architectural bit would have left Group 1 disabled and every virtual interrupt gated. |
+| `0010-vgic-priority-readback.patch` | `src/hv_vgic.c`, `src/hv_exc.c` | Returns the stored `GICR_IPRIORITYR4-7` value on a read instead of overwriting it with the read buffer, and delivers a queued interrupt at the guest's current priority instead of the producer's placeholder (`0x20`/`0x40`). |
 
 ## Why 0002 is not optional on M4
 
@@ -371,6 +372,27 @@ bit 1 as Group 1 and bit 0 as Group 0, so the two layouts can no longer confirm
 each other's mistake. `scripts/check-vgic.py` rejects bit 0 as the Group 1 gate
 in the patched tree and requires the reset value without it.
 
+## Why 0010 exists
+
+`handle_vgic_redist_access()` has two sides, and the PPI priority read was
+written as if it were the write side: an aligned read of `GICR_IPRIORITYR4-7`
+executed `gicr_ppi_ipriority_reg[reg_num] = *val;`, assigning the array from the
+output pointer. `*val` holds whatever the guest's destination register held, so
+the stored priority was replaced by garbage on every read, and the next
+injection used that value. UEFI does not read PPI priorities; a Windows HAL
+reading its timer PPI priority would have caused the corruption, which is why
+the firmware self-test could not see it.
+
+The same audit found a second, smaller error on the queued path. Producers push
+a placeholder priority (`0x20` for the timers and SGIs, `0x40` for a refused
+SPI), and the drain injected the entry's value verbatim. An SGI/PPI priority is
+per-PE, and a queue can be filled on the CPU that took the physical interrupt
+before being drained on the target, so the entry is not authoritative. The
+drain now reads `hv_vgic3_get_priority()` on the CPU that will deliver, which is
+the same value the immediate path uses. Only the queued path changes, so a
+regression is invisible until an interrupt is refused by the enable gate and
+then drained.
+
 ## The SMC trace
 
 `hv_handle_smc()` used to print the PSCI function ID on every guest SMC. That is
@@ -383,7 +405,7 @@ bring-up. It is now behind `DEBUG_PSCI_SMC` (off by default); define it in
 
 ```bash
 ./scripts/apply-patches.sh          # the whole series, idempotent
-./scripts/verify-patches.sh         # applies 0001-0009 in order to a clean worktree of the pin
+./scripts/verify-patches.sh         # applies 0001-0010 in order to a clean worktree of the pin
 ./scripts/check-vgic.py             # asserts the vGIC contract against the series
 ```
 
@@ -428,6 +450,6 @@ diff -r --exclude=.git --exclude=build --exclude='*.o' \
 Then run `./scripts/verify-patches.sh`, `./scripts/check-vgic.py --tree
 third_party/m1n1-windows`, and rebuild with `./scripts/build-m1n1.sh`. As a
 reproducibility check, the series as committed builds
-`m1n1.macho` = `e380f969b4cc…` and `m1n1.bin` = `e168cdd47fa7…` (SHA-256),
+`m1n1.macho` = `1b5954bc0c3b…` and `m1n1.bin` = `7341d887cba9…` (SHA-256),
 the same bytes as the working tree it was generated from (checked 2026-10-28).
 

@@ -80,16 +80,18 @@ If you started from a clean NTASP checkout, apply the project's M4 patch first:
 ```
 
 The script applies `patches/ntasp-firmware/0001-m4-uefi-platform.patch`,
-`0003-vgic-selftest.patch` and `0004-vgic-selftest-group1-bit.patch` in order,
-and, once `MU_BASECORE` is initialized, `0002-nasm-scope.patch`. It is
-idempotent.
+`0003-vgic-selftest.patch`, `0004-vgic-selftest-group1-bit.patch` and
+`0005-vgic-selftest-ppi-priority.patch` in order, and, once `MU_BASECORE` is
+initialized, `0002-nasm-scope.patch`. It is idempotent. Applying only through
+`0004` builds an image without the PPI priority read-back, which is why the
+script names `0005` explicitly.
 
 `./scripts/verify-patches.sh` checks the same patches against the exact commits
 the submodules pin, using throwaway git worktrees, so it passes on a dirty tree
 and fails loudly when a submodule moves under the patches. Applying them to a
 clean checkout reproduces the build trees inside this repository exactly (checked
-2026-10-26 by diffing a patched worktree against the working tree), and those
-trees produced the released artifacts.
+2026-10-28 by diffing a patched worktree against the working tree, including
+`0005`), and those trees produced the released artifacts.
 
 The validated reference platform is the M2 MacBook Pro package:
 

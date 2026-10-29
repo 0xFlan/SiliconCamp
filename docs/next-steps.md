@@ -401,7 +401,7 @@ reserve as a bisection tool.
 | Apple's CPU interface diverges from the architecture in ways only a real guest finds | Guest `ICC_*` behaviour differs from what the emulated distributor implies | Nothing offline can detect this; it is what hardware is for |
 | `ENABLE_VGIC_LOGGING` is turned back on | First boot looks like a hang at the first interrupt | Step 2 shipped `0005`; the checker fails if any patch restores it |
 | The ACPI tables describe the vGIC accurately but Windows ignores the MSI frame | MSI never works | `check-acpi.py` already pins the frame against `guest_msi.h`; the self-test should read the doorbell back |
-| Deterministic-build claim is mistaken | Patches and artifacts drift | The series reproduces the working tree and rebuilds to `m1n1.macho = 222b6f9b…`, `m1n1.bin = c59b4f14…` (**verified** on 2026-10-27) |
+| Deterministic-build claim is mistaken | Patches and artifacts drift | The series reproduces the working tree and a clean rebuild reproduces `m1n1.macho = 1b5954bc…`, `m1n1.bin = 7341d887…` (**verified** on 2026-10-28 by rebuilding twice) |
 | The diagnostics are mistaken for a conformance test | A green log is read as "the vGIC is correct" | The ring records what the guest *did*, not whether it was correct; the conformance question is the UEFI self-test (step 4) |
 | An OS refuses to boot because an SPI it moved is still delivered on the AIC's PE | Interrupt affinity is performance-only on this hardware, unless a driver depends on locality | Step 3 shipped `0006`; the self-test should record the delivering PE per SPI, and the fix (forwarding an acknowledged interrupt to another CPU's queue) is designed only after that measurement |
 

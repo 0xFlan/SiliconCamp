@@ -9,8 +9,8 @@ one. UEFI is a lenient guest, so a build that boots is evidence about UEFI, not
 about the vGIC.
 
 **Status:** builds with zero warnings, is present in the DXE FV, and is
-machine-checked offline by `scripts/check-vgic-selftest.py` (94 checks against the
-patch series, 93 against the tree). `scripts/check-gicv3-oracle.py` additionally
+machine-checked offline by `scripts/check-vgic-selftest.py` (97 checks against the
+patch series, 96 against the tree). `scripts/check-gicv3-oracle.py` additionally
 re-checks the register read-backs it assumes against QEMU's independent GICv3
 model. **It has never run on the M4.** Everything it asserts about the device is
 an expectation derived from ARM IHI 0069 and from the hypervisor's source; the run
@@ -200,6 +200,7 @@ reads the alias it did not write.
 | `redist.deactivate` | `GICR_ICACTIVER0` clears active. |
 | `redist.igroup` | `GICR_IGROUPR0` reports Group 1 for the bit, the group every virtual interrupt is injected as. |
 | `redist.igroup-forced` | A write that tries to select Group 0 is ignored. Delivery has no Group 0 path, so a register that accepted the write would describe an interrupt routing that never happens. |
+| `redist.priority` | PPI 30's priority, written as `0xa5`, reads back as `0xa5`. This is `GICR_IPRIORITYR4-7`, a different block from the SGI priority words, and its read path had assigned the emulation's array from `*val` instead of loading `*val` from it. A HAL that saves and restores timer priorities would have corrupted them on the read. The probe restores the whole 32-bit word exactly. |
 
 Before `0007` the enable and pending handlers in this region read and wrote the
 **active** bank, and `GICR_ICENABLER0` never cleared the enable bit at all. A

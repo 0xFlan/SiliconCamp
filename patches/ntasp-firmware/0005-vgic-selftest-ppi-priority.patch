@@ -1,0 +1,94 @@
+Read a PPI priority back in the vGIC self-test.
+
+The hypervisor's GICR_IPRIORITYR4-7 read path assigned the priority array from
+*val instead of loading *val from it, so a guest reading a PPI priority
+overwrote the value it was reading.  The distributor probe covers an SPI
+priority, but the PPI block has a separate array and a separate handler, and a
+Windows HAL saves the timer PPI priorities before enabling them.
+
+Add redist.priority: write a known byte into PPI 30's priority, read the word
+back, restore the original word.  It is the only probe that exercises the PPI
+priority handler in either direction, and the value is restored exactly so a
+later driver sees the frame as it was.
+
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
+--- a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
+@@ -125,6 +125,12 @@
+ #define GICR_SGI_ICPENDR    0x10280
+ #define GICR_SGI_ISACTIVER  0x10300
+ #define GICR_SGI_ICACTIVER  0x10380
++//
++// GICR_IPRIORITYR4-7 is the 32-bit priority word for PPIs 16-31.  It is a
++// different register block from the SGI priority words at 0x10400, and the
++// read path is what a HAL uses to save timer priorities before enabling them.
++//
++#define GICR_PPI_IPRIORITYR 0x10410
+ 
+ #define GICR_WAKER_PROCESSOR_SLEEP (1U << 1)
+ #define GICR_WAKER_CHILDREN_ASLEEP (1U << 2)
+@@ -176,6 +182,12 @@
+ //
+ #define VGIC_TEST_SGI        9
+ #define VGIC_TEST_SGI_2      10
++//
++// A PPI the delivery tests do not register, used only to read a priority back.
++// PPI 16-31 are the redistributor's PPI range; 30 is clear of the architected
++// timers, the PMU and the SGI probes above.
++//
++#define VGIC_TEST_PPI_PRIORITY 30
+ //
+ // The bank-semantics probe uses an SGI none of the delivery tests touch, so it
+ // can save and restore a single bit without disturbing them.
+@@ -1381,6 +1393,9 @@
+   UINT32  OriginalEnable;
+   UINT32  OriginalGroup;
+   UINT32  OriginalPending;
++  UINT32  OriginalPriority;
++  UINT32  PriorityShift;
++  UINT32  PriorityWord;
+   UINT32  Value;
+ 
+   Bit             = (UINT32)(1U << IntId);
+@@ -1524,6 +1539,41 @@
+   }
+ 
+   MmioWrite32 (SgiBase + GICR_SGI_IGROUPR0, OriginalGroup);
++
++  //
++  // PPI priority.  The read path is the property being measured: an emulation
++  // that assigns its priority array from *val while servicing a read replaces
++  // the value it was asked to return, so the first read after a write already
++  // returns the corrupted word.  PPI 30 is not registered by any other probe,
++  // and the whole 32-bit word is written back exactly.
++  //
++  PriorityWord    = SgiBase + GICR_PPI_IPRIORITYR +
++                    (((VGIC_TEST_PPI_PRIORITY - 16) / 4) * 4);
++  PriorityShift   = ((VGIC_TEST_PPI_PRIORITY - 16) & 3) * 8;
++  OriginalPriority = MmioRead32 (PriorityWord);
++  MmioWrite32 (
++    PriorityWord,
++    (OriginalPriority & ~(0xFFU << PriorityShift)) | (0xA5U << PriorityShift)
++    );
++
++  Value = (MmioRead32 (PriorityWord) >> PriorityShift) & 0xFF;
++  if (Value == 0xA5) {
++    VgicPass (
++      "redist.priority",
++      "PPI %u priority reads back 0xa5",
++      VGIC_TEST_PPI_PRIORITY
++      );
++  } else {
++    VgicFail (
++      "redist.priority",
++      "PPI %u priority read back 0x%02x, expected 0xa5: the read path overwrote "
++      "the stored value",
++      VGIC_TEST_PPI_PRIORITY,
++      Value
++      );
++  }
++
++  MmioWrite32 (PriorityWord, OriginalPriority);
+ }
+ 
+ /**

@@ -68,16 +68,26 @@ while claiming to clear Group 1. The patch moves the macro and every use to bit
 so it is applied after `0003`; the apply script deliberately does not use the
 `.inf` marker for it, because that file already exists once `0003` is in place.
 
-`0001`, `0003` and `0004` are one **cumulative series**: `0003` edits two files
-that `0001` creates, and `0004` edits the driver `0003` creates. None can be
-checked on its own, because `0003` does not apply to a tree without `0001` and
-`0001` no longer applies cleanly once `0003` is on top.
+`0005-vgic-selftest-ppi-priority.patch` adds `redist.priority`, the PPI priority
+read-back. `GICR_IPRIORITYR4-7` is a separate register block from the SGI
+priority words, with its own handler, and the hypervisor's read path assigned
+the priority array from `*val` instead of loading `*val` from it. A guest that
+read a PPI priority back therefore overwrote the value it was reading; a
+Windows HAL saving the timer priorities before enabling them is the sequence
+that would have hit it. The probe writes a known byte into PPI 30, reads the
+word back, compares the byte, and restores the whole word exactly. It is the
+only check that exercises that handler in either direction.
+
+`0001`, `0003`, `0004` and `0005` are one **cumulative series**: `0003` edits two
+files that `0001` creates, and `0004` and `0005` edit the driver `0003` creates.
+None can be checked on its own, because `0003` does not apply to a tree without
+`0001` and `0001` no longer applies cleanly once `0003` is on top.
 `scripts/verify-patches.sh` and `scripts/apply-ntasp-patches.sh` both treat them
 in that order, and the apply script has a marker fallback (the driver's `.inf`)
 for exactly that reason.
 
-All four patches contain a binary file (`Resources/RegulatoryLogos.png` in
-`0001`), so apply them with `git apply` (not a plain `patch` command).
+`0001` contains a binary file (`Resources/RegulatoryLogos.png`), so apply the
+series with `git apply` (not a plain `patch` command).
 
 From a clean checkout:
 

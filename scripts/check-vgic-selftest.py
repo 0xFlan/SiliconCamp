@@ -77,6 +77,7 @@ ALLOWED_GICR = {
     "GICR_SGI_ISACTIVER",
     "GICR_SGI_ISENABLER",
     "GICR_SGI_ISPENDR",
+    "GICR_PPI_IPRIORITYR",
     "GICR_TYPER",
     "GICR_TYPER_AFFINITY_MASK",
     "GICR_TYPER_DIRECTLPI",
@@ -338,6 +339,33 @@ def check_driver(ck: Checker, source: str, inf: str) -> None:
     ck.check(has(banks, r"MmioWrite32\s*\(\s*SgiBase\s*\+\s*GICR_SGI_ICENABLER\s*,\s*Bit\s*\)") and
              has(banks, r"MmioWrite32\s*\(\s*SgiBase\s*\+\s*GICR_SGI_IGROUPR0\s*,\s*OriginalGroup\s*\)"),
              "the probe restores the enable bit and the group register before returning")
+    #
+    # GICR_IPRIORITYR4-7 is a separate block from the SGI priority words, and
+    # its read path is what a HAL uses to save timer priorities.  A read that
+    # stores into the emulation's array destroys the value it returns, so the
+    # probe has to write a known priority, read it back and restore the word.
+    #
+    #
+    # Use the whole source for these checks: the series mode reconstructs the
+    # driver from added lines only, so a function body assembled that way can
+    # stop at a brace from a later patch.  The strings are unique to this probe.
+    #
+    ck.check("GICR_PPI_IPRIORITYR" in code and "VGIC_TEST_PPI_PRIORITY" in code,
+             "the probe reads a PPI priority back from GICR_IPRIORITYR4-7")
+    #
+    # Scope both checks to the text after GICR_PPI_IPRIORITYR.  The SPI probe
+    # uses the same PriorityWord/OriginalPriority names, so an unscoped match is
+    # satisfied by the SPI restore even when the PPI one is gone, and a plain
+    # `PriorityShift` match still passes when the read-back was replaced by a
+    # literal.
+    #
+    ppi_tail = code[code.find("GICR_PPI_IPRIORITYR"):]
+    ck.check(has(ppi_tail, r"Value\s*=\s*\(\s*MmioRead32\s*\(\s*PriorityWord\s*\)"
+                           r"\s*>>\s*PriorityShift\s*\)\s*&\s*0xFF") and
+             has(ppi_tail, r"if\s*\(\s*Value\s*==\s*0xA5U?\s*\)"),
+             "the PPI priority probe writes a known byte and compares it after a read")
+    ck.check(has(ppi_tail, r"MmioWrite32\s*\(\s*PriorityWord\s*,\s*OriginalPriority\s*\)"),
+             "the PPI priority word is restored after the probe")
     ck.check(code.count("VgicCheckRedistributorBanks") >= 2 and
              has(code, r"VgicCheckRedistributorBanks\s*\([^;]*BootFrame"),
              "the entry point runs the probe on the boot PE's own frame")
