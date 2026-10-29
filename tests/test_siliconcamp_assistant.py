@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -231,6 +232,22 @@ class MediaPayloadTests(unittest.TestCase):
             with self.assertRaises(self.media.MediaError):
                 self.media.scan_payload(root)
 
+    def test_fat32_unsafe_names_are_refused_before_the_destination_is_touched(self) -> None:
+        # A colon survives on APFS and Linux but not on FAT32.  Catching it in
+        # scan_payload means the USB disk is not erased for media that cannot
+        # hold the file.
+        for name in ("bad:name.bin", "trailing.", "trailing ", "CON", "lpt1.txt", "a" * 256):
+            self.assertTrue(self.media.fat32_name_problem(name), name)
+        for name in ("BOOTAA64.EFI", "install.swm", "Windows 11", "$WinPEDriver$"):
+            self.assertEqual(self.media.fat32_name_problem(name), "", name)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.payload_tree(root)
+            (root / "sources" / "bad:name.bin").write_bytes(b"x")
+            with self.assertRaises(self.media.MediaError) as caught:
+                self.media.scan_payload(root)
+            self.assertIn("FAT32", str(caught.exception))
+
     def test_files_differing_only_by_case_are_rejected(self) -> None:
         # FAT32 is case-insensitive, so both cannot exist on the destination.
         # The walk and the sizes are mocked so the test behaves the same on a
@@ -353,6 +370,23 @@ class MediaPayloadTests(unittest.TestCase):
                 image.normalise_image(str(existing))
             with self.assertRaises(image.MediaError):
                 image.normalise_image(str(pathlib.Path(tmp) / "plain.txt"))
+
+    def test_an_image_size_must_be_a_positive_integer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.payload_tree(root)
+            payload = self.media.scan_payload(root)
+            for size in ("big", -1, 12.5):
+                with self.assertRaises(self.media.MediaError) as caught:
+                    self.media.plan_media(
+                        payload,
+                        target={
+                            "kind": "image",
+                            "path": str(root / "out.sparseimage"),
+                            "size": size,
+                        },
+                    )
+                self.assertIn("size", str(caught.exception))
 
     def test_an_internal_disk_is_never_a_media_target(self) -> None:
         payload_target = {"kind": "disk", "device": "/dev/disk0"}
@@ -596,6 +630,23 @@ class AllocationTests(unittest.TestCase):
         self.assertIsNone(plan["existing"])
         self.assertFalse(plan["remove"]["enabled"])
 
+    def test_a_tight_plan_does_not_suggest_a_smaller_partition_than_allowed(self) -> None:
+        # 64 GB is the Windows 11 Arm64 minimum.  With 88 GB free the plan is at
+        # that minimum and still close to the reserve; the warning must say the
+        # only fix is freeing macOS space, not shrinking the plan below its floor.
+        plan = self.allocation.plan_space(64, stats=self.fake_host(free_gb=88))
+        self.assertTrue(plan["fit"])
+        self.assertTrue(plan["warnings"])
+        warning = " ".join(plan["warnings"])
+        self.assertIn("smallest supported", warning)
+        self.assertIn("free up space", warning)
+        self.assertNotIn("smaller partition", warning)
+
+    def test_a_larger_plan_still_suggests_shrinking_it(self) -> None:
+        plan = self.allocation.plan_space(74, stats=self.fake_host(free_gb=100))
+        self.assertTrue(plan["fit"])
+        self.assertTrue(any("smaller partition" in warning for warning in plan["warnings"]))
+
     def test_an_existing_partition_blocks_a_second_allocation(self) -> None:
         existing = {
             "device": "/dev/disk0s4",
@@ -711,6 +762,33 @@ class AllocationWriteTests(unittest.TestCase):
         with self.assertRaises(self.allocation.AllocationError) as caught:
             self.allocation.apply_space(64)
         self.assertIn("confirm=True", str(caught.exception))
+
+    def test_a_rollback_that_does_not_restore_the_capacity_is_reported(self) -> None:
+        # The two diskutil calls can both exit 0 and still leave the container
+        # short.  Reporting "restored" on exit codes alone would hide a broken
+        # disk from the person deciding what to do next.
+        info = {"reference": "disk3", "whole_disk": "/dev/disk0"}
+        original = 500 * self.allocation.GB
+        with mock.patch.object(self.allocation, "_checked", return_value=""), \
+             mock.patch.object(
+                 self.allocation,
+                 "container_info",
+                 return_value={"capacity": original - 64 * self.allocation.GB},
+             ), \
+             mock.patch.object(self.allocation, "find_bootcamp", return_value={}):
+            problems = self.allocation._restore_after_failure(info, original, {})
+        self.assertIn("not the original", problems)
+
+    def test_a_clean_rollback_reports_nothing(self) -> None:
+        info = {"reference": "disk3", "whole_disk": "/dev/disk0"}
+        original = 500 * self.allocation.GB
+        with mock.patch.object(self.allocation, "_checked", return_value=""), \
+             mock.patch.object(
+                 self.allocation, "container_info", return_value={"capacity": original}
+             ), \
+             mock.patch.object(self.allocation, "find_bootcamp", return_value={}):
+            problems = self.allocation._restore_after_failure(info, original, {})
+        self.assertEqual(problems, "")
 
     def test_the_container_holding_root_is_refused_until_windows_boots(self) -> None:
         if not HAVE_DISK_TOOLS:

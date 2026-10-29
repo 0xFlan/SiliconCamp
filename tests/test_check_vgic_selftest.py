@@ -40,6 +40,7 @@ SELFTEST_DRIVER = os.path.join(
     "AppleVgicSelfTestDxe", "AppleVgicSelfTestDxe.c",
 )
 PATCH = "0003-vgic-selftest.patch"
+GROUP1_PATCH = "0004-vgic-selftest-group1-bit.patch"
 
 
 def run_checker(*args: str) -> subprocess.CompletedProcess:
@@ -59,7 +60,7 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("vGIC self-test: OK", result.stdout)
 
-    def _mutated_series(self, old: str, new: str) -> str:
+    def _mutated_series(self, old: str, new: str, patch: str = PATCH) -> str:
         tmp = tempfile.mkdtemp(prefix="vgic-selftest-")
         self.addCleanup(shutil.rmtree, tmp, True)
         for name in os.listdir(PATCH_DIR):
@@ -67,7 +68,7 @@ class PatchSeriesTests(unittest.TestCase):
                 continue
             with open(os.path.join(PATCH_DIR, name), "r", encoding="utf-8") as handle:
                 text = handle.read()
-            if name == PATCH:
+            if name == patch:
                 self.assertIn(old, text, f"fixture drifted: {old!r} not in {name}")
                 text = text.replace(old, new)
             with open(os.path.join(tmp, name), "w", encoding="utf-8") as handle:
@@ -214,16 +215,17 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertIn("re-enables the source", result.stdout)
 
     def test_series_that_checks_the_wrong_group_enable_bit_is_rejected(self) -> None:
-        # Bit 1 is EnableGrp0 under DS=1.  Both bits are set at reset, so the
+        # Bit 0 is EnableGrp0 under DS=1.  Both bits are set at reset, so the
         # wrong constant passes on an untouched device and only fails when a
         # guest clears Group 1 while leaving Group 0 alone.
         series = self._mutated_series(
-            "+#define GICD_CTLR_ENABLEGRP1NS  (1U << 0)",
             "+#define GICD_CTLR_ENABLEGRP1NS  (1U << 1)",
+            "+#define GICD_CTLR_ENABLEGRP1NS  (1U << 0)",
+            patch=GROUP1_PATCH,
         )
         result = run_checker("--patches", series)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("EnableGrp1 is bit 0 under DS=1", result.stdout)
+        self.assertIn("EnableGrp1 is bit 1 under DS=1", result.stdout)
 
     def test_series_without_the_pending_across_disable_probe_is_rejected(self) -> None:
         # gating.sgi proves a disabled SGI is not delivered; it does not prove
@@ -301,7 +303,7 @@ class PatchSeriesTests(unittest.TestCase):
         )
         result = run_checker("--patches", series)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("only EnableGrp1NS is cleared", result.stdout)
+        self.assertIn("only EnableGrp1 (DS=1 bit 1) is cleared", result.stdout)
 
 
 @unittest.skipUnless(os.path.isfile(SELFTEST_DRIVER),

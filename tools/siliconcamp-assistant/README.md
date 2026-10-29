@@ -309,14 +309,15 @@ checks; it cannot manufacture a Windows kernel that reaches the display.
 python3 -m unittest tests.test_siliconcamp_assistant
 ```
 
-60 tests. They cover the status payload, the checker allow-list, skip handling,
+66 tests. They cover the status payload, the checker allow-list, skip handling,
 dirty-submodule classification, the step order, local-only assets, the token
 boundary, the loopback `Host` check, the media engine's validation (including an
-x64 `BOOTAA64.EFI`, a non-PE file, and an oversized `install.esd` that is
-neither splittable nor acceptable on FAT32), the answer file's contents and its
-refusal of disk configuration, the APFS arithmetic, both write gates, an
-existing partition blocking a second allocation while offering removal, and the
-engine itself: three end-to-end media builds against real disk images (plain,
+x64 `BOOTAA64.EFI`, a non-PE file, FAT32-invalid names, a non-integer image
+size, and an oversized `install.esd` that is neither splittable nor acceptable
+on FAT32), the answer file's contents and its refusal of disk configuration,
+the APFS arithmetic, both write gates, an existing partition blocking a second
+allocation while offering removal, a rollback that reads the container back and
+reports one that did not return to its original size, and the engine itself: three end-to-end media builds against real disk images (plain,
 single MBR FAT32 shape, oversized `install.wim` split), a failed build that must
 leave no image behind, and a full resize + restore rehearsal on a throwaway APFS
 image. The disk-image tests skip on Linux CI; everything else runs there.

@@ -1,0 +1,72 @@
+Fix GICD_CTLR Group 1 gating for DS=1.
+
+Under GICD_CTLR.DS=1, bit 1 is EnableGrp1 and bit 0 is EnableGrp0
+(ARM IHI 0069, GICD_CTLR single-security-state layout).  The vGIC read
+bit 0 as Group 1 and set it at reset, so it never saw the guest enable
+Group 1 and advertised Group 0 as enabled instead.  The firmware
+self-test shared the mistake, which made the two self-consistent and
+wrong against both the architecture and the Windows HAL.
+
+Gate delivery on bit 1 and start with only DS, ARE and Group 1 set.
+Group 0 is not modelled, so its enable bit is left alone.
+
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -395,25 +395,20 @@
+                     //
+                     vgic_log("HV vGIC DEBUG [INFO]: guest is changing EN1WF\n");
+                 }
+-                if(((gicd_ctlr_new_val & BIT(1)) == 0) && ((distributor->gicd_ctl_reg & BIT(1)) != 0)) {
+-                    //
+-                    // the guest is clearing EnableGrp0.
+-                    //
+-                    vgic_log("HV vGIC DEBUG [INFO]: guest is clearing EnableGrp0\n");
+-                }
+                 //
+-                // Every virtual interrupt is delivered as Group 1, so this bit
+-                // turning on is the moment anything queued behind a disabled
+-                // group becomes deliverable.
++                // With DS=1 the group-enable layout is bit 1 EnableGrp1 and
++                // bit 0 EnableGrp0.  Every virtual interrupt is delivered as
++                // Group 1, so bit 1 is the one that gates delivery -- reading
++                // bit 0 here checked Group 0 and left Group 1 ungated.
+                 //
+-                bool group1_enabled = ((distributor->gicd_ctl_reg & BIT(0)) == 0) &&
+-                                      ((gicd_ctlr_new_val & BIT(0)) != 0);
+-                if((gicd_ctlr_new_val & BIT(0)) == 0 && (distributor->gicd_ctl_reg & BIT(0)) != 0) {
++                if(((gicd_ctlr_new_val & BIT(1)) == 0) && ((distributor->gicd_ctl_reg & BIT(1)) != 0)) {
+                     //
+                     // the guest is clearing EnableGrp1.
+                     //
+                     vgic_log("HV vGIC DEBUG [INFO]: guest is clearing EnableGrp1\n");
+                 }
++                bool group1_enabled = ((distributor->gicd_ctl_reg & BIT(1)) == 0) &&
++                                      ((gicd_ctlr_new_val & BIT(1)) != 0);
+ 
+                 //
+                 // GICD_CTLR.RWP is RO and reads 1 only while a write to this
+@@ -1571,8 +1566,13 @@
+     //
+     // For now - taking the easy route of saying that at least 1024 IRQs are supported on all platforms.
+     //
+-    distributor->gicd_ctl_reg = (BIT(6) | BIT(4) | BIT(1) | BIT(0));
+     //
++    // DS | ARE | EnableGrp1.  In the DS=1 layout EnableGrp1 is bit 1; bit 0
++    // is EnableGrp0, which this vGIC does not implement and must not advertise
++    // as enabled.
++    //
++    distributor->gicd_ctl_reg = (BIT(6) | BIT(4) | BIT(1));
++    //
+     // GIC type will be defined as the following:
+     // - No extended SPIs (Update on 6/10/2025: maz in Asahi IRC says we can probably expose extended SPIs? could also look into some other hacks for > 1024 IRQ platforms)
+     // - Affinity level 0 can go up to 15
+@@ -1881,7 +1881,7 @@
+     // KVM's vgic_target_oracle() gates SGI/PPI forwarding on the same
+     // distributor-enabled flag.
+     //
+-    if ((distributor->gicd_ctl_reg & BIT(0)) == 0)
++    if ((distributor->gicd_ctl_reg & BIT(1)) == 0)
+         return false;
+ 
+     if (vintid < 32) {

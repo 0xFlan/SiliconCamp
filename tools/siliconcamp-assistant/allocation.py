@@ -260,7 +260,19 @@ def plan_space(
     if not blockers and free - wanted < reserve:
         blockers.append("that leaves macOS below its reserve")
     if not blockers and free - wanted < reserve + 10 * GB:
-        warnings.append("macOS will be close to full; consider a smaller partition.")
+        if requested > MIN_WINDOWS_GB:
+            warnings.append("macOS will be close to full; consider a smaller partition.")
+        else:
+            #
+            # The plan is already at the smallest Windows 11 Arm64 size.  Telling
+            # the user to shrink it further is advice they cannot follow; the
+            # only way to widen the macOS headroom is to free space on macOS.
+            #
+            warnings.append(
+                "This is the smallest supported Windows partition and it leaves "
+                f"macOS {max(0, free - wanted - reserve) // GB} GB above its reserve; "
+                "free up space in macOS before allocating."
+            )
 
     layout = [
         {
@@ -296,8 +308,7 @@ def plan_space(
         "requested_gb": requested,
         "fit": not blockers,
         "blockers": blockers,
-        "warnings": warnings,
-        "layout": layout,
+        "warnings": warnings,            "layout": layout,
         "host": host,
         "after": {
             "free": max(0, free - wanted),
@@ -398,6 +409,26 @@ def _restore_after_failure(info: dict, original: int, part: dict) -> str:
         )
     except AllocationError as exc:
         problems.append(f"could not grow the container back: {exc}")
+
+    #
+    # An exit code is not the same as the disk being back where it started.
+    # Read the container again and say so, rather than reporting a clean
+    # rollback that the next `diskutil apfs list` would contradict.
+    #
+    try:
+        restored = container_info(info["reference"])
+    except AllocationError as exc:
+        problems.append(f"could not verify the restored container: {exc}")
+    else:
+        if abs(int(restored["capacity"]) - int(original)) > MIB:
+            problems.append(
+                f"the container reads {int(restored['capacity']) / GB:.1f} GB after "
+                f"the rollback, not the original {original / GB:.1f} GB"
+            )
+    if find_bootcamp(info["whole_disk"]):
+        problems.append(
+            f"{PARTITION_NAME} is still present after the rollback"
+        )
     return "; ".join(problems)
 
 

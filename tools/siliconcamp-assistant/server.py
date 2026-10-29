@@ -69,6 +69,10 @@ import media  # noqa: E402 - local module, path set above
 TOKEN = secrets.token_urlsafe(24)
 TOKEN_PLACEHOLDER = "__SILICONCAMP_TOKEN__"
 
+#: One version string for the page payload and the HTTP `Server` header; they
+#: drifted once, and the window identified itself as 0.3 while serving 0.4.
+VERSION = "0.4"
+
 #: The names in artifacts/SHA256SUMS and where a local build puts each one.
 ARTIFACTS = (
     (
@@ -360,7 +364,7 @@ def build_status() -> dict[str, object]:
     ready = bool(artifacts) and all(row["status"] == "match" for row in artifacts)
     return {
         "product": "SiliconCamp Assistant",
-        "version": "0.4",
+        "version": VERSION,
         "preview": True,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "machine": machine_info(),
@@ -474,7 +478,7 @@ JOBS = Jobs()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SiliconCampAssistant/0.3"
+    server_version = f"SiliconCampAssistant/{VERSION}"
     sys_version = ""
 
     def log_message(self, fmt: str, *args: object) -> None:

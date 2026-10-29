@@ -313,7 +313,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     private func waitForServer(attempts: Int) {
         if portIsOpen() {
-            loadWalkthrough()
+            //
+            // A port that accepts a connection is not proof that this process
+            // owns it.  The server could have failed to bind because another
+            // program won the race, and loading that program into a WebView
+            // that exposes the file-picker bridge would show a stranger's page
+            // as the assistant.  Check both the child and the product string.
+            //
+            if let server, !server.isRunning {
+                showFailure(
+                    title: "The local assistant exited",
+                    detail: "See ~/Library/Logs/SiliconCampAssistant.log for the server output."
+                )
+                return
+            }
+            verifyExistingServer()
             return
         }
         guard attempts > 0 else {

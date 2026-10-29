@@ -369,6 +369,13 @@ reserve as a bisection tool.
    remaining placeholder notes in `hv_vgic.c` are the places to look next, and
    `scripts/check-vgic.py` now pins the fixed pair in the series and the tree.
 
+   The same method found a second, worse case: `GICD_CTLR` bit 0 was used as
+   Group 1 by the vGIC, the self-test **and** the QEMU oracle. Under `DS=1`, bit
+   0 is `EnableGrp0`; bit 1 is `EnableGrp1`. Three implementations agreeing did
+   not make the field right. `0009-vgic-group1-bit.patch` and firmware `0004`
+   move the gate to bit 1, and the oracle now measures bit 1 as Group 1 and bit
+   0 as Group 0, so the cross-check can no longer confirm the same mistake.
+
 ### Hardware-gated
 
 7. Boot m1n1, then the firmware, and capture the serial log (`docs/bringup-plan.md`

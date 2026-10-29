@@ -198,6 +198,13 @@ would have exposed on the first hardware boot. The fix is small because the
 state was already there; the failure would not have been, because it was in the
 path the probe was written to measure.
 
+`0009` corrects the field that predicate reads. Under `GICD_CTLR.DS=1`, bit 1
+is `EnableGrp1` and bit 0 is `EnableGrp0`; the vGIC had used bit 0, and the
+self-test and QEMU oracle had encoded the same layout, so the three agreed with
+each other while disagreeing with ARM IHI 0069 and with the bit a Windows HAL
+sets. The gate now reads bit 1, and the reset value no longer claims Group 0 is
+enabled. The firmware self-test carries the matching fix in patch `0004`.
+
 `scripts/check-vgic.py` asserts all of it, against the patch series and against
 patched sources; `docs/next-steps.md` explains why the firmware could not have
 caught any of it, and `scripts/check-gicv3-oracle.py` checks the read-backs

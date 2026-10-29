@@ -9,6 +9,7 @@ PATCH_DIR="$ROOT/patches/ntasp-firmware"
 MAIN_PATCH="$PATCH_DIR/0001-m4-uefi-platform.patch"
 NASM_PATCH="$PATCH_DIR/0002-nasm-scope.patch"
 SELFTEST_PATCH="$PATCH_DIR/0003-vgic-selftest.patch"
+GROUP1_PATCH="$PATCH_DIR/0004-vgic-selftest-group1-bit.patch"
 
 if [ ! -d "$TREE/.git" ] && [ ! -f "$TREE/.git" ]; then
     echo "error: not a git checkout: $TREE" >&2
@@ -54,6 +55,16 @@ if [ ! -f "$SELFTEST_PATCH" ]; then
 fi
 apply_patch "$TREE" "$SELFTEST_PATCH" "0003-vgic-selftest.patch" \
             "Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.inf"
+
+#
+# 0004 edits a file 0003 creates, so the .inf marker would already exist and
+# would make a missing 0004 look applied.  Its own reverse check is the marker.
+#
+if [ ! -f "$GROUP1_PATCH" ]; then
+    echo "error: patch not found: $GROUP1_PATCH" >&2
+    exit 1
+fi
+apply_patch "$TREE" "$GROUP1_PATCH" "0004-vgic-selftest-group1-bit.patch"
 
 if [ -e "$TREE/MU_BASECORE/.git" ]; then
     if [ ! -f "$NASM_PATCH" ]; then

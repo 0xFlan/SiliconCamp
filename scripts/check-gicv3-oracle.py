@@ -65,8 +65,8 @@ GICD_IGROUPR = 0x0080
 GICD_ISENABLER = 0x0100
 GICD_ICENABLER = 0x0180
 
-GICD_CTLR_ENABLEGRP1 = 1 << 0
-GICD_CTLR_ENABLEGRP0 = 1 << 1
+GICD_CTLR_ENABLEGRP1 = 1 << 1
+GICD_CTLR_ENABLEGRP0 = 1 << 0
 GICD_CTLR_ARE = 1 << 4
 GICD_CTLR_DS = 1 << 6
 GICD_CTLR_RWP = 1 << 31
@@ -244,7 +244,7 @@ class Oracle:
         t.write32(GICD_BASE + GICD_CTLR, base | GICD_CTLR_ENABLEGRP1)
         ctlr = t.read32(GICD_BASE + GICD_CTLR)
         self.check((ctlr & GICD_CTLR_ENABLEGRP1) != 0,
-                   "GICD_CTLR bit 0 is EnableGrp1",
+                   "GICD_CTLR bit 1 is EnableGrp1 under DS=1",
                    f"a write of 0x{base | GICD_CTLR_ENABLEGRP1:08x} reads back "
                    f"0x{ctlr:08x}")
 
@@ -252,8 +252,8 @@ class Oracle:
         ctlr = t.read32(GICD_BASE + GICD_CTLR)
         self.check((ctlr & GICD_CTLR_ENABLEGRP1) == 0 and
                    (ctlr & GICD_CTLR_ENABLEGRP0) != 0,
-                   "GICD_CTLR bit 1 is EnableGrp0, not Group 1",
-                   f"writing bit 1 reads back 0x{ctlr:08x}; a test that used bit 1 "
+                   "GICD_CTLR bit 0 is EnableGrp0, not Group 1",
+                   f"writing bit 0 reads back 0x{ctlr:08x}; a test that used bit 0 "
                    "for Group 1 would measure Group 0")
 
         t.write32(GICD_BASE + GICD_CTLR, base | (1 << 2))

@@ -59,14 +59,24 @@ self-test, and wires it into the image:
   `!if $(AIC_BUILD) == FALSE`, placed before `TimerDxe` in the FV because it must
   own the virtual timer PPI before that driver registers a handler for it.
 
-`0001` and `0003` are one **cumulative series**: `0003` edits two files that
-`0001` creates. Neither can be checked on its own, because `0003` does not apply
-to a tree without `0001` and `0001` no longer applies cleanly once `0003` is on
-top. `scripts/verify-patches.sh` and `scripts/apply-ntasp-patches.sh` both treat
-them in that order, and the apply script has a marker fallback (the driver's
-`.inf`) for exactly that reason.
+`0004-vgic-selftest-group1-bit.patch` corrects the self-test's Group 1 gate.
+Under `GICD_CTLR.DS=1`, bit 1 is `EnableGrp1` and bit 0 is `EnableGrp0`. The
+driver originally checked bit 0, which the vGIC also set at reset, so the wrong
+check passed on an untouched device and the Windows HAL replay cleared Group 0
+while claiming to clear Group 1. The patch moves the macro and every use to bit
+1 and says which layout the bit comes from. It edits the file `0003` creates,
+so it is applied after `0003`; the apply script deliberately does not use the
+`.inf` marker for it, because that file already exists once `0003` is in place.
 
-All three patches contain a binary file (`Resources/RegulatoryLogos.png` in
+`0001`, `0003` and `0004` are one **cumulative series**: `0003` edits two files
+that `0001` creates, and `0004` edits the driver `0003` creates. None can be
+checked on its own, because `0003` does not apply to a tree without `0001` and
+`0001` no longer applies cleanly once `0003` is on top.
+`scripts/verify-patches.sh` and `scripts/apply-ntasp-patches.sh` both treat them
+in that order, and the apply script has a marker fallback (the driver's `.inf`)
+for exactly that reason.
+
+All four patches contain a binary file (`Resources/RegulatoryLogos.png` in
 `0001`), so apply them with `git apply` (not a plain `patch` command).
 
 From a clean checkout:
