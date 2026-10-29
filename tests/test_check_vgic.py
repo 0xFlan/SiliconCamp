@@ -242,6 +242,28 @@ class PatchSeriesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("GICD_ISACTIVER sets the active bit", result.stdout)
 
+    def test_series_without_priority_readback_is_rejected(self) -> None:
+        # A read that stores into the array replaces the priority it was asked
+        # to return.  The write branch must be the only store.
+        tmp = self._mutated_series(
+            "0010-vgic-priority-readback.patch",
+            "*val = redistributors[cpu_num].sgi_region.gicr_ppi_ipriority_reg[reg_num];",
+            "redistributors[cpu_num].sgi_region.gicr_ppi_ipriority_reg[reg_num] = *val;",
+        )
+        result = run_checker("--patches", tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reading a PPI priority", result.stdout)
+
+    def test_series_with_a_placeholder_priority_is_rejected(self) -> None:
+        tmp = self._mutated_series(
+            "0010-vgic-priority-readback.patch",
+            "hv_vgic3_get_priority(pending.vintid),",
+            "pending.priority,",
+        )
+        result = run_checker("--patches", tmp)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("delivered at the priority the guest programmed", result.stdout)
+
 
 class PatchedTreeTests(unittest.TestCase):
     """The checker's structural pass, run against real patched sources."""
@@ -492,6 +514,26 @@ class PatchedTreeTests(unittest.TestCase):
         result = run_checker("--tree", tree)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cpu_num", result.stdout)
+
+    def test_tree_that_overwrites_on_priority_read_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(
+            tree, "src/hv_vgic.c",
+            "*val = redistributors[cpu_num].sgi_region.gicr_ppi_ipriority_reg[reg_num];",
+            "redistributors[cpu_num].sgi_region.gicr_ppi_ipriority_reg[reg_num] = *val;",
+        )
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PPI priority", result.stdout)
+
+    def test_tree_that_delivers_a_queued_interrupt_at_the_placeholder_priority_is_rejected(self) -> None:
+        tree = self._copy_tree()
+        self._mutate(tree, "src/hv_exc.c",
+                     "hv_vgic3_get_priority(pending.vintid),",
+                     "pending.priority,")
+        result = run_checker("--tree", tree)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("producer's placeholder", result.stdout)
 
 
 if __name__ == "__main__":

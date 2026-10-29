@@ -408,6 +408,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         webView.loadHTMLString(html, baseURL: nil)
     }
 
+    /// Keep the file-picker bridge on this Mac's assistant page.
+    ///
+    /// The bridge is a script message handler that can return a real file
+    /// path, so a page loaded into this WebView must not be able to reach it.
+    /// Only the loopback assistant origin is allowed to navigate here; a link
+    /// to anywhere else opens in the user's browser instead.
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+        if url.scheme == "about" {
+            // showFailure() loads its HTML with no base URL.
+            decisionHandler(.allow)
+            return
+        }
+        let host = (url.host ?? "").lowercased()
+        if (host == "127.0.0.1" || host == "localhost"), url.port == port {
+            decisionHandler(.allow)
+            return
+        }
+        if navigationAction.navigationType == .linkActivated {
+            NSWorkspace.shared.open(url)
+        }
+        decisionHandler(.cancel)
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if screenshotPath != nil {
             fputs("loaded \(webView.url?.absoluteString ?? "nil")\n", stderr)

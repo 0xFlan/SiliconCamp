@@ -10,6 +10,7 @@ MAIN_PATCH="$PATCH_DIR/0001-m4-uefi-platform.patch"
 NASM_PATCH="$PATCH_DIR/0002-nasm-scope.patch"
 SELFTEST_PATCH="$PATCH_DIR/0003-vgic-selftest.patch"
 GROUP1_PATCH="$PATCH_DIR/0004-vgic-selftest-group1-bit.patch"
+PPI_PATCH="$PATCH_DIR/0005-vgic-selftest-ppi-priority.patch"
 
 if [ ! -d "$TREE/.git" ] && [ ! -f "$TREE/.git" ]; then
     echo "error: not a git checkout: $TREE" >&2
@@ -65,6 +66,18 @@ if [ ! -f "$GROUP1_PATCH" ]; then
     exit 1
 fi
 apply_patch "$TREE" "$GROUP1_PATCH" "0004-vgic-selftest-group1-bit.patch"
+
+#
+# 0005 also edits the driver 0003 creates, so it needs no marker: the forward
+# and reverse checks are both meaningful once 0004 is in place.  Leaving it out
+# of this script would make the documented clean-checkout build produce an image
+# without the PPI priority read-back while verify-patches.sh still passed.
+#
+if [ ! -f "$PPI_PATCH" ]; then
+    echo "error: patch not found: $PPI_PATCH" >&2
+    exit 1
+fi
+apply_patch "$TREE" "$PPI_PATCH" "0005-vgic-selftest-ppi-priority.patch"
 
 if [ -e "$TREE/MU_BASECORE/.git" ]; then
     if [ ! -f "$NASM_PATCH" ]; then

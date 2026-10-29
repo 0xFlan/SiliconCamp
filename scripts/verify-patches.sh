@@ -133,12 +133,13 @@ verify_series "$ROOT/third_party/m1n1-windows" \
               "$ROOT/patches/m1n1-windows" \
               "m1n1-windows"
 
-# 0003 and 0004 edit files 0001 creates, so they are one cumulative series.
+# 0003-0005 edit the driver 0001 creates, so they are one cumulative series.
 verify_series_list "$ROOT/third_party/ntasp-firmware" \
                    "ntasp-firmware" \
                    "$ROOT/patches/ntasp-firmware/0001-m4-uefi-platform.patch" \
                    "$ROOT/patches/ntasp-firmware/0003-vgic-selftest.patch" \
-                   "$ROOT/patches/ntasp-firmware/0004-vgic-selftest-group1-bit.patch"
+                   "$ROOT/patches/ntasp-firmware/0004-vgic-selftest-group1-bit.patch" \
+                   "$ROOT/patches/ntasp-firmware/0005-vgic-selftest-ppi-priority.patch"
 
 verify "$ROOT/third_party/ntasp-firmware/MU_BASECORE" \
        "$ROOT/patches/ntasp-firmware/0002-nasm-scope.patch" \

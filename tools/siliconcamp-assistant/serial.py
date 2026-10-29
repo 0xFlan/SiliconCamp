@@ -163,10 +163,13 @@ def capture(
 ) -> dict[str, object]:
     """Read the port until ``stop`` is set or ``seconds`` elapse.
 
-    Lines are timestamped at the moment the newline is read, with a monotonic
-    clock, so the log shows the gap between boot stages even if the host clock
-    changes.  The file is opened in append mode and begins with a header; the
-    footer is written on the normal path and when Ctrl-C ends the capture.
+    Lines are timestamped with the host wall clock at the moment the newline is
+    read, so the log shows the gap between boot stages; a clock change shows up
+    as a step in those timestamps rather than being hidden.  The footer's
+    elapsed value uses a monotonic clock, so it remains the real duration even
+    if the wall clock moves.  The file is opened in append mode and begins with
+    a header; the footer is written on the normal path and when Ctrl-C ends the
+    capture.
     """
     started_wall = datetime.now().astimezone()
     started = time.monotonic()

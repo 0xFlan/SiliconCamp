@@ -131,7 +131,7 @@ They are recorded here so a reader does not have to open the header, and
 bitmap) so a change that moves them also fails a check. Regenerate them with:
 
 ```bash
-cc -o /tmp/off - <<'EOF'
+cc -x c -o /tmp/off - <<'EOF'
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -156,8 +156,7 @@ EOF
 /tmp/off
 ```
 
-As of this build (m1n1.macho SHA-256 `222b6f9bf8e8…`) that prints
-`size 4664 ring 56 dist 1592 redist 2616`.
+That prints `size 4664 ring 56 dist 1592 redist 2616`.
 
 ---
 

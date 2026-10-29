@@ -421,6 +421,10 @@ def check_tree(ck: Checker, tree: str) -> None:
     ck.check(re.search(r"spin_lock\s*\(\s*&\s*q->p_lock\s*\)", drain) is not None,
              "drain_queue(): compaction holds the queue lock against producers on "
              "other CPUs")
+    ck.check(re.search(r"hv_vgic3_inject_irq\s*\(\s*\n?\s*pending\.vintid,\s*\n?\s*"
+                       r"hv_vgic3_get_priority\s*\(\s*pending\.vintid\s*\)", drain) is not None,
+             "drain_queue(): a queued interrupt is delivered at the guest's current "
+             "priority, not at the producer's placeholder")
     drain_all = function_body(exc, "hv_vgic3_drain_pending")
     ck.check(drain_all.count("hv_vgic3_drain_queue") >= 3,
              "drain_pending(): drains the timer, SGI and device-interrupt queues")
@@ -489,6 +493,24 @@ def check_tree(ck: Checker, tree: str) -> None:
     ck.check("gicd_interrupt_group_regs[i] = 0xFFFFFFFF" in vgic,
              "GICD_IGROUPR: modelled SPIs reset to Group 1, the only group the delivery "
              "path implements")
+
+    ck.section("Priority registers: a read returns state instead of overwriting it")
+    #
+    # The PPI priority read used to assign the array from *val -- the output
+    # pointer -- so every aligned read replaced the stored priority with
+    # whatever the guest's destination register held.  Count the store form to
+    # catch the inversion in either direction: the write branch needs exactly
+    # one, and a read branch has none.
+    #
+    ck.check(vgic.count("gicr_ppi_ipriority_reg[reg_num] = *val") == 1,
+             "GICR_IPRIORITYR4-7: only the write path stores into the PPI priority "
+             "array; a read that does is overwriting the state it returns")
+    ck.check(re.search(r"\*val\s*=\s*redistributors\[cpu_num\]\s*\.sgi_region\s*\."
+                       r"gicr_ppi_ipriority_reg\s*\[\s*reg_num\s*\]", vgic) is not None,
+             "GICR_IPRIORITYR4-7: an aligned read returns the stored PPI priority")
+    ck.check(re.search(r"\*val\s*=\s*redistributors\[cpu_num\]\s*\.sgi_region\s*\."
+                       r"gicr_sgi_ipriority_reg\s*\[\s*reg_num\s*\]", vgic) is not None,
+             "GICR_IPRIORITYR0-3: an aligned read returns the stored SGI priority")
 
     ck.section("Diagnostics: the hot path never writes to the UART")
     ck.check(re.search(r"#define\s+ENABLE_VGIC_LOGGING\s+0\b", vgic) is not None,
@@ -634,6 +656,12 @@ MUST_ADD = (
      "modelled SPIs report Group 1, the group delivery implements"),
     ("src/hv_exc.c", r"void\s+hv_vgic3_drain_queue\s*\(",
      "the drain compacts the queue instead of stopping at a disabled entry"),
+    ("src/hv_exc.c", r"hv_vgic3_get_priority\s*\(\s*pending\.vintid\s*\)",
+     "a queued interrupt is delivered at the priority the guest programmed"),
+    # --- 0010: redistributor priority readback -------------------------------
+    ("src/hv_vgic.c", r"\*val\s*=\s*redistributors\[cpu_num\]\s*\.sgi_region\s*\."
+                      r"gicr_ppi_ipriority_reg\s*\[\s*reg_num\s*\]",
+     "reading a PPI priority returns the stored value instead of overwriting it"),
     ("src/hv_exc.c", r"void\s+hv_vgic3_drain_pending\s*\(\s*void\s*\)",
      "all three per-CPU queues have one drain entry point"),
     ("src/hv.h", r"void\s+hv_vgic3_drain_pending\s*\(\s*void\s*\)\s*;",
@@ -711,6 +739,10 @@ MUST_REMOVE = (
      "Group 1 is no longer read from bit 0, which is EnableGrp0 under DS=1"),
     ("src/hv_vgic.c", r"BIT\(6\)\s*\|\s*BIT\(4\)\s*\|\s*BIT\(1\)\s*\|\s*BIT\(0\)",
      "the reset value no longer advertises Group 0 as enabled"),
+    # --- 0010: priority readback ---------------------------------------------
+    ("src/hv_vgic.c", r"redistributors\[cpu_num\]\s*\.sgi_region\s*\."
+                      r"gicr_ppi_ipriority_reg\s*\[\s*reg_num\s*\]\s*=\s*\*val",
+     "reading a PPI priority no longer writes the read buffer into the register"),
 )
 
 MUST_NOT_ADD = (

@@ -1,8 +1,8 @@
 # Build artifacts
 
 These are the outputs of the 2026-10-28 build on the `Mac16,3` / `J624` M4 iMac.
-Both images were rebuilt after the Group 1 audit: the hypervisor carries
-patches `0001`-`0009`, and the firmware carries `0001`-`0004`. Release
+The hypervisor was rebuilt after the Group 1 and priority audits and carries
+patches `0001`-`0010`; the firmware carries `0001`, `0003`-`0005`. Release
 **v0.9.0** is older: its hypervisor predates `0008`/`0009` and its self-test
 still checks bit 0 as Group 1. No release tag carries the corrected pair, so use
 these hashes, not v0.9.0, for the first hardware session.
@@ -16,7 +16,10 @@ All three images changed between v0.8.0 and v0.9.0.
   real exception path. It measures both halves of the hypervisor's enable gate,
   including `gating.pending` (an SGI sent while disabled has to arrive when the
   bit is set, without a resend) and `gating.group1` / `gating.group1-pending`
-  (the distributor's Group 1 enable). It has never run on hardware;
+  (the distributor's Group 1 enable). Firmware patch `0005` adds
+  `redist.priority`, which writes PPI 30's priority, reads the word back and
+  restores it, so the hypervisor's PPI priority read cannot silently overwrite
+  the value a Windows HAL is saving. It has never run on hardware;
   `../docs/vgic-selftest.md` is the per-check reference.
 - the hypervisor now carries patch `0007-vgic-enable-gating.patch`: injection
   consults `GICD_CTLR.EnableGrp1` and the INTID's own enable bit, a refused
@@ -41,11 +44,12 @@ All three images changed between v0.8.0 and v0.9.0.
 They are provided for review and for a hardware experiment that has **not** been
 run yet. Read `../docs/safety.md` before installing anything on the machine.
 
-The images themselves are attached to the GitHub release for the matching tag,
-not committed to git (the FD is 30 MB and would be permanent in history).
-Download them with `gh release download` or from the releases page; the
-`SHA256SUMS` below identifies the exact images this repository was built and
-checked against.
+The images are not committed to git (the FD is 30 MB and would be permanent in
+history). **No published release matches these hashes yet:** v0.9.0 is the last
+release and predates the Group 1 and priority fixes. The `SHA256SUMS` below
+identifies the exact images this tree builds and was checked against; reproduce
+them with the commands under Rebuild, then compare the hashes before flashing
+anything. A later release can attach the same files.
 
 | File | Size | What it is |
 |---|---|---|
@@ -57,20 +61,22 @@ checked against.
 ## SHA-256
 
 ```
-1c2d9384fc495cc74b4d557ea2760420aa00bcfccd24c8839550b9629c1c28d1  MAC16_3_EFI.fd
-e168cdd47fa769607735a13bef140039aaf9159e5377d3c9ca34e48e3d40733f  m1n1-windows.bin
-e380f969b4cc669313e161291036bc2ffeb369e946431ac551a683f9eca989ec  m1n1-windows.macho
+066c1d56b708f49cb9c22805825db4039d89eaf21b23597a27381a80c4ef9e5e  MAC16_3_EFI.fd
+7341d887cba903f01e71db4aad7079ad616f8945a854023810926fbad2730ebc  m1n1-windows.bin
+1b5954bc0c3b822340ad0caaf1de1a79258d20ca6f6d0c7ff5c9605837f8cc67  m1n1-windows.macho
 ```
 
 The m1n1 hashes come from a detached worktree of the pinned submodule commit
-with `patches/m1n1-windows/0001`–`0009` applied. A recursive `diff -r` of that
+with `patches/m1n1-windows/0001`–`0010` applied. A recursive `diff -r` of that
 tree against the working tree the patches were developed in reports no
 difference outside `.git`, `build/` and `target/`, and both trees build the same
 `m1n1.bin` and `m1n1.macho` byte for byte — so the hashes identify
 clean-checkout + patches, not a dirty tree. The UEFI image was built from the
 firmware tree that `patches/ntasp-firmware/0001` reproduces from its pinned
-commit with `0003` and `0004` applied on top; a `diff -r` ignoring `__pycache__`
-reports no difference.
+commit with `0003`, `0004` and `0005` applied on top; a `diff -r` ignoring
+`__pycache__`, `.venv` and the nested submodules reports no file content
+difference. Building that tree twice produced the same FD hash both times, so
+the UEFI hash also identifies the source tree rather than a build timestamp.
 
 ## What the UEFI image contains
 

@@ -1,0 +1,60 @@
+Return the stored PPI priority, and deliver queued interrupts at the guest's priority.
+
+Two defects in the same register path.  A 32-bit read of GICR_IPRIORITYR4-7
+assigned the PPI priority array from *val, the output pointer, instead of
+loading *val from it.  A guest reading a PPI priority back therefore overwrote
+the stored priority with whatever its destination register held, and the next
+injection used the corrupted value.  The self-test does not read a PPI
+priority, so only a Windows HAL reading timer priorities would have found it.
+
+The drain path also injected a queued interrupt at the priority its producer
+stored: 0x20 for the timers and SGIs, 0x40 for a refused SPI.  Those are
+placeholders, not the guest's priority, and an SGI/PPI priority is per-PE, so
+a queue filled on one CPU is not authoritative on another.  The drain runs on
+the CPU that will deliver the interrupt, so it reads the priority there.  This
+changes preemption only on the queued path, which is the path the enable gate
+introduced.
+
+diff --git a/src/hv_vgic.c b/src/hv_vgic.c
+--- a/src/hv_vgic.c
++++ b/src/hv_vgic.c
+@@ -1525,8 +1525,16 @@
+                 // u32 reg_num;
+                 reg_num = (relative_addr - GIC_REDIST_IPRIORITYR4) / 4;
+                 reg_offset = (relative_addr - GIC_REDIST_IPRIORITYR4) % 4;
++                //
++                // This is the read path, so the register has to be the source.
++                // It used to assign the array from *val here, which overwrote
++                // the stored PPI priority with the read buffer on every aligned
++                // access; a guest reading a PPI priority back got whatever its
++                // destination register happened to hold, and the next injection
++                // used the corrupted priority.
++                //
+                 if(reg_offset == 0)
+-                    redistributors[cpu_num].sgi_region.gicr_ppi_ipriority_reg[reg_num] = *val;
++                    *val = redistributors[cpu_num].sgi_region.gicr_ppi_ipriority_reg[reg_num];
+                 else{
+                     //TODO: handle width
+                     u8 *reg_u8 = (u8 *)&redistributors[cpu_num].sgi_region.gicr_ppi_ipriority_reg[reg_num];
+diff --git a/src/hv_exc.c b/src/hv_exc.c
+--- a/src/hv_exc.c
++++ b/src/hv_exc.c
+@@ -99,7 +99,17 @@
+         if (hv_vgic3_irq_enabled(pending.vintid) &&
+             hv_vgic3_inject_irq(
+                 pending.vintid,
+-                pending.priority,
++                // 
++                // Take the priority from the guest's current register state,
++                // not from the entry.  The producers queue a placeholder (0x20
++                // for the timers and SGIs, 0x40 for a refused SPI) because the
++                // interrupt is queued on the CPU that took the physical one,
++                // and an SGI/PPI priority is per-PE.  Injecting the entry's
++                // value delivered a queued interrupt at a priority the guest
++                // never programmed, which changes preemption on the drained
++                // path but not on the immediate one.
++                //
++                hv_vgic3_get_priority(pending.vintid),
+                 pending.active,
+                 pending.pending,
+                 pending.hw_status,

@@ -11,12 +11,17 @@ permissions:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.9 is the system Python on the supported macOS, so it is the floor the
+        # assistant has to keep working on; 3.12 is what most contributors run.
+        python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       # The fixtures are the real tables an M4 build produced, so this proves the
       # checker still understands Project Mu's output and still rejects mutated
