@@ -79,8 +79,10 @@ If you started from a clean NTASP checkout, apply the project's M4 patch first:
 ./scripts/apply-ntasp-patches.sh
 ```
 
-The script applies `patches/ntasp-firmware/0001-m4-uefi-platform.patch` and, once
-`MU_BASECORE` is initialized, `0002-nasm-scope.patch`. It is idempotent.
+The script applies `patches/ntasp-firmware/0001-m4-uefi-platform.patch`,
+`0003-vgic-selftest.patch` and `0004-vgic-selftest-group1-bit.patch` in order,
+and, once `MU_BASECORE` is initialized, `0002-nasm-scope.patch`. It is
+idempotent.
 
 `./scripts/verify-patches.sh` checks the same patches against the exact commits
 the submodules pin, using throwaway git worktrees, so it passes on a dirty tree

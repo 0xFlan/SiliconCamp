@@ -1040,7 +1040,7 @@
       updateChrome();
     } catch (error) {
       showError(
-        `Cannot read http://127.0.0.1:8770/api/status (${error}). ` +
+        `Cannot read ${location.origin}/api/status (${error}). ` +
           "Start `python3 tools/siliconcamp-assistant/server.py` and reload this page."
       );
     }

@@ -1,10 +1,11 @@
 # Build artifacts
 
 These are the outputs of the 2026-10-28 build on the `Mac16,3` / `J624` M4 iMac.
-The UEFI image is the one published as release **v0.9.0**; the hypervisor was
-rebuilt after patch `0008` and its current hashes are below. No release tag
-carries that hypervisor yet, so use v0.9.0 only for the firmware, never for the
-`dist.active` self-test.
+Both images were rebuilt after the Group 1 audit: the hypervisor carries
+patches `0001`-`0009`, and the firmware carries `0001`-`0004`. Release
+**v0.9.0** is older: its hypervisor predates `0008`/`0009` and its self-test
+still checks bit 0 as Group 1. No release tag carries the corrected pair, so use
+these hashes, not v0.9.0, for the first hardware session.
 
 All three images changed between v0.8.0 and v0.9.0.
 
@@ -56,20 +57,20 @@ checked against.
 ## SHA-256
 
 ```
-89e7cbb3669b08a903ee5663c618867518c2a26782ed1412e2b91b7c29a16739  MAC16_3_EFI.fd
-2caed35028234b761322c2e69093bf5c73120f517bef5789a774437fe46bb96f  m1n1-windows.bin
-68f5e54aa5caadc5ecd969f8c2908f61ef1498e00eb8e0b243c557f1d354ca16  m1n1-windows.macho
+1c2d9384fc495cc74b4d557ea2760420aa00bcfccd24c8839550b9629c1c28d1  MAC16_3_EFI.fd
+e168cdd47fa769607735a13bef140039aaf9159e5377d3c9ca34e48e3d40733f  m1n1-windows.bin
+e380f969b4cc669313e161291036bc2ffeb369e946431ac551a683f9eca989ec  m1n1-windows.macho
 ```
 
 The m1n1 hashes come from a detached worktree of the pinned submodule commit
-with `patches/m1n1-windows/0001`–`0008` applied. A recursive `diff -r` of that
+with `patches/m1n1-windows/0001`–`0009` applied. A recursive `diff -r` of that
 tree against the working tree the patches were developed in reports no
 difference outside `.git`, `build/` and `target/`, and both trees build the same
 `m1n1.bin` and `m1n1.macho` byte for byte — so the hashes identify
 clean-checkout + patches, not a dirty tree. The UEFI image was built from the
 firmware tree that `patches/ntasp-firmware/0001` reproduces from its pinned
-commit with `0003` applied on top; a `diff -r` ignoring `__pycache__` reports no
-difference.
+commit with `0003` and `0004` applied on top; a `diff -r` ignoring `__pycache__`
+reports no difference.
 
 ## What the UEFI image contains
 
@@ -131,9 +132,12 @@ larger than the whole image.
   root complexes at 1231–1249 — are masked and logged once.
 - distributor active bits (patch 0008): `GICD_ISACTIVER` sets and
   `GICD_ICACTIVER` clears the shared active bitmap. Without it, the firmware's
-  `dist.active` probe fails on the first boot; the probe was already in the
-  v0.9.0 image, which is why this hypervisor build and that image are meant to
-  be used together.
+  `dist.active` probe fails on the first boot. The probe was already in the
+  v0.9.0 image; this hypervisor build is the one that makes it pass.
+- Group 1 gate (patch 0009, firmware 0004): the vGIC and the self-test both
+  check `GICD_CTLR` bit 1, which is `EnableGrp1` under DS=1. Before the fix both
+  checked bit 0 (`EnableGrp0`), so a Windows HAL enabling Group 1 would have
+  left every virtual interrupt gated while the firmware reported a pass.
 - `HV_QUIESCE_PCIE` in `config.h` restores upstream's `pcie_shutdown()` — it is
   **not** defined in this build.
 

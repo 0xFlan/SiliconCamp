@@ -350,7 +350,7 @@ def check_driver(ck: Checker, source: str, inf: str) -> None:
     ck.check(has(hal, r"MmioWrite32\s*\(\s*Dist\s*\+\s*GICD_ICENABLER[^,]*,\s*0xFFFFFFFF\s*\)"),
              "it writes the HAL's 0xFFFFFFFF teardown to GICD_ICENABLER")
     ck.check(has(hal, r"SavedCtlr\s*&\s*~\s*GICD_CTLR_ENABLEGRP1NS"),
-             "only EnableGrp1NS is cleared; DS and ARE are never written to zero")
+             "only EnableGrp1 (DS=1 bit 1) is cleared; DS and ARE are never written to zero")
     ck.check(has(hal, r"MmioWrite32\s*\(\s*Dist\s*\+\s*GICD_CTLR\s*,\s*SavedCtlr\s*\)"),
              "GICD_CTLR is restored from the value that was read")
     ck.check(has(hal, r"MmioWrite32\s*\(\s*Dist\s*\+\s*GICD_ISENABLER[^,]*,\s*SavedEnable"),
@@ -361,11 +361,19 @@ def check_driver(ck: Checker, source: str, inf: str) -> None:
              "a group disable the device ignores is reported as a gap, not silently accepted")
 
     ck.section("GICD_CTLR group enables use the DS=1 bit layout")
-    ck.check(
-        re.search(r"#define\s+GICD_CTLR_ENABLEGRP1NS\s+\(\s*1U\s*<<\s*0\s*\)", code) is not None,
-        "EnableGrp1 is bit 0 under DS=1; bit 1 is EnableGrp0, and checking it would "
-        "measure the wrong group",
+    #
+    # Patch 0003 originally defined this as bit 0; patch 0004 corrects it.  The
+    # last definition is the one the compiled image gets, so that is the one
+    # checked, in both tree mode (one definition) and series mode (two, in
+    # order).  Bit 1 is EnableGrp1 and bit 0 is EnableGrp0 under DS=1.
+    #
+    defines = re.findall(
+        r"#define\s+GICD_CTLR_ENABLEGRP1NS\s+\(\s*1U\s*<<\s*(\d+)\s*\)", code
     )
+    ck.check(bool(defines) and defines[-1] == "1",
+             "EnableGrp1 is bit 1 under DS=1; bit 0 is EnableGrp0, and checking "
+             "it would measure the wrong group"
+             + (f" (last definition is bit {defines[-1]})" if defines else ""))
 
     ck.section("No1N and IRM agree with what the vGIC implements")
     ck.check(re.search(r"#define\s+GICD_TYPER_NO1N\s+\(1U\s*<<\s*25\)", code) is not None,

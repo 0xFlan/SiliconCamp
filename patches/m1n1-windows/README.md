@@ -1,6 +1,6 @@
 # m1n1-windows patches
 
-Eight patches apply to the NTASP `m1n1_windows` commit pinned by this
+Nine patches apply to the NTASP `m1n1_windows` commit pinned by this
 repository. They are cumulative (each assumes every earlier one), so the order
 below is part of the contract, and `verify-patches.sh` applies the whole series,
 in order, to one pristine worktree:
@@ -15,6 +15,7 @@ in order, to one pristine worktree:
 | `0006-vgic-honest-spi-routing.patch` | `src/hv_vgic.c`, `src/hv_vgic.h` | Sets `GICD_TYPER.No1N` so the distributor does not claim 1-of-N SPI selection it never performs, treats a `GICD_IROUTER.IRM` write of 1 as 0 (the behaviour the architecture permits when `No1N` is set), and keeps bit 31 out of the stored routing value so read-back cannot report a mode that never runs. |
 | `0007-vgic-enable-gating.patch` | `src/hv_vgic.c`, `src/hv_vgic.h`, `src/hv_exc.c` | Makes delivery obey the guest's enable state (`GICD_CTLR.EnableGrp1`, `GICR_ISENABLER0`, `GICD_ISENABLER`), keeps a refused interrupt queued instead of dropping it, and repairs the redistributor's SGI-frame bank handlers, which kept enable and pending state in the active bank. Also makes `GICD_ISPENDR` read back and reports the Group 1 that delivery implements. |
 | `0008-vgic-distributor-active-bits.patch` | `src/hv_vgic.c` | Makes `GICD_ISACTIVER` write-1-to-set and `GICD_ICACTIVER` write-1-to-clear over the shared active bitmap. The placeholder handlers did the opposite for `ISACTIVER`, so the firmware self-test's `dist.active` probe would have failed on the first hardware boot. |
+| `0009-vgic-group1-bit.patch` | `src/hv_vgic.c` | Uses `GICD_CTLR` bit 1 as `EnableGrp1`, the DS=1 field the architecture defines, instead of bit 0 (`EnableGrp0`). The vGIC was self-consistent with a self-test that made the same mistake, but a Windows HAL programming the architectural bit would have left Group 1 disabled and every virtual interrupt gated. |
 
 ## Why 0002 is not optional on M4
 
@@ -352,6 +353,24 @@ directions in both the series and the patched tree, and
 `tests/test_check_vgic.py` puts the clearing behaviour back and requires the
 checker to reject it.
 
+## Why 0009 exists
+
+Under `GICD_CTLR.DS=1`, ARM defines bit 1 as `EnableGrp1` and bit 0 as
+`EnableGrp0`; bits 3:2 are RES0. The vGIC read bit 0 as Group 1 and set both
+bits at reset. The firmware self-test used the same bit, so it agreed with the
+vGIC and with the QEMU oracle, which had also encoded the wrong layout. All
+three were internally consistent and wrong against the architecture. A Windows
+HAL that enables the architectural Group 1 bit would have changed bit 1, which
+the vGIC never consulted, so every virtual interrupt would have stayed gated
+while the firmware reported a pass.
+
+`0009-vgic-group1-bit.patch` moves the gate to bit 1 and stops the reset value
+advertising Group 0, which this vGIC does not model. The companion firmware
+patch `0004` moves the self-test to the same bit; the QEMU oracle now measures
+bit 1 as Group 1 and bit 0 as Group 0, so the two layouts can no longer confirm
+each other's mistake. `scripts/check-vgic.py` rejects bit 0 as the Group 1 gate
+in the patched tree and requires the reset value without it.
+
 ## The SMC trace
 
 `hv_handle_smc()` used to print the PSCI function ID on every guest SMC. That is
@@ -364,7 +383,7 @@ bring-up. It is now behind `DEBUG_PSCI_SMC` (off by default); define it in
 
 ```bash
 ./scripts/apply-patches.sh          # the whole series, idempotent
-./scripts/verify-patches.sh         # applies 0001-0008 in order to a clean worktree of the pin
+./scripts/verify-patches.sh         # applies 0001-0009 in order to a clean worktree of the pin
 ./scripts/check-vgic.py             # asserts the vGIC contract against the series
 ```
 
@@ -409,6 +428,6 @@ diff -r --exclude=.git --exclude=build --exclude='*.o' \
 Then run `./scripts/verify-patches.sh`, `./scripts/check-vgic.py --tree
 third_party/m1n1-windows`, and rebuild with `./scripts/build-m1n1.sh`. As a
 reproducibility check, the series as committed builds
-`m1n1.macho` = `68f5e54aa5ca…` and `m1n1.bin` = `2caed3502823…` (SHA-256),
+`m1n1.macho` = `e380f969b4cc…` and `m1n1.bin` = `e168cdd47fa7…` (SHA-256),
 the same bytes as the working tree it was generated from (checked 2026-10-28).
 

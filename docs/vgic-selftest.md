@@ -99,7 +99,7 @@ log can be column-diffed between boots.
 |---|---|
 | `dist.ds` | `GICD_CTLR.DS = 1`: one security state, all interrupts Group 1. |
 | `dist.are` | `ARE = 1`: affinity routing is enabled, and legacy routing is not modelled. |
-| `dist.grp1` | `EnableGrp1NS = 1` at dispatch time. |
+| `dist.grp1` | `EnableGrp1 (DS=1 bit 1) = 1` at dispatch time. Bit 0 is `EnableGrp0`; the test and the vGIC originally checked that bit and agreed with each other, not the architecture. |
 | `dist.ds-are-forced` | A write of 0 leaves DS and ARE set. A guest is allowed to try to clear them; silently clearing them would break every later write. |
 | `dist.rwp` | `RWP` reads 0 once the write has been applied. **A guest that polls RWP would spin forever if this were not true**, and the spin would look like a hang in the guest. |
 | `dist.restore` | `GICD_CTLR` reads back the value it was found with, so the test is not a configuration change. |
@@ -120,8 +120,10 @@ The active-bit pair is the one row that was changed after the image was built.
 The probe was written against ARM IHI 0069, where `ISACTIVER` is write-1-to-set,
 but the distributor handler was still upstream's placeholder and did the
 opposite. The hypervisor now implements both directions (patch `0008`) and
-`scripts/check-vgic.py` rejects the clearing behaviour; the UEFI image did not
-need a rebuild because the probe was already in it.
+`scripts/check-vgic.py` rejects the clearing behaviour; that probe did not need
+an image rebuild. The Group 1 bit did: the test checked bit 0, which is
+`EnableGrp0` under DS=1, so firmware patch `0004` moves it to bit 1 and the UEFI
+image was rebuilt with the corrected probe.
 
 ### Routing (`VgicCheckIrouter`, SPI 512)
 
@@ -136,7 +138,7 @@ need a rebuild because the probe was already in it.
 This group is **reverse-engineered, not vendor-documented**. Connor McGarr's
 public analysis of the Windows ARM64 HAL ([*Pardon The Interruption*](https://connormcgarr.github.io/windows-arm64-interrupts/))
 reports that `nt!HalpGic3InitializeIoUnit`, before it enables anything, clears
-`GICD_CTLR.EnableGrp1NS`, writes `0xFFFFFFFF` to every `GICD_ICENABLER<n>` bank
+`GICD_CTLR.EnableGrp1` (the report calls it `EnableGrp1NS`), writes `0xFFFFFFFF` to every `GICD_ICENABLER<n>` bank
 and zeroes every `GICD_IROUTER<n>`. It is one report on one GICv3 machine, not a
 Microsoft contract, and the article itself contains at least one register-name
 error (it calls `ICC_SRE_EL1` bit 1 the SRE bit; `SRE` is bit 0). The group is
@@ -146,7 +148,7 @@ sequence prints nothing.
 
 | Check | Asserts |
 |---|---|
-| `windows.grp1` | `EnableGrp1NS` can be cleared and restored. Since patch `0007` the injection path consults this bit, so the guest's temporary disable now stops delivery instead of being advisory. |
+| `windows.grp1` | `EnableGrp1` (DS=1 bit 1) can be cleared and restored. Since patch `0007` the injection path consults this bit, so the guest's temporary disable now stops delivery instead of being advisory. |
 | `windows.icenabler` | `0xFFFFFFFF` to all eight `GICD_ICENABLER` banks of the MSI window disables all 256 SPIs, read back through `GICD_ISENABLER`. Every bit has to translate to an AIC vector before it can be masked, and again before it can be unmasked: this is patch 0004's inverse translation at full width. |
 | `windows.irouter-zero` | A zeroed `GICD_IROUTER` reads back as zero. Zero names the PE with affinity 0, so it is not a neutral value, but the HAL writes it before it has described any line. |
 | `windows.restore` | The MSI window's enables, the two probed routes and `GICD_CTLR` all return to the values they had before the replay. |
@@ -229,7 +231,7 @@ vector reads `ICC_IAR1_EL1`, calls the registered handler, and the handler write
 | `gating.sgi` | A **disabled** SGI (INTID 10) is not delivered. The protocol enables the source when a handler is registered, so the test clears `GICR_ISENABLER0` in the boot PE's own frame behind the protocol's back and sends the SGI. Delivery that ignores the enable bit is reported as a gap. |
 | `gating.pending` | The SGI refused above is not lost: the test sets `GICR_ISENABLER0` and waits **without sending again**. A vGIC that dropped the interrupt instead of queueing it leaves this silent, which for an edge-triggered source can be forever. This is a `[FAIL]`, not a gap: the pending state is part of the contract, and the check is the only one that distinguishes "queued" from "dropped". |
 | `gating.rearm` | The same SGI is enabled again and sent again, and has to arrive. A gate that refuses forever would be worse than no gate: this is the failure mode of testing the enable bit before the guest has programmed it, and it is the reason the check is a `[FAIL]`, not a gap. |
-| `gating.group1` | The **other half** of the gate: with the SGI's own enable bit set, the test clears `GICD_CTLR.EnableGrp1` and sends it. Every list register is injected as Group 1, so delivery while that bit is clear is reported as a gap. The register is written back exactly; DS and ARE are preserved. |
+| `gating.group1` | The **other half** of the gate: with the SGI's own enable bit set, the test clears `GICD_CTLR.EnableGrp1` (bit 1 under DS=1) and sends it. Every list register is injected as Group 1, so delivery while that bit is clear is reported as a gap. The register is written back exactly; DS and ARE are preserved. |
 | `gating.group1-pending` | Restoring `GICD_CTLR.EnableGrp1` delivers the SGI sent while the group was disabled, **without a resend**. A vGIC that discarded it leaves the guest waiting; the check is a `[FAIL]`. |
 | `delivery.ppi` | The virtual timer PPI (from `PcdArmArchTimerVirtIntrNum`, 18 on this platform) is programmed 5 ms out and delivered. It is then stopped again for `TimerDxe`. |
 

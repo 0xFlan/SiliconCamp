@@ -373,9 +373,12 @@ def check_tree(ck: Checker, tree: str) -> None:
     ck.section("Enable state: a disabled interrupt is not delivered (patch 0007)")
     enabled = function_body(vgic, "hv_vgic3_irq_enabled")
     ck.check(bool(enabled), "hv_vgic.c: found hv_vgic3_irq_enabled()")
-    ck.check(re.search(r"gicd_ctl_reg\s*&\s*BIT\(0\)", enabled) is not None,
-             "irq_enabled(): GICD_CTLR.EnableGrp1 gates delivery, because every LR "
-             "is injected as Group 1")
+    ck.check(re.search(r"gicd_ctl_reg\s*&\s*BIT\(1\)", enabled) is not None,
+             "irq_enabled(): GICD_CTLR.EnableGrp1 (DS=1 bit 1) gates delivery, "
+             "because every LR is injected as Group 1")
+    ck.check(re.search(r"gicd_ctl_reg\s*&\s*BIT\(0\)", enabled) is None,
+             "irq_enabled(): bit 0 is EnableGrp0 under DS=1 and must not be used "
+             "as the Group 1 gate")
     ck.check(re.search(r"gicr_isenabler0\s*&\s*BIT\(", enabled) is not None,
              "irq_enabled(): an SGI/PPI is gated by GICR_ISENABLER0")
     ck.check(re.search(r"gicd_interrupt_set_enable_regs\s*\[\s*bank\s*\]\s*&\s*BIT\(",
@@ -617,8 +620,10 @@ MUST_ADD = (
      "the enable-state predicate is declared for the injection path"),
     ("src/hv_vgic.c", r"bool\s+hv_vgic3_irq_enabled\s*\(\s*u32\s+vintid\s*\)",
      "the enable-state predicate is implemented"),
-    ("src/hv_vgic.c", r"gicd_ctl_reg\s*&\s*BIT\(0\)",
-     "GICD_CTLR.EnableGrp1 gates delivery"),
+    ("src/hv_vgic.c", r"gicd_ctl_reg\s*&\s*BIT\(1\)",
+     "GICD_CTLR.EnableGrp1 (DS=1 bit 1) gates delivery"),
+    ("src/hv_vgic.c", r"gicd_ctl_reg\s*=\s*\(\s*BIT\(6\)\s*\|\s*BIT\(4\)\s*\|\s*BIT\(1\)\s*\)",
+     "the distributor starts with DS, ARE and Group 1 enabled, not Group 0"),
     ("src/hv_vgic.c", r"gicr_isenabler0\s*\|=\s*\*val",
      "GICR_ISENABLER0 is write-1-to-set"),
     ("src/hv_vgic.c", r"gicr_isenabler0\s*&=\s*~\s*\*val",
@@ -701,6 +706,11 @@ MUST_REMOVE = (
      "GICD_ISACTIVER is no longer a placeholder that clears the bit"),
     ("src/hv_vgic.c", r"ICACTIVER not implemented for irq",
      "GICD_ICACTIVER is no longer a placeholder"),
+    # --- 0009: DS=1 Group 1 bit ----------------------------------------------
+    ("src/hv_vgic.c", r"gicd_ctl_reg\s*&\s*BIT\(0\)",
+     "Group 1 is no longer read from bit 0, which is EnableGrp0 under DS=1"),
+    ("src/hv_vgic.c", r"BIT\(6\)\s*\|\s*BIT\(4\)\s*\|\s*BIT\(1\)\s*\|\s*BIT\(0\)",
+     "the reset value no longer advertises Group 0 as enabled"),
 )
 
 MUST_NOT_ADD = (

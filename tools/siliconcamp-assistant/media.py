@@ -174,11 +174,41 @@ def pe_machine(path: str | Path) -> int:
         raise MediaError(f"cannot read {path}: {exc}") from exc
 
 
+#: Characters FAT32 cannot store in a name.  A Windows ISO does not contain
+#: them, but a repacked one can, and finding out during `copyfile` means the
+#: destination has already been erased.
+FAT32_INVALID_CHARS = frozenset('<>:"/\\|?*')
+
+#: Device names DOS reserves in every directory, with or without an extension.
+FAT32_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
+
+
+def fat32_name_problem(name: str) -> str:
+    """Why `name` cannot be stored on FAT32, or an empty string if it can."""
+    if not name or name in (".", ".."):
+        return "it is not a usable name"
+    if any(character in FAT32_INVALID_CHARS for character in name):
+        return "it contains a character FAT32 does not allow"
+    if any(ord(character) < 32 for character in name):
+        return "it contains a control character"
+    if name.endswith((" ", ".")):
+        return "it ends with a space or a dot"
+    if len(name.encode("utf-16-le")) // 2 > 255:
+        return "it is longer than FAT32's 255-character limit"
+    if name.split(".", 1)[0].strip().upper() in FAT32_RESERVED_NAMES:
+        return "it is a reserved DOS device name"
+    return ""
+
+
 def scan_payload(root: str | Path) -> Payload:
     """Read a mounted Windows media tree and prove it is one.
 
     Nothing is copied here: the required paths, the install image, the FAT32
-    limit and case collisions are all decided before a destination is touched.
+    limits and case collisions are all decided before a destination is touched.
     """
     base = Path(root)
     if not base.is_dir():
@@ -195,6 +225,12 @@ def scan_payload(root: str | Path) -> Payload:
             except OSError as exc:
                 raise MediaError(f"cannot read {full}: {exc}") from exc
             relative = full.relative_to(base).as_posix()
+            for component in relative.split("/"):
+                problem = fat32_name_problem(component)
+                if problem:
+                    raise MediaError(
+                        f"{relative!r} cannot be stored on FAT32: {problem}"
+                    )
             key = relative.lower()
             if key in seen:
                 # FAT32 is case-insensitive; two entries that differ only by
@@ -492,7 +528,19 @@ def plan_media(
         image = normalise_image(str(target.get("path", "")))
         capacity = image_size_for(payload)
         if target.get("size"):
-            capacity = int(target["size"])
+            raw_size = target["size"]
+            if isinstance(raw_size, bool) or not isinstance(raw_size, (int, str)):
+                raise MediaError(
+                    "the image size must be an integer number of bytes"
+                )
+            try:
+                capacity = int(raw_size)
+            except (TypeError, ValueError) as exc:
+                raise MediaError(
+                    "the image size must be an integer number of bytes"
+                ) from exc
+            if capacity <= 0:
+                raise MediaError("the image size must be positive")
             if capacity < payload.total_bytes + 32 * MIB:
                 blockers.append("the image is smaller than the Windows media")
         steps.append(f"hdiutil create -size {capacity // MIB}m -type SPARSE {image}")

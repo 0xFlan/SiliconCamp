@@ -1,0 +1,71 @@
+Fix the self-test's GICD_CTLR Group 1 bit.
+
+Under DS=1, GICD_CTLR bit 1 is EnableGrp1 and bit 0 is EnableGrp0.
+The test checked bit 0, which the reset value also set, so the wrong
+check passed on an untouched device and the HAL replay cleared Group 0
+while claiming to clear Group 1.  Test the architectural bit and name
+the layout the bit comes from.
+
+diff --git a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
+--- a/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
++++ b/Silicon/Apple/AppleSiliconPkg/Drivers/AppleVgicSelfTestDxe/AppleVgicSelfTestDxe.c
+@@ -71,17 +71,17 @@
+ #define GICD_IPRIORITYR  0x0400
+ #define GICD_IROUTER     0x6000
+ 
+-#define GICD_CTLR_ENABLEGRP1NS  (1U << 0)
++#define GICD_CTLR_ENABLEGRP1NS  (1U << 1)
+ #define GICD_CTLR_ARE           (1U << 4)
+ #define GICD_CTLR_DS            (1U << 6)
+ #define GICD_CTLR_RWP           (1U << 31)
+ //
+-// With DS = 1 the group-enable fields are bit 0 EnableGrp1, bit 1 EnableGrp0,
+-// and bit 2 RAZ/WI (checked against QEMU's GICv3 model by
+-// scripts/check-gicv3-oracle.py).  The name above is the two-security-state
+-// name for the same bit; using bit 1 here would have tested Group 0 while the
+-// message claimed Group 1, and both bits are set at reset, so the mistake
+-// would have looked like a pass.
++// With DS = 1 the group-enable fields are bit 1 EnableGrp1 and bit 0
++// EnableGrp0; bits 3:2 are RES0.  The macro keeps its two-security-state name
++// because the architecture calls the same Group 1 field EnableGrp1NS there,
++// but the bit it tests is the DS=1 bit 1.  Checking bit 0 would measure Group
++// 0; both bits are set at reset, so that mistake looks like a pass until a
++// guest clears Group 1 while leaving Group 0 alone.
+ //
+ 
+ #define GICD_TYPER_ITLINES_MASK   (0x1FU << 0)
+@@ -630,9 +630,9 @@
+   }
+ 
+   if ((Original & GICD_CTLR_ENABLEGRP1NS) != 0) {
+-    VgicPass ("dist.grp1", "GICD_CTLR.EnableGrp1NS = 1");
++    VgicPass ("dist.grp1", "GICD_CTLR.EnableGrp1 (DS=1 bit 1) = 1");
+   } else {
+-    VgicFail ("dist.grp1", "GICD_CTLR.EnableGrp1NS = 0 at self-test time");
++    VgicFail ("dist.grp1", "GICD_CTLR.EnableGrp1 (DS=1 bit 1) = 0 at self-test time");
+   }
+ 
+   //
+@@ -796,7 +796,7 @@
+   This group is reverse-engineered, not vendor-documented.  Connor McGarr's
+   public analysis of the Windows ARM64 HAL ("Windows ARM64 Internals: Pardon
+   The Interruption!") reports that nt!HalpGic3InitializeIoUnit, before it
+-  enables anything, clears GICD_CTLR.EnableGrp1NS, writes 0xFFFFFFFF to every
++  enables anything, clears GICD_CTLR.EnableGrp1 (bit 1 under DS=1), writes 0xFFFFFFFF to every
+   GICD_ICENABLER<n> bank and zeroes every GICD_IROUTER<n>.  It is one report on
+   one GICv3 machine, not a Microsoft contract, and the article itself contains
+   at least one register-name error (it calls ICC_SRE_EL1 bit 1 the SRE bit;
+@@ -851,11 +851,11 @@
+   MmioWrite32 (Dist + GICD_CTLR, SavedCtlr & ~GICD_CTLR_ENABLEGRP1NS);
+   ReadBack = MmioRead32 (Dist + GICD_CTLR);
+   if ((ReadBack & GICD_CTLR_ENABLEGRP1NS) == 0) {
+-    VgicPass ("windows.grp1", "EnableGrp1NS cleared while the distributor is reconfigured");
++    VgicPass ("windows.grp1", "EnableGrp1 (DS=1 bit 1) cleared while the distributor is reconfigured");
+   } else {
+     VgicGap (
+       "windows.grp1",
+-      "EnableGrp1NS stayed set after the HAL's clear (read 0x%08x)",
++      "EnableGrp1 (DS=1 bit 1) stayed set after the HAL's clear (read 0x%08x)",
+       ReadBack
+       );
+   }
